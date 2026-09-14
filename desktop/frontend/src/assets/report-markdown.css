@@ -1,0 +1,22 @@
+/* Bundled locally: report layout must also work without a CDN connection. */
+.sk-report-markdown, .safe-markdown, .safe-report-preview {
+  color: var(--sk-text, inherit); font-size: 14px; line-height: 1.85;
+  text-align: left; white-space: normal; overflow-wrap: anywhere; min-width: 0;
+}
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) :is(h1,h2,h3,h4,h5,h6) { line-height: 1.5; font-weight: 650; margin: 1.5em 0 .65em; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) h1 { font-size: 1.6em; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) h2 { font-size: 1.3em; padding-bottom: .4em; border-bottom: 1px solid var(--sk-border, #69788a55); }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) h3 { font-size: 1.1em; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) p { margin: .7em 0; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) :is(ul,ol) { padding-left: 1.8em; margin: .7em 0; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) li { margin: .25em 0; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) blockquote { margin: 1em 0; padding: .2em 1em; border-left: 3px solid var(--sk-accent, #3da4ff); color: var(--sk-text-muted, inherit); }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) a { color: var(--sk-accent, #3da4ff); text-decoration: underline; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) pre { padding: 14px; overflow-x: auto; white-space: pre; background: var(--sk-surface-2, #69788a15); border-radius: 6px; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) code { font-family: var(--sk-font-mono, Consolas, monospace); font-size: .9em; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) :not(pre)>code { padding: .1em .35em; border-radius: 3px; background: var(--sk-surface-2, #69788a15); }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) table { display: block; width: max-content; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 1em 0; font-size: .92em; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) :is(th,td) { border: 1px solid var(--sk-border, #69788a55); padding: .55em .8em; min-width: 80px; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) th { background: var(--sk-surface-2, #69788a15); font-weight: 650; }
+:is(.sk-report-markdown, .safe-markdown, .safe-report-preview) hr { border: 0; border-top: 1px solid var(--sk-border, #69788a55); margin: 1.5em 0; }
+.picks-ai-config{display:flex;align-items:center;gap:14px;margin:12px 0;font-size:12px}.picks-ai-config label{display:flex;align-items:center;gap:8px}.picks-ai-config select{padding:6px 10px;background:var(--sk-surface);color:var(--sk-text);border:1px solid var(--sk-border);border-radius:5px}.picks-ai-config>span{color:var(--sk-text-muted);font-size:11px}

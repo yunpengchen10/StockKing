@@ -1,0 +1,21 @@
+//go:build windows
+
+package data
+
+import (
+	"github.com/chromedp/chromedp"
+	"os/exec"
+	"syscall"
+)
+
+func hideBrowserProcessWindow(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.HideWindow = true
+	cmd.SysProcAttr.CreationFlags |= 0x08000000 // CREATE_NO_WINDOW
+}
+
+func backgroundBrowserOptions() []chromedp.ExecAllocatorOption {
+	return []chromedp.ExecAllocatorOption{chromedp.ModifyCmdFunc(hideBrowserProcessWindow)}
+}

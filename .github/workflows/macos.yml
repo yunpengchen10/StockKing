@@ -1,0 +1,37 @@
+name: macOS
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: desktop/go.mod
+          cache-dependency-path: desktop/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: brew install libomp
+      - run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
+      - run: bash scripts/build-macos.sh
+      - run: go test .
+        working-directory: desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Stock-King-macos-arm64
+          path: artifacts/macos/Stock-King-macos-arm64.zip
+          if-no-files-found: error

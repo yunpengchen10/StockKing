@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8"/>
+    <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+    <link href="./src/assets/images/stock-king-mark.svg" rel="icon" type="image/svg+xml"/>
+    <title>Stock King</title>
+    <link href="./src/style.css" rel="stylesheet">
+</head>
+<body>
+<div id="startup-status" role="status" style="position:fixed;inset:0;z-index:99999;display:grid;place-content:center;gap:16px;background:#0b101b;color:#e7edf8;font:14px 'Segoe UI','Microsoft YaHei',sans-serif;text-align:center">
+  <strong>Stock King</strong><span id="startup-message">正在启动…</span>
+  <button id="startup-retry" hidden onclick="location.reload()" style="padding:9px 18px;border:0;border-radius:6px;background:#5288ff;color:white;cursor:pointer">重新加载</button>
+</div>
+<script>
+  (() => {
+    let complete = false;
+    const fail = () => {
+      if (complete) return;
+      document.getElementById('startup-message').textContent = '界面加载失败，请重新加载或安装修复版。';
+      document.getElementById('startup-retry').hidden = false;
+    };
+    const timeout = setTimeout(fail, 20000);
+    window.stockKingStartupFailed = fail;
+    window.stockKingStartupComplete = () => {
+      complete = true;
+      clearTimeout(timeout);
+      document.getElementById('startup-status')?.remove();
+    };
+    window.addEventListener('error', fail, true);
+    window.addEventListener('unhandledrejection', fail);
+  })();
+</script>
+<div id="app"></div>
+<script src="./src/main.js" type="module"></script>
+</body>
+</html>

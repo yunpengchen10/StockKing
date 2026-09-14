@@ -1,0 +1,19 @@
+{
+  "name": "stock-king",
+  "outputfilename": "Stock King",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "http://localhost:5173",
+  "author": {
+    "name": "Stock King",
+    "email": ""
+  },
+  "info": {
+    "companyName": "Stock King",
+    "productName": "Stock King",
+    "productVersion": "2.5.0",
+    "copyright": "Based on go-stock (GPL-3.0) and Daily Stock Analysis (MIT)",
+    "comments": "Stock King：行情、行动计划、AI 研究与量化验证工作台。"
+  }
+}
