@@ -10,13 +10,14 @@
 - 工作日 09:20、10:30、14:55 筛选，15:30 复盘，周五 15:45 学习，均按北京时间。
 - 自动任务使用本地模型；AI 复审由你手动触发，不增加自动 AI 调用费用。
 - 数据、模型和设置保存在本机。软件不自动下单。
+- 核心流程无需付费 API、云服务器或 GitHub Actions；构建和校验在自己的电脑完成。AI 可使用本地 Ollama，也可手动导入报告。
 
 需要让 AI 工具复用同一套行情，可使用 [只读 MCP 行情服务](quote-service/README.md)。支持 Windows、macOS 的 Python 运行方式；ChatGPT 云端仍需完成远程连接授权和实测。
 
 ## 快速开始
 
-1. 在 [Actions](https://github.com/yunpengchen10/stock-king/actions) 中选择成功的对应平台构建，下载并解压 Artifacts。私有阶段需要仓库访问权限。
-2. 建议使用 64 位 Python 3.12。安装下载的原生 wheel，然后启动：
+1. 获取维护者提供的原生 wheel，或按 [本地构建与分发](docs/LOCAL_BUILD.md) 在自己的 Windows / Apple Silicon 电脑打包。无需 Actions、付费构建平台或云服务器；当前仓库仍是私有内测，源码访问需要授权。
+2. 建议使用 64 位 Python 3.12。安装已有的原生 wheel，然后启动：
 
    ```text
    python -m pip install "下载目录/stock_king-2.6.0-py3-none-win_amd64.whl"
@@ -27,7 +28,14 @@
 3. 打开“自选”添加研究股票，在“精选 → 当日机会”点“刷新全部”，先检查数据时间、证据缺口与入场条件。
 4. 需要 AI 时再配置模型；看行情、运行本地规则不要求 AI API Key。进入“策略”前先选择训练股票池或准备回测数据。
 
-当前未发布到 PyPI。`pip install stock-king` 不是本仓库当前的安装方式。源码安装提供研究 CLI，完整桌面请使用平台原生 wheel；详情见 [pip 安装说明](docs/precision-and-packaging.md#私有-github-与-pip)。
+当前未发布到 PyPI，也尚无公开安装包下载页。`pip install stock-king` 不是本仓库当前的安装方式。已有仓库权限的用户可先安装研究 CLI：
+
+```text
+python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing.git@main"
+stock-king doctor
+```
+
+源码安装提供研究 CLI，完整桌面请使用平台原生 wheel。项目显示名为 **Stock King**，GitHub 仓库名为 **StockKing**；兼容现有安装的命令仍为 `stock-king`。详情见 [本地构建与分发](docs/LOCAL_BUILD.md)。
 
 ## 页面与使用流程
 
@@ -50,6 +58,8 @@
 
 ## AI 配置说明
 
+**免费入门：** 不配置 AI 也能使用核心功能。需要本地 AI 时，在下面配置流程中使用 Ollama：Base URL 为 `http://localhost:11434/v1`，令牌填本地占位值 `ollama`，Model ID 填已安装模型的准确标签。也可在“AI 研究”导出研究包、手动导入已有报告。本地运行需要相应内存和算力；外部报告所用服务由用户自行选择。
+
 1. 打开“工具 → AI 平台配置”，点击“添加AI配置”。也可从“设置 → AI设置”启用“AI诊股”后进入“前往管理”；该旧入口的开关不代替模型配置。
 2. 填写**配置名称、接口地址（Base URL）、令牌（API Key）、模型名称（Model ID）**。接口须支持应用使用的 OpenAI 兼容 Chat Completions 格式；模型名称以服务商实际可用列表为准。
 3. 点击“测试并刷新模型列表”。它检查模型列表接口，不等于已经验证模型生成回答或推理参数。
@@ -67,17 +77,17 @@
 
 完整示例、Ollama 本地配置、手动导入报告、密钥与常见错误处理见 [AI 配置说明书](docs/AI_CONFIGURATION.md)。保存的配置位于本机，但手动使用远程 AI 时，所选证据、提示词及请求内容会发送给该服务商。日常定时扫描不会自动调用 AI；自行启用的机器人或其他 AI 任务需单独管理。
 
-## 常见问题与构建状态
+## 常见问题与本地验证
 
 | 现象 | 处理方式 |
 | --- | --- |
-| GitHub 检查几秒内全部失败，且没有构建日志 | 打开 Actions 的 Summary → Annotations。若提示付款失败或 spending limit，需在 GitHub 账号的 Billing & licensing 中处理；重新提交代码不能修复账单限制。 |
-| Actions 下载项消失 | 新构建产物保留 14 天；已过期需重新构建，或使用已下载的包。历史产物沿用当时的保留设置。 |
+| 旧提交仍显示失败检查 | 历史任务曾被 GitHub 账单限制阻止启动。项目现已停用 Actions，不需要开通付费额度；旧结果不会因此变为通过。 |
+| 没有安装包或包已过期 | 使用维护者提供的本地构建包，或按本地构建说明重新打包；不依赖 Actions 临时产物。 |
 | 引擎未就绪、行情缺失或精选为空 | 先确认网络与引擎状态，再看报价时间和缺口；完整证据不够时允许没有候选。 |
 | 连接测试成功，AI 仍然报错 | 模型列表与生成回答是不同接口；检查模型权限、余额、模型 ID、推理参数及实际请求错误。 |
 | 安装提示 wheel 不支持当前平台 | 核对 Windows x64 / macOS ARM64、Python 架构与 macOS 15+ 要求。Intel Mac 不在支持范围。 |
 
-CI 对代码和构建配置的修改继续执行；纯 README / `docs/` 修改不触发整套打包，同一分支的新构建会取消旧构建。账单限制解除前不能把失败检查称为已通过。详见 [构建排查](docs/CI_TROUBLESHOOTING.md)。
+本仓库不使用 GitHub Actions，也不要求购买 GitHub Pro 或付费构建服务。本地构建脚本执行对应测试和安装校验；Windows 与 Apple Silicon 应分别在对应机器验收。操作见 [本地构建与分发](docs/LOCAL_BUILD.md)，历史失败说明见 [构建排查](docs/CI_TROUBLESHOOTING.md)。
 
 ## 推荐算法
 
@@ -111,7 +121,7 @@ SafeBound、BalancedRank、LimitPulse 是本项目的模块名称。展示的排
 
 ## Windows
 
-Python 3.11+ 可用 pip 安装研究工具；Windows/macOS 桌面 wheel 由私有 GitHub Actions 构建。仓库保持私有，不发布 PyPI。完整安装命令、平台差异和验收范围见 [pip 安装说明](docs/precision-and-packaging.md#私有-github-与-pip)。
+Python 3.11+ 可用 pip 安装研究工具，建议 3.12。桌面 wheel 在本地电脑构建，仓库目前保持私有，尚未发布 PyPI。完整安装命令和平台差异见 [本地构建与分发](docs/LOCAL_BUILD.md)。
 
 开发需要 Python、Node.js 20+、Go（版本见 `desktop/go.mod`）和 Wails 2.11。
 
@@ -123,10 +133,10 @@ cd desktop
 wails dev
 ```
 
-构建离线安装包（另需 NSIS）：
+构建原生桌面 wheel（无需 NSIS、Actions 或付费证书）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/build-stock-king-v2.ps1
+powershell -ExecutionPolicy Bypass -File scripts/build-windows-wheel.ps1
 ```
 
 ## macOS（Apple Silicon）
@@ -141,7 +151,7 @@ export PATH="$PATH:$(go env GOPATH)/bin"
 bash scripts/build-macos.sh
 ```
 
-产物为 `artifacts/macos/Stock-King-macos-arm64.zip`，解压后把 `Stock King.app` 放入“应用程序”。这是本地临时签名的构建，尚无 Apple 公证；首次打开可能需要在“系统设置 → 隐私与安全性”中允许。GitHub Actions 的 macOS 工作流也会构建同一安装包。
+产物为 `artifacts/macos/Stock-King-macos-arm64.zip` 及 `dist/desktop/` 中的 wheel，解压后把 `Stock King.app` 放入“应用程序”。这是本地临时签名的构建，不要求购买开发者证书，尚无 Apple 公证；首次打开可能需要在“系统设置 → 隐私与安全性”中允许。
 
 安装独立后台任务（关闭软件窗口后仍可运行）：
 

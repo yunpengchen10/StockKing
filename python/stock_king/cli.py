@@ -74,7 +74,7 @@ def materialize_desktop(executable):
 def launch_desktop():
     executable = desktop_path()
     if executable is None:
-        raise RuntimeError('Install the Windows/macOS desktop wheel from the private GitHub Actions artifacts, '
+        raise RuntimeError('Install a locally built Windows/macOS desktop wheel (see docs/LOCAL_BUILD.en.md), '
                            'or set STOCK_KING_DESKTOP to your installed app. The source wheel provides research commands.')
     executable = materialize_desktop(executable)
     if sys.platform == 'darwin' and executable.suffix == '.app':

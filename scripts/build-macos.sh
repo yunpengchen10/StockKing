@@ -12,6 +12,7 @@ command -v wails >/dev/null
 "${PYTHON_BIN:-python3.12}" scripts/test_macos_schedule.py
 cd desktop
 npm --prefix frontend ci
+npm --prefix frontend test
 npm --prefix frontend run build
 go test .
 # Keep this pure command test independent of legacy provider-test databases.
@@ -27,6 +28,8 @@ test -d "$APP"
 cd "$ROOT"
 "${PYTHON_BIN:-python3.12}" -m venv .venv
 .venv/bin/python -m pip install '.[engine,models]' pyinstaller build
+.venv/bin/python -m pip install pytest
+.venv/bin/python -m pytest daily-engine/tests/test_precision_policy.py daily-engine/tests/test_local_quote_integration.py daily-engine/tests/test_local_observation_review.py daily-engine/tests/test_economy_review.py daily-engine/tests/test_public_market_quotes.py daily-engine/tests/test_recommendation_evidence.py daily-engine/tests/test_complete_market_evidence.py daily-engine/tests/test_intraday_evidence.py -q
 .venv/bin/python scripts/build-macos-engine.py
 mkdir -p "$APP/Contents/Resources/daily-engine"
 ditto "$ROOT/daily-engine/dist/backend/stock_analysis" "$APP/Contents/Resources/daily-engine/stock_analysis"
@@ -44,4 +47,5 @@ set -e
 mkdir -p "$ROOT/artifacts/macos"
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ROOT/artifacts/macos/Stock-King-macos-$ARCH.zip"
 .venv/bin/python scripts/build-desktop-wheel.py
+.venv/bin/python scripts/smoke-wheel.py --native
 echo "Built: $ROOT/artifacts/macos/Stock-King-macos-$ARCH.zip and platform wheel"

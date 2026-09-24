@@ -57,14 +57,14 @@
 
 ## 私有 GitHub 与 pip
 
-仓库保持 private；工作流只在私有 Actions 上传构建产物，不发布 PyPI，不自动改仓库可见性。未来公开前保留 GPL-3.0 与所有第三方声明，并复核发行物、依赖和数据使用条件。
+仓库保持 private，项目显示名为 Stock King，GitHub 仓库标识为 StockKing；不使用 GitHub Actions 或付费构建平台。安装包在自己的 Windows / Apple Silicon 电脑构建，步骤见 [本地构建与分发](LOCAL_BUILD.md)。目前未发布 PyPI，不自动改仓库可见性。未来公开前保留 GPL-3.0 与所有第三方声明，并复核发行物、依赖和数据使用条件。
 
 需要 64 位 Python 3.11+，建议 3.12。先在仓库有读取权限的终端进行正常 GitHub 登录，切勿把令牌写入 URL 或命令历史。
 
 研究工具：
 
 ```text
-python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/stock-king.git@main"
+python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing.git@main"
 stock-king doctor
 stock-king evidence 600519
 stock-king evidence 600519 --as-of 2026-09-24T10:30:00+08:00
@@ -72,7 +72,7 @@ stock-king evidence 600519 --as-of 2026-09-24T10:30:00+08:00
 
 没有当时归档的历史查询会返回未知，不补抓当前数据。完整本地研究 API 将 extra 换成 `[engine]`，然后运行 `stock-king engine`。API 只监听 127.0.0.1，需要 `X-Stock-King-Token`；随机凭据保存在用户数据目录 `engine-token`，不会打印内容。模型依赖另选 `[engine,models]`，训练仍需用户选择股票池。
 
-桌面版：从私有 Actions 下载与系统匹配的 wheel，解压 Actions 外层 ZIP 后：
+桌面版：安装本地构建或维护者提供的对应平台 wheel：
 
 ```text
 python -m pip install ./stock_king-2.6.0-py3-none-win_amd64.whl
@@ -85,4 +85,4 @@ macOS 应用以保留符号链接和权限的内嵌归档打包，首次启动�
 
 默认数据目录：Windows `%LOCALAPPDATA%/Stock King`，macOS `~/Library/Application Support/Stock King`；可通过 `STOCK_KING_HOME` 覆盖 CLI 目录。每个用户独立存储，包内不写数据库、密钥、模型或通知收件人。
 
-CI 分别验证 Windows x64 和 Apple Silicon 的通用包安装，并构建原生 wheel；macOS 构建脚本会拒绝 Intel/Rosetta 环境。远程任务没有通过前，不能把对应平台标成已验收。
+本地构建脚本执行测试和原生 wheel 安装校验；macOS 构建脚本拒绝 Intel/Rosetta 环境。需要分别在 Windows x64 和 Apple Silicon 上完成验收；删除云端工作流不代表测试通过。

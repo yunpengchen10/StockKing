@@ -38,7 +38,7 @@ dev = ["build>=1.2", "pytest>=8"]
 stock-king = "stock_king.cli:main"
 
 [project.urls]
-Repository = "https://github.com/yunpengchen10/stock-king"
+Repository = "https://github.com/yunpengchen10/StockKing"
 
 [tool.setuptools]
 package-dir = {"" = "python"}

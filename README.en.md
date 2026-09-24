@@ -10,13 +10,14 @@ A local desktop for stock quantitative research and China A-share research: quot
 - Weekday picks at 09:20, 10:30 and 14:55; review at 15:30; Friday learning at 15:45, Asia/Shanghai time.
 - Automatic tasks use local models. AI review is manually triggered; no automatic AI API spending.
 - User data, models and settings are stored locally. No automatic trading.
+- Core workflows need no paid API, cloud server or GitHub Actions. Build and validate on your own computer; AI can use local Ollama or manually imported reports.
 
 AI tools can reuse the same quotes through the [read-only MCP quote service](quote-service/README.md). Python execution is supported on Windows and macOS; the ChatGPT cloud connection still requires remote authorization and end-to-end testing.
 
 ## Quick start
 
-1. Open [Actions](https://github.com/yunpengchen10/stock-king/actions), select a successful build for your platform, and download and extract its Artifacts. Repository access is required while the project is private.
-2. A 64-bit Python 3.12 installation is recommended. Install the downloaded native wheel, then launch:
+1. Obtain a native wheel supplied by the maintainer, or follow [local building and distribution](docs/LOCAL_BUILD.en.md) on your Windows / Apple Silicon computer. No Actions, paid build platform or cloud server is required. The repository is currently in private testing, so source access requires permission.
+2. A 64-bit Python 3.12 installation is recommended. Install your native wheel, then launch:
 
    ```text
    python -m pip install "download-directory/stock_king-2.6.0-py3-none-win_amd64.whl"
@@ -27,7 +28,14 @@ AI tools can reuse the same quotes through the [read-only MCP quote service](quo
 3. Add research symbols in “自选”, then select “刷新全部” in “精选 → 当日机会”. Check evidence timestamps, missing data and entry conditions first.
 4. Configure a model when you need AI; quotes and local rules do not require an AI API key. Select a training universe or prepare backtest data before using “策略”.
 
-The project is not published on PyPI. `pip install stock-king` is not the current installation method for this repository. Source installation provides the research CLI; use a platform-native wheel for the complete desktop. See [pip installation details (Chinese)](docs/precision-and-packaging.md#私有-github-与-pip).
+The project is not published on PyPI and has no public installer download page yet. `pip install stock-king` is not the current installation method for this repository. Users with repository access can start with the research CLI:
+
+```text
+python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing.git@main"
+stock-king doctor
+```
+
+Source installation provides the research CLI; use a platform-native wheel for the complete desktop. The display name is **Stock King**, and the GitHub repository is **StockKing**. The command remains `stock-king` for compatibility with existing installations. See [local building and distribution](docs/LOCAL_BUILD.en.md).
 
 ## Pages and workflow
 
@@ -50,6 +58,8 @@ Suggested sequence: **Market → Watchlist → Daily opportunities → Chart ver
 
 ## AI configuration
 
+**Free starting point:** Core features work without AI configuration. For local AI, use the configuration steps below with Ollama: Base URL `http://localhost:11434/v1`, local placeholder key `ollama`, and the exact installed model tag. You can also export research packages and manually import existing reports in “AI 研究”. Local models need suitable memory and compute; users choose any external service used to create imported reports.
+
 1. Open “工具 → AI 平台配置” and click “添加AI配置”. The legacy path is “设置 → AI设置”, enable “AI诊股”, then “前往管理”; that switch does not replace model configuration.
 2. Enter **configuration name, Base URL, API key and Model ID**. The endpoint must support the OpenAI-compatible Chat Completions format used by the application. Use model IDs actually available from your provider.
 3. Click “测试并刷新模型列表”. This checks the model-list endpoint; it does not verify answer generation or reasoning parameters.
@@ -67,17 +77,17 @@ Suggested sequence: **Market → Watchlist → Daily opportunities → Chart ver
 
 See the [AI configuration manual](docs/AI_CONFIGURATION.en.md) for examples, local Ollama, report imports, key handling and troubleshooting. Saved settings are local, but manual use of a remote AI sends selected evidence, prompts and request content to that provider. Routine scheduled scans do not call AI automatically; separately enabled bots or other AI tasks must be managed individually.
 
-## FAQ and build status
+## FAQ and local validation
 
 | Symptom | What to do |
 | --- | --- |
-| All GitHub checks fail within seconds, with no build logs | Open Actions → Summary → Annotations. If the message mentions failed payments or a spending limit, resolve it in the GitHub account's Billing & licensing settings. Another code commit cannot fix a billing restriction. |
-| An Actions download is missing | New artifacts are retained for 14 days. Rebuild expired artifacts or use a previously downloaded package. Historical artifacts retain their original retention settings. |
+| An old commit still shows failed checks | Historical jobs were blocked by GitHub billing restrictions. Actions is now disabled; no paid allowance is needed. Historical failures do not become passing results. |
+| No installer is available, or a package has expired | Use a maintainer-supplied local build or build again using the local instructions. Installation does not depend on temporary Actions artifacts. |
 | Engine not ready, missing quotes or an empty candidate list | Check network and engine status, quote timestamps and evidence gaps. Insufficient evidence can legitimately produce no candidates. |
 | Connection test passes but AI still fails | Listing models and generating answers use different endpoints. Check model permissions, balance, exact model ID, reasoning parameters and the actual request error. |
 | pip says the wheel is unsupported | Check Windows x64 / macOS ARM64, Python architecture and the macOS 15+ requirement. Intel Macs are not supported. |
 
-Code and build-configuration changes still run CI. README-only or `docs/`-only changes skip full packaging, and a newer build on the same branch cancels an older build. Failed checks cannot be described as passing while billing restrictions remain. See [build troubleshooting](docs/CI_TROUBLESHOOTING.en.md).
+This repository does not use GitHub Actions or require GitHub Pro or paid build services. Local scripts run the corresponding tests and installation checks. Validate Windows and Apple Silicon on their respective machines. See [local building and distribution](docs/LOCAL_BUILD.en.md) and the [historical build troubleshooting note](docs/CI_TROUBLESHOOTING.en.md).
 
 ## Recommendation algorithms
 
@@ -111,7 +121,7 @@ SafeBound, BalancedRank and LimitPulse are project module names. Ranking percent
 
 ## Windows
 
-Python 3.11+ can install the research tools through pip; Windows/macOS desktop wheels are built by private GitHub Actions. The repository stays private and is not published to PyPI. See [installation, platform differences and validation scope (Chinese)](docs/precision-and-packaging.md#私有-github-与-pip).
+Python 3.11+ can install the research tools through pip; 3.12 is recommended. Desktop wheels are built locally. The repository is currently private and not published on PyPI. See [local building and distribution](docs/LOCAL_BUILD.en.md) for installation and platform differences.
 
 Development requires Python, Node.js 20+, Go (see `desktop/go.mod`) and Wails 2.11.
 
@@ -123,10 +133,10 @@ cd desktop
 wails dev
 ```
 
-Build the offline installer with NSIS installed:
+Build a native desktop wheel (no NSIS, Actions or paid certificate required):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/build-stock-king-v2.ps1
+powershell -ExecutionPolicy Bypass -File scripts/build-windows-wheel.ps1
 ```
 
 ## macOS (Apple Silicon)
@@ -141,7 +151,7 @@ export PATH="$PATH:$(go env GOPATH)/bin"
 bash scripts/build-macos.sh
 ```
 
-Extract `artifacts/macos/Stock-King-macos-arm64.zip` and move `Stock King.app` to Applications. The build is ad-hoc signed, not Apple-notarized; first launch may need approval in System Settings → Privacy & Security. The macOS GitHub Actions workflow builds the same archive.
+The outputs are `artifacts/macos/Stock-King-macos-arm64.zip` and a wheel in `dist/desktop/`. Extract the archive and move `Stock King.app` to Applications. The build is ad-hoc signed and requires no purchased developer certificate; it is not Apple-notarized, so first launch may need approval in System Settings → Privacy & Security.
 
 Enable independent background research, including when the desktop window is closed:
 

@@ -4,6 +4,8 @@
 
 Applies to Stock King 2.6. Menu labels are primarily Chinese. Quotes, watchlists, local picks and quantitative research do not require an AI API key. AI organizes evidence, explains risks and compares opinions; it does not replace local entry checks.
 
+Prefer the free local workflow: leave AI disabled, use Ollama as described below, or manually import existing reports. Cloud configuration is optional for users who already want their own integration; installation and routine research do not require purchasing a cloud AI plan.
+
 ## 1. Add and save a platform
 
 1. Open **工具 → AI 平台配置 → 添加AI配置** (Tools → AI platform configuration → Add).
