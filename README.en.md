@@ -4,21 +4,93 @@
 
 [简体中文](README.md) | English
 
-A local stock research desktop: quotes, charts, watchlists, scheduled picks, observation review and local model learning.
+A local desktop for stock quantitative research and China A-share research: quotes, charts, watchlists, scheduled picks, account backtests, observation review and manual AI research. Supports Windows x64 and Apple Silicon (M series, macOS 15+).
 
 - Free Tencent/Sina quote fallback with original timestamps and freshness checks.
 - Weekday picks at 09:20, 10:30 and 14:55; review at 15:30; Friday learning at 15:45, Asia/Shanghai time.
 - Automatic tasks use local models. AI review is manually triggered; no automatic AI API spending.
-- User data and models stay local. No automatic trading.
+- User data, models and settings are stored locally. No automatic trading.
+
+AI tools can reuse the same quotes through the [read-only MCP quote service](quote-service/README.md). Python execution is supported on Windows and macOS; the ChatGPT cloud connection still requires remote authorization and end-to-end testing.
+
+## Quick start
+
+1. Open [Actions](https://github.com/yunpengchen10/stock-king/actions), select a successful build for your platform, and download and extract its Artifacts. Repository access is required while the project is private.
+2. A 64-bit Python 3.12 installation is recommended. Install the downloaded native wheel, then launch:
+
+   ```text
+   python -m pip install "download-directory/stock_king-2.6.0-py3-none-win_amd64.whl"
+   stock-king
+   ```
+
+   Apple Silicon uses `stock_king-2.6.0-py3-none-macosx_15_0_arm64.whl` and requires ARM64 Python. Windows requires WebView2 Runtime. On Mac, you can also use the `.app` archive from the build artifacts.
+3. Add research symbols in “自选”, then select “刷新全部” in “精选 → 当日机会”. Check evidence timestamps, missing data and entry conditions first.
+4. Configure a model when you need AI; quotes and local rules do not require an AI API key. Select a training universe or prepare backtest data before using “策略”.
+
+The project is not published on PyPI. `pip install stock-king` is not the current installation method for this repository. Source installation provides the research CLI; use a platform-native wheel for the complete desktop. See [pip installation details (Chinese)](docs/precision-and-packaging.md#私有-github-与-pip).
+
+## Pages and workflow
+
+The interface is primarily Chinese. Chinese menu labels are retained below so that you can find the corresponding controls.
+
+| Page | Purpose and actions |
+| --- | --- |
+| 市场 — Market | Review the market overview, trading session and research leads before choosing symbols to investigate. |
+| 自选 — Watchlist | Search symbols and organize groups; open individual charts or AI research. Watchlist records are not actual brokerage positions. |
+| 图表 — Charts | Inspect candles, technical indicators and price/volume structure; verify the current price, trend and trading plan. |
+| 精选 → 当日机会 — Daily opportunities | Refresh scans and switch between conservative, balanced and aggressive entry profiles. Read selection reasons, evidence, trigger/invalidation/no-chase conditions; history and recommendation records preserve the original snapshots. |
+| 精选 → 策略分组 — Strategy groups | Inspect existing strategy groups and model status, separately from the three entry filters in daily opportunities. |
+| AI 研究 — AI research | Select a symbol and template, retrieve evidence, then manually call a configured model. You can also export research packages, import external AI reports and compare consensus, disagreements and evidence times. |
+| 策略 — Strategies | In account backtesting, import market data and signals recorded before execution, configure costs and fill constraints, and inspect equity and trade records. Train and check model eligibility within the selected universe. |
+| 多图 — Multiple charts | Compare several symbols in one workspace. |
+| 工具 — Tools | Access AI platform configuration, reports and deep research, fund research, research assistant, scheduled tasks, and data tools. |
+| 设置 — Settings | Manage preferences, quote refresh, notifications and AI analysis settings. Save after making changes. |
+
+Suggested sequence: **Market → Watchlist → Daily opportunities → Chart verification → Optional AI review → Historical review**. Empty candidate lists, pending verification and expired evidence are valid states. Unknown evidence must not be treated as passed, and observed price changes are not realized trading returns.
+
+## AI configuration
+
+1. Open “工具 → AI 平台配置” and click “添加AI配置”. The legacy path is “设置 → AI设置”, enable “AI诊股”, then “前往管理”; that switch does not replace model configuration.
+2. Enter **configuration name, Base URL, API key and Model ID**. The endpoint must support the OpenAI-compatible Chat Completions format used by the application. Use model IDs actually available from your provider.
+3. Click “测试并刷新模型列表”. This checks the model-list endpoint; it does not verify answer generation or reasoning parameters.
+4. Click “确定” in the drawer, then **“保存配置”** on the list page. Wait for the save confirmation before leaving.
+5. Return to “AI 研究” or “精选 → 当日机会”, select the platform and model, and manually start research or “AI 复审”. Provider charges may apply.
+
+| Field | How to configure it |
+| --- | --- |
+| Base URL | Use the API base, retaining required prefixes such as `/v1`. Do not use a chat website or append `/chat/completions`. |
+| API Key | Use a key from the corresponding API platform. A website login or chat subscription does not configure API access here. Enter it only in your local configuration page. |
+| Model ID | Select from the list or enter the exact ID; a display nickname is not sufficient. |
+| Temperature / MaxTokens | Set sampling and maximum output according to the model's capabilities; follow provider guidance for unsupported parameters. |
+| Timeout / 深度思考 | Timeout is measured in seconds. Reasoning models may need longer. Enable deep thinking only when both the model and endpoint support it. |
+| HTTP proxy | Configure for your network if needed. The model-list test uses the general HTTP client, so it does not verify the proxy assigned to an individual configuration. |
+
+See the [AI configuration manual](docs/AI_CONFIGURATION.en.md) for examples, local Ollama, report imports, key handling and troubleshooting. Saved settings are local, but manual use of a remote AI sends selected evidence, prompts and request content to that provider. Routine scheduled scans do not call AI automatically; separately enabled bots or other AI tasks must be managed individually.
+
+## FAQ and build status
+
+| Symptom | What to do |
+| --- | --- |
+| All GitHub checks fail within seconds, with no build logs | Open Actions → Summary → Annotations. If the message mentions failed payments or a spending limit, resolve it in the GitHub account's Billing & licensing settings. Another code commit cannot fix a billing restriction. |
+| An Actions download is missing | New artifacts are retained for 14 days. Rebuild expired artifacts or use a previously downloaded package. Historical artifacts retain their original retention settings. |
+| Engine not ready, missing quotes or an empty candidate list | Check network and engine status, quote timestamps and evidence gaps. Insufficient evidence can legitimately produce no candidates. |
+| Connection test passes but AI still fails | Listing models and generating answers use different endpoints. Check model permissions, balance, exact model ID, reasoning parameters and the actual request error. |
+| pip says the wheel is unsupported | Check Windows x64 / macOS ARM64, Python architecture and the macOS 15+ requirement. Intel Macs are not supported. |
+
+Code and build-configuration changes still run CI. README-only or `docs/`-only changes skip full packaging, and a newer build on the same branch cancels an older build. Failed checks cannot be described as passing while billing restrictions remain. See [build troubleshooting](docs/CI_TROUBLESHOOTING.en.md).
 
 ## Recommendation algorithms
 
-Daily picks follow full-market screening → local five-day ranking → quote/risk checks → at most five candidates.
+Version 2.6 adds conservative, balanced and aggressive entry checks in “当日机会”, plus AKShare archives for financial statements, earnings forecasts and share unlocks. Missing data does not imply no risk; inadequate room below resistance blocks selection. Initial thresholds have not been validated for out-of-sample returns. See the [algorithm comparison, thresholds and validation plan (Chinese)](docs/precision-and-packaging.md).
+
+Daily picks follow full-market leads → minute price/volume and historical structure verification → three entry profiles → conditional observation. Each profile contains at most five symbols, with no quota filling. Evidence rules use `king-evidence-20260920`; entry checks use `king-precision-v1`. These are local evidence rules without return calibration.
 
 | Stage | Implementation |
 | --- | --- |
-| Universe and screening | Main-board, non-ST filtering; weighted price change, turnover, volume ratio and traded amount, using 40 / 25 / 20 / 15 screening weights. |
-| Local five-day ranking | The independently qualified five-day BalancedRank signal. Missing, unqualified or out-of-scope models produce explicit rule observations; model and rule scores are not mixed. |
+| Universe and screening | Main-board, non-ST symbols. Separate ranks for traded amount, volume ratio, turnover and recovery from the open prioritize at most 30 symbols for deeper research. The former 40%-price-change weighted score is removed. There is no fixed price-change interval; unexamined symbols are not described as excluded. |
+| Selection evidence | Intraday 3/5-minute recovery with VWAP support or a local breakout; premarket output is observation only. Evidence completeness and cumulative traded amount organize observations. Price bias, ATR distance, reward/risk space and financial events are checked by profile; uncalibrated win rates are not displayed. |
+| Indicators and reasons | Each record preserves actual selection reasons, risks, trigger/invalidation/no-chase conditions, indicator values, units, uses, source timestamps and decision definitions. Indicators include 1/3/5-minute price changes, VWAP, 3-minute traded amount, moving averages, ATR, volatility, drawdown and historical resistance. Missing data is not fabricated. |
+| Evidence gaps | Minute history is cached by day, with attempts to build a 20-day same-time baseline. Insufficient historical, sector-minute or flow coverage blocks selection. Historically knowable financial/event data cannot be backfilled before the first archive. Catalysts and expectation gaps still require original news evidence. |
 | Quote and risk checks | Tencent/Sina fallback, security identifiers, original timestamps, prices and freshness. Incomplete auction evidence remains conditional; unbuyable limit-up names are tracked separately. |
 | Review and learning | Persisted source timestamps and observed price changes; unknown evidence stays unknown. Repeated gaps become review reminders. Friday retraining stays within the user's initialized stock universe. |
 | Manual AI review | Evidence, risk and disagreement summaries without changing the local ranking; invoked only by the user. |
@@ -39,7 +111,9 @@ SafeBound, BalancedRank and LimitPulse are project module names. Ranking percent
 
 ## Windows
 
-Install Python, Node.js 20+, Go (see `desktop/go.mod`) and Wails 2.11.
+Python 3.11+ can install the research tools through pip; Windows/macOS desktop wheels are built by private GitHub Actions. The repository stays private and is not published to PyPI. See [installation, platform differences and validation scope (Chinese)](docs/precision-and-packaging.md#私有-github-与-pip).
+
+Development requires Python, Node.js 20+, Go (see `desktop/go.mod`) and Wails 2.11.
 
 ```powershell
 python -m venv .venv
@@ -57,7 +131,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-stock-king-v2.ps1
 
 ## macOS (Apple Silicon)
 
-Install Xcode Command Line Tools, Python 3.12, Node.js 20+, Go and Homebrew `libomp`.
+Supports Apple Silicon (M series) and macOS 15+; no Intel Mac build is provided. Install native ARM64 Python 3.12, Node.js 20+, Go, Xcode Command Line Tools and Homebrew `libomp`.
 
 ```bash
 xcode-select --install
@@ -76,7 +150,7 @@ python3 scripts/install-macos-schedule.py
 # Remove: python3 scripts/install-macos-schedule.py --remove
 ```
 
-Stay logged in with the computer awake. Scheduling uses Shanghai time regardless of the Mac timezone. Missed intraday slots are not backfilled. The complete model environment does not currently support Intel Macs.
+Stay logged in with the computer awake. Scheduling uses Shanghai time regardless of the Mac timezone. Missed intraday slots are not backfilled. The native `macosx_15_0_arm64` wheel includes LightGBM and PyTorch for MASTER.
 
 ## Acknowledgements
 

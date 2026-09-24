@@ -2,13 +2,21 @@ name: Windows desktop wheel
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'README*.md'
+      - '**/README*.md'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'README*.md'
+      - '**/README*.md'
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
   group: windows-wheel-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 env:
   NODE_OPTIONS: --max-old-space-size=4096
 jobs:
@@ -44,5 +52,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Stock-King-windows-x64
+          retention-days: 14
           path: dist/desktop/*.whl
           if-no-files-found: error

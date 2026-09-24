@@ -2,7 +2,15 @@ name: macOS
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'README*.md'
+      - '**/README*.md'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'README*.md'
+      - '**/README*.md'
   workflow_dispatch:
 permissions:
   contents: read
@@ -34,6 +42,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Stock-King-macos-arm64
+          retention-days: 14
           path: |
             artifacts/macos/*.zip
             dist/desktop/*.whl
