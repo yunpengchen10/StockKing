@@ -146,6 +146,18 @@ def parse_quote_payload(payload, source, requested_codes):
                 'amount_cny': _number(fields[37 if source == 'tencent' else 9]) * (10_000 if source == 'tencent' else 1),
                 'source_time': stamp, **_book(fields, source),
             }
+            if source == 'tencent':
+                try:
+                    buy, sell = _number(fields[7])*100, _number(fields[8])*100
+                    total = quotes[code]['volume_shares']
+                    if buy >= 0 and sell >= 0 and buy+sell > 0 and buy+sell <= total+200:
+                        quotes[code].update(active_buy_volume_shares=buy, active_sell_volume_shares=sell,
+                            active_buy_share_pct=100*buy/(buy+sell),
+                            active_volume_imbalance_pct=100*(buy-sell)/(buy+sell),
+                            active_flow_source='Tencent 外盘/内盘分类估算', active_flow_as_of=stamp,
+                            active_flow_basis='腾讯外盘/内盘成交量分类估算；股数，不是资金净额')
+                except (ValueError, IndexError):
+                    pass
             # This is an explicit provider field, never a guessed 10% limit.
             if source == 'tencent' and len(fields) > 47:
                 try:
@@ -240,6 +252,11 @@ def _assess(code, results, checked):
                 'quote_usable_for_current_price_check': False,
                 'issues': list(dict.fromkeys(result['errors'].get(code, 'source_quote_unavailable') for result in results))}
     quote = ranked[0]
+    if 'active_buy_share_pct' not in quote:
+        active = next((r for r in ranked if 'active_buy_share_pct' in r and _fresh(r,checked)
+                       and abs(r['price']-quote['price'])<=.011),None)
+        if active:
+            quote = {**quote, **{k:v for k,v in active.items() if k.startswith('active_')}}
     phase, source_phase = market_phase(checked), market_phase(quote['source_time'])
     fresh = _fresh(quote, checked)
     same_day = quote['source_time'][:10] == _iso(checked)[:10]

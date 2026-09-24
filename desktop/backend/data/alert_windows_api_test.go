@@ -7,7 +7,7 @@ import (
 	"go-stock/backend/logger"
 	"testing"
 
-	"github.com/go-toast/toast"
+	"go-stock/internal/windowstoast"
 )
 
 // @Author spark

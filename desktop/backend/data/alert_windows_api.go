@@ -6,7 +6,7 @@ package data
 import (
 	"go-stock/backend/logger"
 
-	"github.com/go-toast/toast"
+	"go-stock/internal/windowstoast"
 )
 
 // AlertWindowsApi @Author spark

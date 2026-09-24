@@ -106,7 +106,13 @@ def review_local_observations(db, quote_fetcher, now, history=None, *, clock=Non
         if not run_id:
             continue
         run_stamp = _stamp(result.get("as_of") or row.get("as_of"))
-        for candidate in list(result.get("candidates") or []) + list(result.get("windvanes") or []):
+        profile_rows = result.get('profileCandidates') or {}
+        candidates = list(result.get('candidates') or []) + list(result.get('windvanes') or [])
+        candidates += list(result.get('precisionResearch') or []) + list(result.get('precisionWatchlist') or [])
+        candidates += list(result.get('evidenceInsufficient') or [])
+        for members in profile_rows.values():
+            candidates += members
+        for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
             code = str(candidate.get("code") or "")
@@ -147,6 +153,9 @@ def review_local_observations(db, quote_fetcher, now, history=None, *, clock=Non
             gaps = list(dict.fromkeys(gaps + review_gaps))
             gap_counts[code] += int(bool(gaps))
             observations.append({"run_id": run_id, "code": code, "name": candidate.get("name") or code,
+                'selected_profiles': [key for key, members in profile_rows.items()
+                                      if any(p.get('code') == code for p in members)],
+                'entry_decisions': (candidate.get('precisionDecision') or {}).get('profiles', {}),
                 "decision_at": decision.isoformat() if decision else None,
                 "reference_price": reference, "baseline_quote": baseline, "review_quote": review_quote,
                 "observation_change_pct": round((review_quote["price"] / reference - 1) * 100, 4) if not gaps else None,

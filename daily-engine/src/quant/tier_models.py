@@ -1635,6 +1635,9 @@ class TierModelService:
             scores = percentile_scores([float(item.get("tierRawSignal") or 0.0) for item in grouped])
             for item, score in zip(grouped, scores):
                 item["tierScore"] = round(float(score), 4)
+                if item.get("modelStatus") != "qualified":
+                    item["scoreMeaning"] = "未验证规则观察分在候选池内的相对名次；不是模型收益预测、胜率或行业中性结果"
+                    continue
                 item["scoreMeaning"] = {
                     "conservative": "稳健候选中未来收益下界的当日百分位",
                     "regular": "均衡候选中行业中性风险调整超额收益的当日百分位",

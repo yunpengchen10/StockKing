@@ -1,5 +1,6 @@
 """Native macOS build; runtime import checks fail the build before packaging."""
 import os
+import platform
 from pathlib import Path
 import subprocess
 import sys
@@ -11,8 +12,8 @@ import urllib.error
 import urllib.request
 
 root = Path(__file__).resolve().parents[1] / "daily-engine"
-if sys.platform != "darwin":
-    raise SystemExit("This build requires macOS")
+if sys.platform != "darwin" or platform.machine() != "arm64":
+    raise SystemExit("This build requires Apple Silicon and native ARM64 Python")
 args = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--name", "stock_analysis", "--onedir", "--distpath", "dist/backend",
         "--runtime-hook", "scripts/pyinstaller_runtime_compat.py"]
@@ -23,15 +24,16 @@ for package in ("api", "src.services", "src.quant", "futu", "lightgbm"):
 for package in ("litellm", "tiktoken", "akshare"):
     args += ["--collect-data", package]
 for module in ("multipart", "multipart.multipart", "orjson", "json_repair",
-               "tiktoken_ext.openai_public", "torch", "uvicorn.logging",
+               "tiktoken_ext.openai_public", "uvicorn.logging",
                "uvicorn.loops.auto", "uvicorn.protocols.http.auto",
                "uvicorn.protocols.websockets.auto", "uvicorn.lifespan.on"):
     args += ["--hidden-import", module]
+args += ['--hidden-import', 'torch']
 subprocess.run(args + ["main.py"], cwd=root, check=True)
 executable = root / "dist/backend/stock_analysis/stock_analysis"
 for module in ("api.app", "src.services.yao_scout.local_opportunities",
                "src.services.yao_scout.local_observation_review", "src.quant.service",
-               "src.services.screening.pipeline", "torch", "lightgbm", "futu", "orjson"):
+               "src.services.screening.pipeline", "lightgbm", "futu", "orjson", "torch"):
     subprocess.run([str(executable)], cwd=root, check=True, timeout=120,
                    env={**os.environ, "DSA_PACKAGED_IMPORT_PROBE": module})
 

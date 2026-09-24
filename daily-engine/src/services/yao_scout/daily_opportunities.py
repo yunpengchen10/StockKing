@@ -224,7 +224,12 @@ class DailyOpportunityService:
 
     def _finish_quotes(self, run, quality):
         now = self.clock()
-        records = run['candidates'] + run['windvanes']
+        records_by_code = {p['code']: p for p in run['candidates'] + run['windvanes']
+                           + run.get('precisionResearch', []) + run.get('precisionWatchlist', [])
+                           + run.get('evidenceInsufficient', [])}
+        for rows in run.get('profileCandidates', {}).values():
+            records_by_code.update({p['code']: p for p in rows})
+        records = list(records_by_code.values())
         quotes = [p.get('quote') or {} for p in records]
         # Recheck at completion: a slow final fetch must not leave an earlier
         # candidate marked fresh merely because it was fresh mid-loop.
@@ -233,8 +238,30 @@ class DailyOpportunityService:
                 continue
             state, gaps = validate_candidate(candidate, candidate['quote'], now, run['scanSlot'])
             candidate.update(status=state, stateLabel={'conditional':'条件观察','premarket':'盘前观察','expired':'已过期','windvane':'不可买风向标','data_insufficient':'数据不足'}[state])
-            candidate['data_quality'] = {'gaps': gaps}
+            candidate['data_quality'] = {'gaps': list(dict.fromkeys(gaps + candidate.get('evidenceGaps', [])
+                + candidate.get('precisionDecision', {}).get('sourceContext', {}).get('gaps', [])))}
             candidate['risks'] = list(dict.fromkeys([*candidate.get('risks', []), *gaps]))
+            if not candidate.get('evidenceEligible', True) and state not in {'expired', 'windvane'}:
+                candidate.update(status='evidence_insufficient', stateLabel='证据不足未入选')
+            if state != 'conditional':
+                for decision in candidate.get('precisionDecision', {}).get('profiles', {}).values():
+                    if decision['entryEligible']:
+                        decision.update(entryEligible=False, state='watch',
+                                        reasons=['完成时行情或可成交条件已失效，需重新扫描'])
+        for key in ('candidates', 'windvanes', 'evidenceInsufficient', 'precisionResearch'):
+            if key in run:
+                run[key] = [records_by_code[p['code']] for p in run[key]]
+        for key, rows in run.get('profileCandidates', {}).items():
+            run['profileCandidates'][key] = [records_by_code[p['code']] for p in rows
+                if records_by_code[p['code']]['precisionDecision']['profiles'][key]['entryEligible']]
+        if 'precisionWatchlist' in run:
+            run['candidates'] = run['profileCandidates']['regular']
+            run['precisionWatchlist'] = [p for p in records if p.get('precisionDecision') and
+                any(not d['entryEligible'] for d in p['precisionDecision']['profiles'].values())]
+            quality['precision_policy']['profile_counts'] = {k: len(v) for k, v in run['profileCandidates'].items()}
+            quality['precision_policy']['watch_count'] = len(run['precisionWatchlist'])
+            if not any(run['profileCandidates'].values()):
+                run['status'] = 'no_candidates_with_coverage_limits'
         fresh = sum(not quote_check(q, p['code'], now) for p, q in zip(records, quotes))
         stamps = sorted(q.get('provider_timestamp') or q.get('source_time') for q in quotes if q.get('provider_timestamp') or q.get('source_time'))
         quality['quote_coverage'] = {'requested': len(quotes), 'fresh': fresh,

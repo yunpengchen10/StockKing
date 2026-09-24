@@ -3,7 +3,9 @@ set -euo pipefail
 export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-[[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || { echo 'Build on an Apple Silicon Mac.' >&2; exit 1; }
+[[ "$(uname -s)" == Darwin ]] || { echo 'Build on a Mac.' >&2; exit 1; }
+ARCH="$(uname -m)"
+[[ "$ARCH" == arm64 ]] || { echo 'Build on Apple Silicon with native ARM64 tools.' >&2; exit 1; }
 command -v go >/dev/null
 command -v npm >/dev/null
 command -v wails >/dev/null
@@ -17,12 +19,14 @@ go test backend/data/mac_notification_darwin.go backend/data/mac_notification_da
 cd "$ROOT"
 cd desktop
 wails build -clean -platform darwin/arm64
-mv "$ROOT/desktop/build/bin/stock-king.app" "$ROOT/desktop/build/bin/Stock King.app"
+if [[ -d "$ROOT/desktop/build/bin/stock-king.app" && ! -d "$ROOT/desktop/build/bin/Stock King.app" ]]; then
+  mv "$ROOT/desktop/build/bin/stock-king.app" "$ROOT/desktop/build/bin/Stock King.app"
+fi
 APP="$ROOT/desktop/build/bin/Stock King.app"
 test -d "$APP"
 cd "$ROOT"
 "${PYTHON_BIN:-python3.12}" -m venv .venv
-.venv/bin/python -m pip install -r daily-engine/requirements.txt pyinstaller
+.venv/bin/python -m pip install '.[engine,models]' pyinstaller build
 .venv/bin/python scripts/build-macos-engine.py
 mkdir -p "$APP/Contents/Resources/daily-engine"
 ditto "$ROOT/daily-engine/dist/backend/stock_analysis" "$APP/Contents/Resources/daily-engine/stock_analysis"
@@ -38,5 +42,6 @@ STATUS=$?
 set -e
 [[ "$STATUS" == 2 ]] || { echo "Packaged desktop failed to execute: $STATUS" >&2; exit 1; }
 mkdir -p "$ROOT/artifacts/macos"
-ditto -c -k --sequesterRsrc --keepParent "$APP" "$ROOT/artifacts/macos/Stock-King-macos-arm64.zip"
-echo "Built: $ROOT/artifacts/macos/Stock-King-macos-arm64.zip"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ROOT/artifacts/macos/Stock-King-macos-$ARCH.zip"
+.venv/bin/python scripts/build-desktop-wheel.py
+echo "Built: $ROOT/artifacts/macos/Stock-King-macos-$ARCH.zip and platform wheel"

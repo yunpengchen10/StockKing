@@ -48,6 +48,22 @@ def test_price_comparison_keeps_two_source_times_and_never_creates_trade_returns
     assert "非成交收益" in result["meaning"]
 
 
+def test_all_profiles_and_rejected_controls_are_reviewed_once():
+    saved = row()
+    pick = saved['result']['candidates'].pop()
+    rejected = row(code='600002')['result']['candidates'][0]
+    saved['result'].update(profileCandidates={'conservative': [], 'regular': [], 'aggressive': [pick]},
+        precisionResearch=[pick, rejected], precisionWatchlist=[rejected])
+    calls = []
+    result = mod.review_local_observations(MemoryDB([saved]),
+        lambda code: calls.append(code) or quote(code=code), NOW)
+    assert sorted(calls) == ['600001', '600002']
+    observations = {r['code']: r for r in result['observations']}
+    assert observations['600001']['selected_profiles'] == ['aggressive']
+    assert observations['600002']['selected_profiles'] == []
+    assert not result['training_eligible']
+
+
 @pytest.mark.parametrize("change", [
     {"source_time": None, "fetched_at": NOW.isoformat()},
     {"source_time": (NOW + timedelta(seconds=1)).isoformat()},

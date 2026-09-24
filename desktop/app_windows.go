@@ -10,8 +10,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/go-toast/toast"
 	"github.com/wailsapp/wails/v2/pkg/options"
+	"go-stock/internal/windowstoast"
 )
 
 const (

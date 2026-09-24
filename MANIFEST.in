@@ -1,0 +1,14 @@
+include LICENSE THIRD_PARTY_NOTICES.md README.md setup.py
+recursive-include licenses *
+recursive-include python *.py
+recursive-include daily-engine/src *.py *.yaml *.yml *.json *.txt *.csv *.md *.html *.j2 *.jinja2 *.png *.jpg
+recursive-include daily-engine/src LICENSE NOTICE
+include docs/precision-and-packaging.md
+recursive-include daily-engine/api *.py
+recursive-include daily-engine/data_provider *.py *.json *.csv
+recursive-include daily-engine/bot *.py
+recursive-include daily-engine/strategies *.yaml *.md
+recursive-include daily-engine/resources *.json *.txt *.csv *.yaml
+include daily-engine/main.py daily-engine/server.py daily-engine/LICENSE daily-engine/THIRD_PARTY_NOTICES.md
+global-exclude *.pyc *.db *.sqlite* *.log .env *.pt *.pth *.pkl *.joblib
+prune daily-engine/src/__pycache__

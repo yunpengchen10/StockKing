@@ -28,10 +28,13 @@ jobs:
       - run: brew install libomp
       - run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
       - run: bash scripts/build-macos.sh
+      - run: .venv/bin/python scripts/smoke-wheel.py --native
       - run: go test .
         working-directory: desktop
       - uses: actions/upload-artifact@v4
         with:
           name: Stock-King-macos-arm64
-          path: artifacts/macos/Stock-King-macos-arm64.zip
+          path: |
+            artifacts/macos/*.zip
+            dist/desktop/*.whl
           if-no-files-found: error

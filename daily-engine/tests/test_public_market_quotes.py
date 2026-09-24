@@ -66,6 +66,16 @@ def test_real_field_layouts_timestamps_and_units():
     assert a['order_book_valid'] is True
 
 
+def test_active_buy_sell_fields_are_shares_with_independent_provider_time():
+    a=quotes.parse_quote_payload(tencent(**{'7':'300','8':'200'}),'tencent',CODES)['quotes']['603936']
+    assert a['active_buy_volume_shares']==30000
+    assert a['active_sell_volume_shares']==20000
+    assert a['active_buy_share_pct']==60 and a['active_volume_imbalance_pct']==20
+    assert a['active_flow_as_of']==NOW.isoformat()
+    b=quotes.parse_quote_payload(tencent(**{'7':'900','8':'200'}),'tencent',CODES)['quotes']['603936']
+    assert 'active_buy_share_pct' not in b
+
+
 @pytest.mark.parametrize('fields', [{'3': ''}, {'4': '0'}, {'3': 'NaN'}, {'2': '600026'},
                                   {'30': '20260230145500'}, {'30': '2026091414550'}, {'3': '12'}])
 def test_bad_quotes_do_not_destroy_siblings(fields):

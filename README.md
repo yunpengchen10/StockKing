@@ -11,17 +11,23 @@
 - 自动任务使用本地模型；AI 复审由你手动触发，不增加自动 AI 调用费用。
 - 数据、模型和设置保存在本机。软件不自动下单。
 
+需要让 AI 工具复用同一套行情，可使用 [只读 MCP 行情服务](quote-service/README.md)。支持 Windows、macOS 的 Python 运行方式；ChatGPT 云端仍需完成远程连接授权和实测。
+
 ## 推荐算法
 
-当前日常精选采用“全市场初筛 → 本地五日排序 → 报价与风险核验 → 最多 5 只候选”的流程。
+2.6 新增三档入场检查与 AKShare 财报、业绩预告、解禁归档：稳健、均衡、激进在“当日机会”中切换。数据缺失不等于无风险，压力空间不足会阻止入选。初始阈值尚未获得样本外收益验证；详见 [算法对照、三档门槛与验证计划](docs/precision-and-packaging.md)。
+
+当前日常精选采用“全市场线索 → 分钟价量与历史结构核验 → 三档入场检查 → 条件观察”的流程，每档最多 5 只，不补齐名额。证据规则版本 `king-evidence-20260920`，入场检查版本 `king-precision-v1`。这是本地、未经收益校准的证据规则。
 
 | 环节 | 实际实现 |
 | --- | --- |
-| 股票池与初筛 | 主板、非 ST 筛选；按涨幅、换手率、量比和成交额加权排序，初筛权重为 40 / 25 / 20 / 15。 |
-| 本地五日精选 | 使用独立通过五日检验的 BalancedRank 模型，按五日原始信号排序。模型缺失、未通过或超出训练范围时显示“规则观察”，不混合模型分数。 |
+| 股票池与初筛 | 主板、非 ST；成交额、量比、换手和开盘修复各自名次用于安排最多30只深研。取消涨幅40%加权总分；没有固定涨幅区间，也不把未深研股票称为已排除。 |
+| 入选依据 | 盘中核验3/5分钟回升与VWAP承接或局部突破；盘前只列观察。按即时价量证据完整性、累计成交额安排观察；价格乖离、ATR距离、空间风险比和财务事件按三档检查，不显示未经校准的胜率。 |
+| 指标与理由 | 每只保存实际入选原因、风险、触发/失效/不追条件，以及指标数值、单位、用途、来源时间和判断口径。指标包括1/3/5分钟涨速、VWAP、3分钟成交额、均线、ATR、波动、回撤及历史压力。缺失数据不补造。 |
+| 能力缺口 | 分钟历史逐日缓存并尝试补齐20日同刻基准；历史、行业分钟或资金覆盖不足时不入选。财报与事件首次归档之前的历史可知数据不可回填；催化和预期差仍需原始新闻证据。 |
 | 行情与风险 | 腾讯、新浪轮换与逐股回退；核对证券代码、来源时间、价格和新鲜度。09:20 竞价字段不足时只给条件观察，涨停等不可买对象单列风向标。 |
 | 复盘与学习 | 保存候选和源时间，计算实际观察价格变化；缺数据保留未知。重复缺口成为下次核验提醒；周五仅在用户已选训练股票池内重训。观察涨跌不伪装成成交收益。 |
-| 手动 AI 复审 | 汇总证据、风险和分歧，不改变本地排名；只有手动触发才调用所选模型。 |
+| 手动 AI 复审 | 汇总证据、风险和分歧，不改变本地排名；只有手动触发才调用所选模型。后台不会因本次调整增加AI调用。 |
 
 ## 量化算法
 
@@ -39,6 +45,8 @@ SafeBound、BalancedRank、LimitPulse 是本项目的模块名称。展示的排
 
 ## Windows
 
+Python 3.11+ 可用 pip 安装研究工具；Windows/macOS 桌面 wheel 由私有 GitHub Actions 构建。仓库保持私有，不发布 PyPI。完整安装命令、平台差异和验收范围见 [pip 安装说明](docs/precision-and-packaging.md#私有-github-与-pip)。
+
 开发需要 Python、Node.js 20+、Go（版本见 `desktop/go.mod`）和 Wails 2.11。
 
 ```powershell
@@ -55,9 +63,9 @@ wails dev
 powershell -ExecutionPolicy Bypass -File scripts/build-stock-king-v2.ps1
 ```
 
-## macOS（M 系列芯片）
+## macOS（Apple Silicon）
 
-需要 Xcode Command Line Tools、Python 3.12、Node.js 20+、Go 和 Homebrew 的 `libomp`。
+支持 Apple Silicon（M 系列）和 macOS 15+，不提供 Intel Mac 构建。需要原生 ARM64 的 Python 3.12、Node.js 20+、Go、Xcode Command Line Tools 和 Homebrew 的 `libomp`。
 
 ```bash
 xcode-select --install
@@ -76,7 +84,7 @@ python3 scripts/install-macos-schedule.py
 # 停用：python3 scripts/install-macos-schedule.py --remove
 ```
 
-需保持电脑开机、唤醒并登录。错过的盘中时点不会补造推荐；Mac 使用哪个时区都按北京时间调度。Intel Mac 暂未支持当前完整模型环境。
+需保持电脑开机、唤醒并登录。错过的盘中时点不会补造推荐；Mac 使用哪个时区都按北京时间调度。原生 wheel 为 `macosx_15_0_arm64`，包含 LightGBM 和 MASTER 所需 PyTorch。
 
 ## 致谢与引用
 

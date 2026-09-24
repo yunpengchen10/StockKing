@@ -39,6 +39,7 @@ type SidecarManager struct {
 	port     int
 	cmd      *exec.Cmd
 	cancel   context.CancelFunc
+	done     chan struct{}
 	client   *http.Client
 	stopping bool
 }
@@ -61,19 +62,23 @@ func (m *SidecarManager) Start(parent context.Context) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	m.cancel = cancel
+	m.done = make(chan struct{})
+	done := m.done
 	m.stopping = false
 	m.status = EngineStatus{State: "starting", Message: "Starting Stock King research engine"}
 	m.mu.Unlock()
-	go m.supervise(ctx)
+	go func() {
+		defer close(done)
+		m.supervise(ctx)
+	}()
 }
 
 func (m *SidecarManager) Stop() {
 	m.mu.Lock()
 	m.stopping = true
 	cancel := m.cancel
-	m.cancel = nil
+	done := m.done
 	cmd := m.cmd
-	m.cmd = nil
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -81,6 +86,16 @@ func (m *SidecarManager) Stop() {
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
 	}
+	// Reap the helper before Wails exits. Keep Start disabled until the old
+	// supervisor has finished, including cancellation during initial launch.
+	if done != nil {
+		<-done
+	}
+	m.mu.Lock()
+	m.cancel = nil
+	m.cmd = nil
+	m.done = nil
+	m.mu.Unlock()
 	m.setStatus(EngineStatus{State: "stopped", Message: "Stock King engine stopped"})
 }
 
@@ -107,7 +122,7 @@ func (m *SidecarManager) supervise(ctx context.Context) {
 		}
 
 		waitCh := make(chan error, 1)
-		go func() { waitCh <- cmd.Wait() }()
+		go func(process *exec.Cmd) { waitCh <- process.Wait() }(cmd)
 		ready := false
 		deadline := time.NewTimer(60 * time.Second)
 		ticker := time.NewTicker(350 * time.Millisecond)
@@ -117,6 +132,7 @@ func (m *SidecarManager) supervise(ctx context.Context) {
 				deadline.Stop()
 				ticker.Stop()
 				_ = cmd.Process.Kill()
+				<-waitCh
 				return
 			case err := <-waitCh:
 				deadline.Stop()
@@ -131,6 +147,7 @@ func (m *SidecarManager) supervise(ctx context.Context) {
 			case <-deadline.C:
 				ticker.Stop()
 				_ = cmd.Process.Kill()
+				<-waitCh
 				m.setStatus(EngineStatus{State: "restarting", RestartCount: restarts, Message: "Stock King engine health check timed out"})
 				cmd = nil
 			}
@@ -149,12 +166,15 @@ func (m *SidecarManager) supervise(ctx context.Context) {
 		ticker.Stop()
 		now := time.Now().Format(time.RFC3339)
 		m.mu.Lock()
-		m.status = EngineStatus{State: "ready", Ready: true, Port: m.port, StartedAt: now, LastCheckAt: now, RestartCount: restarts}
+		if !m.stopping {
+			m.status = EngineStatus{State: "ready", Ready: true, Port: m.port, StartedAt: now, LastCheckAt: now, RestartCount: restarts}
+		}
 		m.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
 			_ = cmd.Process.Kill()
+			<-waitCh
 			return
 		case err := <-waitCh:
 			m.setStatus(EngineStatus{State: "restarting", RestartCount: restarts + 1, Message: processExitMessage(err)})
@@ -181,6 +201,7 @@ func (m *SidecarManager) launch(ctx context.Context, restarts int) (*exec.Cmd, e
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, command, args...)
+	cmd.WaitDelay = 3 * time.Second
 	cmd.Dir = workingDir
 	hideSidecarWindow(cmd)
 	dailyData := filepath.Join(m.paths.DataDir, "daily")
@@ -215,11 +236,18 @@ func (m *SidecarManager) launch(ctx context.Context, restarts int) (*exec.Cmd, e
 		}
 		return nil, fmt.Errorf("start Stock King engine: %w", err)
 	}
+	// Start duplicates the log handles into the child. The parent must not
+	// retain an open file on every engine restart.
+	if logFile != nil {
+		_ = logFile.Close()
+	}
 	m.mu.Lock()
 	m.port = port
 	m.token = token
 	m.cmd = cmd
-	m.status = EngineStatus{State: "starting", Port: port, RestartCount: restarts, Message: "Waiting for Stock King engine health check"}
+	if !m.stopping {
+		m.status = EngineStatus{State: "starting", Port: port, RestartCount: restarts, Message: "Waiting for Stock King engine health check"}
+	}
 	m.mu.Unlock()
 	return cmd, nil
 }
@@ -294,6 +322,10 @@ func (m *SidecarManager) accessToken() string {
 
 func (m *SidecarManager) setStatus(status EngineStatus) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopping && status.State != "stopped" {
+		return
+	}
 	if status.Port == 0 {
 		status.Port = m.port
 	}
@@ -301,7 +333,6 @@ func (m *SidecarManager) setStatus(status EngineStatus) {
 		status.RestartCount = m.status.RestartCount
 	}
 	m.status = status
-	m.mu.Unlock()
 }
 
 func randomToken() (string, error) {

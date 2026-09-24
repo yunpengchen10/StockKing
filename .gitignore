@@ -44,6 +44,7 @@ data/*.db
 data/*.db-*
 data/models/
 **/node_modules/
+**/.wrangler/
 **/dist/
 desktop/data/
 desktop/logs/
@@ -57,3 +58,15 @@ daily-engine/static/
 daily-engine/apps/
 daily-engine/.electron-builder-cache/
 daily-engine/stock_analysis.spec
+# Generated research, package builds and local UI backups are never source.
+/daily-engine/output/
+/desktop/frontend/dist-before-*/
+/desktop/frontend/dist.backup-*/
+/build/
+/dist/
+*.egg-info/
+/.package-check/
+/.test-tmp*/
+/stock_king-*/
+/.package-build.log
+/.sdist-*.log

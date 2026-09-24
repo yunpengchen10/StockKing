@@ -1,0 +1,7 @@
+{
+  "name": "stock-king-quotes",
+  "main": "worker.ts",
+  "compatibility_date": "2026-09-15",
+  "workers_dev": true,
+  "observability": { "enabled": false }
+}

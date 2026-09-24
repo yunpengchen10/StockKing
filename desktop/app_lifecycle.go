@@ -114,13 +114,7 @@ func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 			data.UpdateConfig(cfg)
 		}
 
-		if a.sidecar != nil {
-			a.sidecar.Stop()
-		}
-		if a.cron != nil {
-			a.cron.Stop()
-		}
-		return false
 	}
+	a.stopBackgroundServices()
 	return false
 }

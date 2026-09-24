@@ -320,7 +320,7 @@ def test_three_tier_contract_and_old_cache_recompute(monkeypatch, tmp_path):
     result = StockKingService(config=object()).picks(max_per_board=5)
     assert result["schemaVersion"] == STOCK_KING_SCHEMA_VERSION
     assert result["schemaVersion"] == 4
-    assert result["methodologyVersion"] == "king-local-5d-v1"
+    assert result["methodologyVersion"] == "king-evidence-20260915"
     assert result["classicMethodologyVersion"] == "king-three-objective-v2.3.4"
     assert result["adaptive"]["status"] == "unavailable"
     assert set(result["tiers"]) == {"conservative", "regular", "aggressive"}
@@ -332,7 +332,8 @@ def test_three_tier_contract_and_old_cache_recompute(monkeypatch, tmp_path):
     assert aggressive["potentialHorizon"] == "1-3_trading_days"
     assert aggressive["buyability"]["tradableAtGeneration"] is True
     assert aggressive["modelStatus"] == "rule_fallback"
-    assert "百分位" in aggressive["scoreMeaning"]
+    assert "未验证规则观察分" in aggressive["scoreMeaning"]
+    assert "不是模型收益预测" in aggressive["scoreMeaning"]
     assert "touchProbability3d" not in aggressive
 
 

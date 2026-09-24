@@ -34,6 +34,7 @@ import (
 // App struct
 type App struct {
 	ctx                context.Context
+	shutdownOnce       sync.Once
 	paths              AppPaths
 	sidecar            *SidecarManager
 	cache              *freecache.Cache
@@ -1200,25 +1201,31 @@ func addStockFollowData(follow data.FollowedStock, stockData *data.StockInfo) {
 // shutdown is called at application termination
 func (a *App) shutdown(ctx context.Context) {
 	defer PanicHandler()
-	if a.sidecar != nil {
-		a.sidecar.Stop()
-	}
-	if a.cron != nil {
-		a.cron.Stop()
-	}
-	// 停止飞书应用机器人长连接
-	a.stopFeishuBotInternal()
-	// 记录当前窗口大小，供下次启动时还原
-	if a.ctx != nil {
-		if w, h := runtime.WindowGetSize(a.ctx); w > 0 && h > 0 {
-			cfg := data.GetSettingConfig()
-			cfg.WindowWidth = w
-			cfg.WindowHeight = h
-			data.UpdateConfig(cfg)
-			//logger.SugaredLogger.Infof("save window size: %dx%d", w, h)
+	// Window geometry is saved by beforeClose while the native window is alive.
+	// OnShutdown must never call back into the destroyed WebView/window.
+	a.stopBackgroundServices()
+}
+
+func (a *App) stopBackgroundServices() {
+	a.shutdownOnce.Do(func() {
+		if a.cron != nil {
+			a.cron.Stop()
 		}
-	}
-	//logger.SugaredLogger.Infof("application shutdown Version:%s", Version)
+		a.summaryMu.Lock()
+		if a.summaryCancel != nil {
+			a.summaryCancel()
+		}
+		a.summaryMu.Unlock()
+		a.agentMu.Lock()
+		if a.agentCancel != nil {
+			a.agentCancel()
+		}
+		a.agentMu.Unlock()
+		a.stopFeishuBotInternal()
+		if a.sidecar != nil {
+			a.sidecar.Stop()
+		}
+	})
 }
 
 // Greet returns a greeting for the given name
