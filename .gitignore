@@ -49,6 +49,7 @@ data/models/
 desktop/data/
 desktop/logs/
 desktop/build/bin/
+desktop/build/darwin/
 desktop/build/windows/installer/tmp/
 daily-engine/data/
 daily-engine/logs/

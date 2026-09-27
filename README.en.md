@@ -16,15 +16,15 @@ AI tools can reuse the same quotes through the [read-only MCP quote service](quo
 
 ## Quick start
 
-1. Obtain a native wheel supplied by the maintainer, or follow [local building and distribution](docs/LOCAL_BUILD.en.md) on your Windows / Apple Silicon computer. No Actions, paid build platform or cloud server is required. The repository is currently in private testing, so source access requires permission.
-2. A 64-bit Python 3.12 installation is recommended. Install your native wheel, then launch:
+1. Obtain a native wheel or macOS `.app` archive supplied by the maintainer. If you have source access, follow [local building and distribution](docs/LOCAL_BUILD.en.md) to build on your own Windows or Apple Silicon computer. The repository is currently in private testing, so cloning requires permission.
+2. Python 3.11+ is supported (3.12 recommended); use a native 64-bit Python matching your platform. From the directory containing the wheel, run the following command (substitute the actual filename if its version differs):
 
    ```text
-   python -m pip install "download-directory/stock_king-2.6.0-py3-none-win_amd64.whl"
+   python -m pip install ./stock_king-2.6.0-py3-none-win_amd64.whl
    stock-king
    ```
 
-   Apple Silicon uses `stock_king-2.6.0-py3-none-macosx_15_0_arm64.whl` and requires ARM64 Python. Windows requires WebView2 Runtime. On Mac, you can also use the `.app` archive from the build artifacts.
+   Apple Silicon uses `stock_king-2.6.0-py3-none-macosx_15_0_arm64.whl` and requires ARM64 Python. Windows requires WebView2 Runtime. On Mac, you can instead extract the `.app` archive, copy `Stock King.app` to `/Applications`, open it, and confirm the interface says “已连接” (Connected).
 3. Add research symbols in “自选”, then select “刷新全部” in “精选 → 当日机会”. Check evidence timestamps, missing data and entry conditions first.
 4. Configure a model when you need AI; quotes and local rules do not require an AI API key. Select a training universe or prepare backtest data before using “策略”.
 
@@ -35,7 +35,7 @@ python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/S
 stock-king doctor
 ```
 
-Source installation provides the research CLI; use a platform-native wheel for the complete desktop. The display name is **Stock King**, and the GitHub repository is **StockKing**. The command remains `stock-king` for compatibility with existing installations. See [local building and distribution](docs/LOCAL_BUILD.en.md).
+Source installation provides the research CLI; use a platform-native wheel or the macOS `.app` archive for the complete desktop. The display name is **Stock King**, and the GitHub repository is **StockKing**. The command remains `stock-king` for compatibility with existing installations. See [local building and distribution](docs/LOCAL_BUILD.en.md).
 
 ## Pages and workflow
 
@@ -123,7 +123,7 @@ SafeBound, BalancedRank and LimitPulse are project module names. Ranking percent
 
 Python 3.11+ can install the research tools through pip; 3.12 is recommended. Desktop wheels are built locally. The repository is currently private and not published on PyPI. See [local building and distribution](docs/LOCAL_BUILD.en.md) for installation and platform differences.
 
-Development requires Python, Node.js 20+, Go (see `desktop/go.mod`) and Wails 2.11.
+Development requires Python, Node.js 20+, Go 1.26 (as required by `desktop/go.mod`) and Wails 2.11. Go 1.27.1 failed during this project's Wails 2.11 binding build; the packaging scripts select Go 1.26.8.
 
 ```powershell
 python -m venv .venv
@@ -141,26 +141,34 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows-wheel.ps1
 
 ## macOS (Apple Silicon)
 
-Supports Apple Silicon (M series) and macOS 15+; no Intel Mac build is provided. Install native ARM64 Python 3.12, Node.js 20+, Go, Xcode Command Line Tools and Homebrew `libomp`.
+Supports Apple Silicon (M series) and macOS 15+; no Intel Mac build is provided. For a source build, first install an official macOS universal2 Python 3.11 or 3.12 (3.12 recommended) from [python.org](https://www.python.org/downloads/macos/). Use its native ARM64 interpreter. Also install Node.js 20+, Go 1.26, Xcode Command Line Tools and `libomp`; if `brew` is missing, follow the [official Homebrew installer](https://brew.sh/) first. Check the command line tools with `xcode-select -p`; if missing, run `xcode-select --install` and wait for installation to finish. Go 1.27.1 failed during this project's Wails 2.11 binding build. The build script checks the Python interpreter and project virtual environment before the expensive build stages.
+
+Build from source:
 
 ```bash
-xcode-select --install
-brew install python@3.12 node go libomp
-go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
-export PATH="$PATH:$(go env GOPATH)/bin"
+xcode-select -p
+brew install node go@1.26 libomp
+export PATH="$(brew --prefix go@1.26)/bin:$PATH"
+go version  # must report go1.26.x
+export PYTHON_BIN=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12
+"$PYTHON_BIN" -c 'import platform, pyexpat; assert platform.machine() == "arm64"'
+git clone https://github.com/yunpengchen10/StockKing.git
+cd StockKing
 bash scripts/build-macos.sh
 ```
 
-The outputs are `artifacts/macos/Stock-King-macos-arm64.zip` and a wheel in `dist/desktop/`. Extract the archive and move `Stock King.app` to Applications. The build is ad-hoc signed and requires no purchased developer certificate; it is not Apple-notarized, so first launch may need approval in System Settings → Privacy & Security.
+If you installed Python 3.11, change `PYTHON_BIN` to `/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11`. The script uses Go 1.26.8, installs Wails 2.11 if needed, and recreates an incompatible project `.venv` before the build. Standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` settings are inherited by build commands when your network needs a proxy. Dependency downloads and the full test, desktop, engine and wheel builds can take considerable time on a first run.
 
-Enable independent background research, including when the desktop window is closed:
+The outputs are `artifacts/macos/Stock-King-macos-arm64.zip` and a wheel in `dist/desktop/`. Extract the archive, move `Stock King.app` to `/Applications`, open it, and confirm “已连接” (Connected) in the interface. The build is ad-hoc signed and requires no purchased developer certificate; it is not Apple-notarized, so first launch may need approval in System Settings → Privacy & Security. The script stages the signed application outside cloud-synced folders to avoid extended attributes invalidating the signature.
+
+From the source checkout, enable independent background research, including when the desktop window is closed:
 
 ```bash
 python3 scripts/install-macos-schedule.py
-# Remove: python3 scripts/install-macos-schedule.py --remove
+# Remove later: python3 scripts/install-macos-schedule.py --remove
 ```
 
-Stay logged in with the computer awake. Scheduling uses Shanghai time regardless of the Mac timezone. Missed intraday slots are not backfilled. The native `macosx_15_0_arm64` wheel includes LightGBM and PyTorch for MASTER.
+This is a separate, optional step after installing the `.app`; the desktop build does not install background jobs. Stay logged in with the computer awake. On weekdays, the jobs start preparation at 09:10, 10:20 and 14:45, then refresh at 09:20, 10:30 and 14:55; review runs at 15:30, and Friday learning at 15:45. All times are Asia/Shanghai regardless of the Mac timezone. Missed intraday slots are not backfilled. The native `macosx_15_0_arm64` wheel includes LightGBM and PyTorch for MASTER.
 
 ## Acknowledgements
 

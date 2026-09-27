@@ -23,7 +23,7 @@ classifiers = [
 data = ["akshare>=1.18.0,<2", "pandas>=2,<4", "numpy>=1.26,<3", "requests>=2.31", "python-dotenv>=1", "tenacity>=8", "PyYAML>=6"]
 engine = ["akshare>=1.18.0,<2", "pandas>=2,<4", "numpy>=1.26,<3", "requests>=2.31", "python-dotenv>=1", "tenacity>=8", "PyYAML>=6",
   "setuptools>=77,<81", "sqlalchemy>=2", "schedule>=1.2", "exchange-calendars>=4.13",
-  "efinance>=0.5.5", "tushare>=1.4", "pytdx>=1.72", "baostock>=0.8", "yfinance>=0.2",
+  "efinance==0.5.9", "tushare>=1.4", "pytdx>=1.72", "baostock>=0.8", "yfinance>=0.2",
   "longbridge>=4.0.5,<5; platform_system != 'Linux'", "tickflow>=0.1.24", "futu-api==10.8.6808",
   "pypinyin>=0.50", "openpyxl>=3.1", "scikit-learn>=1.5", "json-repair>=0.55.1", "orjson>=3.10,<4",
   "litellm>=1.80.10,!=1.82.7,!=1.82.8,<2", "tiktoken>=0.8,<0.12", "openai>=1",

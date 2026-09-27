@@ -18,7 +18,8 @@ def main():
         bundle = work/'bundle'
         bundle.mkdir()
         if sys.platform == 'darwin' and platform.machine() == 'arm64':
-            app = ROOT/'desktop/build/bin/Stock King.app'
+            app = Path(os.environ.get('STOCK_KING_MACOS_APP',
+                                      str(ROOT/'desktop/build/bin/Stock King.app')))
             if not (app/'Contents/Resources/daily-engine/stock_analysis/stock_analysis').is_file():
                 raise RuntimeError('Build and smoke-test the macOS app and engine first')
             # ditto preserves framework symlinks, execute bits and the signature.

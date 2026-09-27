@@ -5,6 +5,7 @@ $buildRepo = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $buildPython = Join-Path $buildRepo '.venv\Scripts\python.exe'
 $savedNodeOptions = $env:NODE_OPTIONS
 $savedPythonBin = $env:PYTHON_BIN
+$savedGoToolchain = $env:GOTOOLCHAIN
 $savedPath = $env:PATH
 
 function Invoke-BuildStep {
@@ -21,6 +22,19 @@ foreach ($command in @($Python, 'go', 'npm')) {
 }
 Push-Location $buildRepo
 try {
+    # Pin the toolchain before any Go command; Go downloads it when necessary.
+    $env:GOTOOLCHAIN = 'go1.26.8+auto'
+    $goVersion = & go version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cannot select Go 1.26.8 automatically. Install Go 1.21+ with network access, or install Go 1.26.8 directly. Details: $goVersion"
+    }
+    if (($goVersion | Out-String).Trim() -ne 'go version go1.26.8 windows/amd64') {
+        throw "Expected Go 1.26.8 on Windows x64; got: $goVersion"
+    }
+    $goTarget = @(& go env GOOS GOARCH)
+    if ($LASTEXITCODE -ne 0 -or $goTarget.Count -ne 2 -or $goTarget[0] -ne 'windows' -or $goTarget[1] -ne 'amd64') {
+        throw "Go must target windows/amd64; got GOOS/GOARCH: $($goTarget -join '/')"
+    }
     if (-not (Test-Path -LiteralPath $buildPython)) {
         Invoke-BuildStep $Python @('-m', 'venv', '.venv')
     }
@@ -38,7 +52,7 @@ try {
         $goBinaryDirectory = Join-Path (($goWorkPath -split ';')[0]) 'bin'
     }
     $env:PATH = "$goBinaryDirectory;$env:PATH"
-    Invoke-BuildStep $buildPython @('-m', 'pytest', 'daily-engine/tests/test_precision_policy.py', 'daily-engine/tests/test_local_quote_integration.py', 'daily-engine/tests/test_local_observation_review.py', 'daily-engine/tests/test_economy_review.py', 'daily-engine/tests/test_public_market_quotes.py', 'daily-engine/tests/test_recommendation_evidence.py', 'daily-engine/tests/test_complete_market_evidence.py', 'daily-engine/tests/test_intraday_evidence.py', '-q')
+    Invoke-BuildStep $buildPython @('-m', 'pytest', 'daily-engine/tests/test_precision_policy.py', 'daily-engine/tests/test_local_quote_integration.py', 'daily-engine/tests/test_local_observation_review.py', 'daily-engine/tests/test_economy_review.py', 'daily-engine/tests/test_public_market_quotes.py', 'daily-engine/tests/test_recommendation_evidence.py', 'daily-engine/tests/test_complete_market_evidence.py', 'daily-engine/tests/test_intraday_evidence.py', 'daily-engine/tests/test_efinance_frozen_cache.py', '-q')
     Push-Location (Join-Path $buildRepo 'daily-engine')
     try { & '.\scripts\build-backend.ps1' -SkipDependencyInstall } finally { Pop-Location }
     Push-Location (Join-Path $buildRepo 'desktop\frontend')
@@ -58,6 +72,7 @@ try {
 } finally {
     $env:NODE_OPTIONS = $savedNodeOptions
     $env:PYTHON_BIN = $savedPythonBin
+    $env:GOTOOLCHAIN = $savedGoToolchain
     $env:PATH = $savedPath
     Pop-Location
 }

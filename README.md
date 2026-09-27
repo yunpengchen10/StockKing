@@ -16,15 +16,15 @@
 
 ## 快速开始
 
-1. 获取维护者提供的原生 wheel，或按 [本地构建与分发](docs/LOCAL_BUILD.md) 在自己的 Windows / Apple Silicon 电脑打包。无需 Actions、付费构建平台或云服务器；当前仓库仍是私有内测，源码访问需要授权。
-2. 建议使用 64 位 Python 3.12。安装已有的原生 wheel，然后启动：
+1. 已有安装包时，Mac 用户直接解压 `Stock-King-macos-arm64.zip`，将 `Stock King.app` 放入“应用程序”并打开；看到界面左下角“已连接”即表示本地引擎已启动。此方式无需安装 Python、Go 或 Node.js。Windows 用户使用平台原生 wheel。没有安装包时，按 [本地构建与分发](docs/LOCAL_BUILD.md) 在自己的电脑构建；当前仓库仍是私有内测，克隆源码需要授权。
+2. 使用原生 wheel 时，安装对应平台的 64 位 Python 3.11+（推荐 3.12），在 wheel 所在目录运行（版本号变化时使用实际文件名）：
 
    ```text
-   python -m pip install "下载目录/stock_king-2.6.0-py3-none-win_amd64.whl"
+   python -m pip install ./stock_king-2.6.0-py3-none-win_amd64.whl
    stock-king
    ```
 
-   Apple Silicon 使用 `stock_king-2.6.0-py3-none-macosx_15_0_arm64.whl`；Python 也须为 ARM64。Windows 需要 WebView2 Runtime。Mac 也可直接使用构建产物中的 `.app` 压缩包。
+   Apple Silicon 使用 `stock_king-2.6.0-py3-none-macosx_15_0_arm64.whl`，且 Python 必须为 ARM64。Windows 需要 WebView2 Runtime。
 3. 打开“自选”添加研究股票，在“精选 → 当日机会”点“刷新全部”，先检查数据时间、证据缺口与入场条件。
 4. 需要 AI 时再配置模型；看行情、运行本地规则不要求 AI API Key。进入“策略”前先选择训练股票池或准备回测数据。
 
@@ -35,7 +35,7 @@ python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/S
 stock-king doctor
 ```
 
-源码安装提供研究 CLI，完整桌面请使用平台原生 wheel。项目显示名为 **Stock King**，GitHub 仓库名为 **StockKing**；兼容现有安装的命令仍为 `stock-king`。详情见 [本地构建与分发](docs/LOCAL_BUILD.md)。
+源码安装提供研究 CLI，完整桌面请使用平台原生 wheel 或 macOS `.app` 安装包。项目显示名为 **Stock King**，GitHub 仓库名为 **StockKing**；兼容现有安装的命令仍为 `stock-king`。详情见 [本地构建与分发](docs/LOCAL_BUILD.md)。
 
 ## 页面与使用流程
 
@@ -123,7 +123,7 @@ SafeBound、BalancedRank、LimitPulse 是本项目的模块名称。展示的排
 
 Python 3.11+ 可用 pip 安装研究工具，建议 3.12。桌面 wheel 在本地电脑构建，仓库目前保持私有，尚未发布 PyPI。完整安装命令和平台差异见 [本地构建与分发](docs/LOCAL_BUILD.md)。
 
-开发需要 Python、Node.js 20+、Go（版本见 `desktop/go.mod`）和 Wails 2.11。
+开发需要 Python、Node.js 20+、Go 1.26（版本见 `desktop/go.mod`）和 Wails 2.11。本项目的 Wails 2.11 绑定生成在 Go 1.27 上曾报错，构建脚本固定使用 Go 1.26.8。
 
 ```powershell
 python -m venv .venv
@@ -141,26 +141,28 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows-wheel.ps1
 
 ## macOS（Apple Silicon）
 
-支持 Apple Silicon（M 系列）和 macOS 15+，不提供 Intel Mac 构建。需要原生 ARM64 的 Python 3.12、Node.js 20+、Go、Xcode Command Line Tools 和 Homebrew 的 `libomp`。
+支持 Apple Silicon（M 系列）和 macOS 15+，不提供 Intel Mac 构建。构建需要原生 ARM64 的 Python 3.11 或 3.12（推荐 3.12）、Node.js 20+、Go 1.26、Xcode Command Line Tools 和 Homebrew 的 `libomp`。先确认命令行工具已安装：运行 `xcode-select -p`；若报错，运行 `xcode-select --install` 并等待系统安装完成。若没有 `brew` 命令，先按 [Homebrew 官方安装说明](https://brew.sh/)安装。再从 [Python 官方 macOS 下载页](https://www.python.org/downloads/macos/)安装 universal2 版本的 Python；如果已安装可用的 ARM64 Python，可跳过这一步。
 
 ```bash
-xcode-select --install
-brew install python@3.12 node go libomp
-go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
-export PATH="$PATH:$(go env GOPATH)/bin"
+brew install node go@1.26 libomp
+export PATH="$(brew --prefix go@1.26)/bin:$PATH"
+git clone https://github.com/yunpengchen10/StockKing.git
+cd StockKing
 bash scripts/build-macos.sh
 ```
 
-产物为 `artifacts/macos/Stock-King-macos-arm64.zip` 及 `dist/desktop/` 中的 wheel，解压后把 `Stock King.app` 放入“应用程序”。这是本地临时签名的构建，不要求购买开发者证书，尚无 Apple 公证；首次打开可能需要在“系统设置 → 隐私与安全性”中允许。
+脚本会检查 Python 版本与架构，自动安装 Wails 2.11，并在现有 `.venv` 不兼容时重建。只有 Python 3.11 可用时，可运行 `PYTHON_BIN=python3.11 bash scripts/build-macos.sh`。若终端通过代理上网，请在构建前设置实际可用的 `HTTPS_PROXY` 和 `HTTP_PROXY`；系统设置中的代理不一定会被终端工具使用。首次构建需下载并编译较大的前端、Go 和 Python 依赖，会花较长时间。
 
-安装独立后台任务（关闭软件窗口后仍可运行）：
+产物为 `artifacts/macos/Stock-King-macos-arm64.zip` 及 `dist/desktop/` 中的 wheel。解压 ZIP，把 `Stock King.app` 放入“应用程序”并打开，确认界面显示“已连接”。脚本在非云同步的临时目录签名，避免 `Documents` 等目录的扩展属性导致签名失败。这是本地临时签名的构建，不要求购买开发者证书，尚无 Apple 公证；首次打开可能需要在“系统设置 → 隐私与安全性”中允许。
+
+如需独立后台任务，在源码目录执行以下命令（关闭软件窗口后仍可运行）：
 
 ```bash
 python3 scripts/install-macos-schedule.py
 # 停用：python3 scripts/install-macos-schedule.py --remove
 ```
 
-需保持电脑开机、唤醒并登录。错过的盘中时点不会补造推荐；Mac 使用哪个时区都按北京时间调度。原生 wheel 为 `macosx_15_0_arm64`，包含 LightGBM 和 MASTER 所需 PyTorch。
+后台任务是安装 `.app` 后单独启用的，默认寻找 `/Applications/Stock King.app`。需保持电脑开机、唤醒并登录。工作日 09:10、10:20、14:45 开始准备，分别在北京时间 09:20、10:30、14:55 复核与刷新；错过的盘中时点不会补造推荐。原生 wheel 为 `macosx_15_0_arm64`，包含 LightGBM 和 MASTER 所需 PyTorch。
 
 ## 致谢与引用
 

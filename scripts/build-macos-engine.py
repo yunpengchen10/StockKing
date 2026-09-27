@@ -31,11 +31,22 @@ for module in ("multipart", "multipart.multipart", "orjson", "json_repair",
 args += ['--hidden-import', 'torch']
 subprocess.run(args + ["main.py"], cwd=root, check=True)
 executable = root / "dist/backend/stock_analysis/stock_analysis"
-for module in ("api.app", "src.services.yao_scout.local_opportunities",
-               "src.services.yao_scout.local_observation_review", "src.quant.service",
-               "src.services.screening.pipeline", "lightgbm", "futu", "orjson", "torch"):
-    subprocess.run([str(executable)], cwd=root, check=True, timeout=120,
-                   env={**os.environ, "DSA_PACKAGED_IMPORT_PROBE": module})
+modules = ("api.app", "src.services.yao_scout.local_opportunities",
+           "src.services.yao_scout.local_observation_review", "src.quant.service",
+           "src.services.screening.pipeline", "lightgbm", "futu", "orjson", "torch")
+with tempfile.TemporaryDirectory(prefix="stock-king-import-probes-") as probe_directory:
+    for index, module in enumerate(modules):
+        # The first launch may spend several minutes initializing the large
+        # PyInstaller bundle on a cold macOS filesystem. Subsequent probes still
+        # have a bounded timeout, and every import must pass.
+        timeout = 300 if index == 0 else 120
+        print(f"Checking packaged import {index + 1}/{len(modules)}: {module} (up to {timeout}s)", flush=True)
+        try:
+            subprocess.run([str(executable)], cwd=root, check=True, timeout=timeout,
+                           env={**os.environ, "DSA_PACKAGED_IMPORT_PROBE": module,
+                                "SCREENING_DATA_DIR": probe_directory})
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f"Packaged import {module} exceeded {timeout}s") from error
 
 with tempfile.TemporaryDirectory(prefix="stock-king-smoke-") as directory:
     state = Path(directory)
@@ -51,6 +62,9 @@ with tempfile.TemporaryDirectory(prefix="stock-king-smoke-") as directory:
     # suppresses web serving when GITHUB_ACTIONS=true.
     env.pop("GITHUB_ACTIONS", None)
     env["USE_PROXY"] = "false"
+    # Health checks must connect directly to loopback even when the build
+    # shell exports a proxy for dependency downloads.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with (state / "engine.log").open("w+") as log:
         process = subprocess.Popen([str(executable), "--serve-only", "--host", "127.0.0.1",
                                     "--port", str(port)], cwd=state, env=env, stdout=log, stderr=log)
@@ -60,7 +74,7 @@ with tempfile.TemporaryDirectory(prefix="stock-king-smoke-") as directory:
             while True:
                 try:
                     request = urllib.request.Request(url, headers={"X-Stock-King-Token": token})
-                    with urllib.request.urlopen(request, timeout=2) as response:
+                    with opener.open(request, timeout=2) as response:
                         assert response.status == 200
                     break
                 except (OSError, urllib.error.URLError):
@@ -69,7 +83,7 @@ with tempfile.TemporaryDirectory(prefix="stock-king-smoke-") as directory:
                         raise RuntimeError("Packaged engine did not start:\n" + log.read()[-8000:])
                     time.sleep(1)
             try:
-                urllib.request.urlopen(url, timeout=2)
+                opener.open(url, timeout=2)
             except urllib.error.HTTPError as error:
                 assert error.code == 401, error.code
             else:
