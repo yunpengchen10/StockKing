@@ -10,7 +10,7 @@ Use `scripts/build-windows-wheel.ps1` on Windows and `scripts/build-macos.sh` on
 
 ## Why an old commit shows four failures
 
-On 2026-09-24, Windows desktop wheel, macOS, and Python package on Windows/macOS did not start for commit `89e55d1`. GitHub's annotation identified failed account payments or a spending limit, with no actual compilation/test logs. The specific billing condition was not established. See the [historical run](https://github.com/yunpengchen10/StockKing/actions/runs/35971302887) (private repository access required).
+On 2026-09-24, Windows desktop wheel, macOS, and Python package on Windows/macOS did not start for commit `89e55d1`. GitHub's annotation identified failed account payments or a spending limit, with no actual compilation/test logs. The specific billing condition was not established. This run belongs to the former repository (run ID `35971302887`); it will no longer be available after that repository is deleted.
 
 The project no longer depends on that build pipeline. Using or distributing the software does not require purchasing Actions allowance. Historical failures may remain in commit history. Disabling the service does not turn them into passing results or clear past usage or existing bills.
 

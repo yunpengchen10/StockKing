@@ -10,7 +10,7 @@
 
 ## 旧提交为何有四项失败
 
-2026-09-24，提交 `89e55d1` 的 Windows desktop wheel、macOS 与 Python package（Windows/macOS 两项）没有启动。GitHub 的注释指出账号付款失败或支出限制；没有实际编译/测试步骤日志。具体是哪一种账单问题未作核定。历史记录见 [该次运行](https://github.com/yunpengchen10/StockKing/actions/runs/35971302887)（需私有仓库权限）。
+2026-09-24，提交 `89e55d1` 的 Windows desktop wheel、macOS 与 Python package（Windows/macOS 两项）没有启动。GitHub 的注释指出账号付款失败或支出限制；没有实际编译/测试步骤日志。具体是哪一种账单问题未作核定。该次运行属于旧仓库，运行 ID 为 `35971302887`；旧仓库删除后无法再查看该记录。
 
 现在不再依赖这条构建链路，不需要为软件使用或发布购买 Actions 额度。旧失败记录可能仍出现在提交历史中；停用服务不会把旧检查变成通过，也不会清除历史用量或已有账单。
 
