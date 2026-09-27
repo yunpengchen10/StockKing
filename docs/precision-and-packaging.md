@@ -64,7 +64,7 @@
 研究工具：
 
 ```text
-python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing-clean.git@main"
+python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing.git@main"
 stock-king doctor
 stock-king evidence 600519
 stock-king evidence 600519 --as-of 2026-09-24T10:30:00+08:00

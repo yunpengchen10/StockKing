@@ -22,7 +22,7 @@ Apple Silicon 将文件名换成 `stock_king-2.6.0-py3-none-macosx_15_0_arm64.wh
 需要 Git、Python 3.11+（建议 3.12）以及当前私有仓库读取权限。先通过正常 GitHub 登录配置 Git 访问，不要把令牌写入安装命令。
 
 ```text
-python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing-clean.git@main"
+python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing.git@main"
 stock-king doctor
 stock-king evidence 600519
 ```
@@ -34,7 +34,7 @@ stock-king evidence 600519
 安装原生 x64 Python 3.12、Node.js 20+ 和 Go（版本见 `desktop/go.mod`）。使用已有源码目录，或通过 Git 获取：
 
 ```powershell
-git clone https://github.com/yunpengchen10/StockKing-clean.git
+git clone https://github.com/yunpengchen10/StockKing.git
 cd StockKing
 powershell -ExecutionPolicy Bypass -File scripts/build-windows-wheel.ps1
 ```
@@ -52,7 +52,7 @@ xcode-select --install
 brew install python@3.12 node go libomp
 go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
 export PATH="$PATH:$(go env GOPATH)/bin"
-git clone https://github.com/yunpengchen10/StockKing-clean.git
+git clone https://github.com/yunpengchen10/StockKing.git
 cd StockKing
 bash scripts/build-macos.sh
 ```

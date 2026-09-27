@@ -22,7 +22,7 @@ The repository is currently in private testing, with no PyPI release or public d
 Install Git and Python 3.11+ (3.12 recommended), and obtain access to the current private repository. Configure Git access through normal GitHub authentication; never embed a token in the installation command.
 
 ```text
-python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing-clean.git@main"
+python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing.git@main"
 stock-king doctor
 stock-king evidence 600519
 ```
@@ -34,7 +34,7 @@ stock-king evidence 600519
 Install native x64 Python 3.12, Node.js 20+ and Go (see `desktop/go.mod` for the version). Use an existing source directory, or clone:
 
 ```powershell
-git clone https://github.com/yunpengchen10/StockKing-clean.git
+git clone https://github.com/yunpengchen10/StockKing.git
 cd StockKing
 powershell -ExecutionPolicy Bypass -File scripts/build-windows-wheel.ps1
 ```
@@ -52,7 +52,7 @@ xcode-select --install
 brew install python@3.12 node go libomp
 go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
 export PATH="$PATH:$(go env GOPATH)/bin"
-git clone https://github.com/yunpengchen10/StockKing-clean.git
+git clone https://github.com/yunpengchen10/StockKing.git
 cd StockKing
 bash scripts/build-macos.sh
 ```

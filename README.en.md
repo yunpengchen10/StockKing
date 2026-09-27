@@ -31,7 +31,7 @@ AI tools can reuse the same quotes through the [read-only MCP quote service](quo
 The project is not published on PyPI and has no public installer download page yet. `pip install stock-king` is not the current installation method for this repository. Users with repository access can start with the research CLI:
 
 ```text
-python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing-clean.git@main"
+python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing.git@main"
 stock-king doctor
 ```
 

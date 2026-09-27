@@ -31,7 +31,7 @@
 当前未发布到 PyPI，也尚无公开安装包下载页。`pip install stock-king` 不是本仓库当前的安装方式。已有仓库权限的用户可先安装研究 CLI：
 
 ```text
-python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing-clean.git@main"
+python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing.git@main"
 stock-king doctor
 ```
 
