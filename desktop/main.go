@@ -70,6 +70,7 @@ func main() {
 	_ = os.Setenv("STOCK_KING_AGENT_ROOT", filepath.Join(paths.LocalRoot, "agent"))
 	_ = os.Setenv("STOCK_KING_USER_DICT", filepath.Join(paths.ConfigDir, "user-dict.txt"))
 	if slot := requestedBackgroundTask(os.Args[1:]); slot != "" {
+		db.Init(paths.databaseDSN())
 		os.Exit(runStockKingBackgroundTask(paths, slot))
 	}
 	data.SetAppIcon(icon)

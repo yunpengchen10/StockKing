@@ -654,6 +654,10 @@ export function GetStockKingAIReview(arg1) {
   return window['go']['main']['App']['GetStockKingAIReview'](arg1);
 }
 
+export function GetStockKingAutoRecommendations() {
+  return window['go']['main']['App']['GetStockKingAutoRecommendations']();
+}
+
 export function GetStockKingBackgroundLearning() {
   return window['go']['main']['App']['GetStockKingBackgroundLearning']();
 }
@@ -662,8 +666,20 @@ export function GetStockKingBackgroundStatus() {
   return window['go']['main']['App']['GetStockKingBackgroundStatus']();
 }
 
+export function GetStockKingDelayedReviews(arg1, arg2, arg3) {
+  return window['go']['main']['App']['GetStockKingDelayedReviews'](arg1, arg2, arg3);
+}
+
+export function GetStockKingLearningState() {
+  return window['go']['main']['App']['GetStockKingLearningState']();
+}
+
 export function GetStockKingPreference(arg1) {
   return window['go']['main']['App']['GetStockKingPreference'](arg1);
+}
+
+export function GetStockKingRecommendationHistory(arg1, arg2, arg3) {
+  return window['go']['main']['App']['GetStockKingRecommendationHistory'](arg1, arg2, arg3);
 }
 
 export function GetStockKingResearchEvidence(arg1) {
@@ -930,10 +946,6 @@ export function ResumeQuantTask(arg1) {
   return window['go']['main']['App']['ResumeQuantTask'](arg1);
 }
 
-export function ReviewStockKingPicks(arg1, arg2, arg3) {
-  return window['go']['main']['App']['ReviewStockKingPicks'](arg1, arg2, arg3);
-}
-
 export function RunExecutableBacktest(arg1) {
   return window['go']['main']['App']['RunExecutableBacktest'](arg1);
 }
@@ -1046,12 +1058,12 @@ export function SetStockAICron(arg1, arg2) {
   return window['go']['main']['App']['SetStockAICron'](arg1, arg2);
 }
 
-export function SetStockKingBackgroundLearning(arg1) {
-  return window['go']['main']['App']['SetStockKingBackgroundLearning'](arg1);
+export function SetStockKingAutoRecommendations(arg1) {
+  return window['go']['main']['App']['SetStockKingAutoRecommendations'](arg1);
 }
 
-export function SetStockKingPicksAIConfig(arg1) {
-  return window['go']['main']['App']['SetStockKingPicksAIConfig'](arg1);
+export function SetStockKingBackgroundLearning(arg1) {
+  return window['go']['main']['App']['SetStockKingBackgroundLearning'](arg1);
 }
 
 export function SetStockSort(arg1, arg2) {

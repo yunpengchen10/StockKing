@@ -25,6 +25,28 @@ type SinaKLineItem struct {
 	Low    string `json:"low"`
 	Close  string `json:"close"`
 	Volume string `json:"volume"`
+	Amount string `json:"amount"`
+}
+
+// The provider alternates JSON numbers and strings for amount and volume.
+func (item *SinaKLineItem) UnmarshalJSON(encoded []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return err
+	}
+	read := func(key string) string {
+		raw := fields[key]
+		if len(raw) == 0 || string(raw) == "null" {
+			return ""
+		}
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return s
+		}
+		return string(raw)
+	}
+	item.Day, item.Open, item.High, item.Low, item.Close, item.Volume, item.Amount = read("day"), read("open"), read("high"), read("low"), read("close"), read("volume"), read("amount")
+	return nil
 }
 
 func NewSinaKLineApi(config *SettingConfig) *SinaKLineApi {
@@ -315,7 +337,7 @@ func (s *SinaKLineApi) convertToKLineData(items []SinaKLineItem, klt string) []K
 			High:   safeStr(item.High),
 			Low:    safeStr(item.Low),
 			Volume: safeStr(item.Volume),
-			Amount: "0",
+			Amount: strings.TrimSpace(item.Amount),
 		}
 		if i > 0 {
 			prevClose, _ := parseFloatToFloat(items[i-1].Close)
@@ -533,7 +555,7 @@ func (t *TencentKLineApi) convertRowsToKLineData(rows [][]string) []KLineData {
 			High:   safeStr(row[3]),
 			Low:    safeStr(row[4]),
 			Volume: safeStr(row[5]),
-			Amount: "0",
+			Amount: "",
 		}
 		if len(row) >= 7 {
 			kd.Amount = safeStr(row[6])
@@ -555,8 +577,12 @@ func (t *TencentKLineApi) convertRowsToKLineData(rows [][]string) []KLineData {
 }
 
 type KLineSourceResult struct {
-	Data   *[]KLineData `json:"data"`
-	Source string       `json:"source"`
+	Data       *[]KLineData `json:"data"`
+	Source     string       `json:"source"`
+	FetchedAt  string       `json:"fetched_at,omitempty"`
+	VolumeUnit string       `json:"volume_unit,omitempty"`
+	AmountUnit string       `json:"amount_unit,omitempty"`
+	Adjustment string       `json:"adjustment,omitempty"`
 }
 
 // ShouldUseLatestMACKLine reports whether the latest-only MAC source can serve the request.
@@ -585,7 +611,7 @@ func eastMoneyAdjustFromFlag(adjustFlag string) string {
 // adjustFlag 可选，控制复权类型："qfq"前复权、"hfq"后复权、"none"/"0"不复权；
 // 未传时各数据源保持原有默认行为（A股 MAC/通达信默认前复权，港股默认不复权，EastMoney 走 API 默认）。
 // 注意：新浪/腾讯数据源硬编码前复权作为兜底，adjustFlag 对其无效；港美股 ExKLine2 协议不支持复权。
-func FetchKLineWithFallback(stockCode, stockName, klt string, limit int, end string, adjustFlag ...string) *KLineSourceResult {
+func fetchKLineUncached(stockCode, stockName, klt string, limit int, end string, adjustFlag ...string) *KLineSourceResult {
 	flag := adjustFlagFromVariadic(adjustFlag...)
 
 	// MAC/通达信最新 K 线接口不接受 end 游标。历史分页若仍优先调用它，

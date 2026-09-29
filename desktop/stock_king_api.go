@@ -265,12 +265,8 @@ func (a *App) GetKingPicks(maxPerBoard int, force bool) (map[string]any, error) 
 	if err != nil {
 		return nil, err
 	}
-	count, syncErr := syncKingPicksToRecommendations(result)
-	result["recommendationSyncCount"] = count
-	if syncErr != nil {
-		result["recommendationSyncError"] = syncErr.Error()
-		logger.SugaredLogger.Warnf("sync King picks to recommendation history failed: %v", syncErr)
-	}
+	// V1.1 signals are persisted by the engine before this response. They must
+	// not be copied into the legacy AI recommendation/transaction history.
 	return result, nil
 }
 
@@ -280,7 +276,7 @@ func (a *App) GetKingPicks(maxPerBoard int, force bool) (map[string]any, error) 
 func (a *App) GetLatestKingPicks(scanSlot string) (map[string]any, error) {
 	slot := strings.ToLower(strings.TrimSpace(scanSlot))
 	allowed := map[string]bool{
-		"live": true, "0920": true, "0922": true, "0925": true, "1030": true,
+		"live": true, "0920": true, "0922": true, "0925": true, "0940": true, "0955": true, "1030": true,
 		"1455": true, "review": true, "weekly": true,
 	}
 	if !allowed[slot] {
@@ -306,6 +302,16 @@ func (a *App) GetKingPicksHistory(limit int) (map[string]any, error) {
 		limit = 30
 	}
 	return a.dailyMap(http.MethodGet, fmt.Sprintf("/api/v1/stock-king/picks/history?limit=%d", limit), nil)
+}
+
+func (a *App) GetStockKingRecommendationHistory(date, symbol, version string) (map[string]any, error) {
+	return a.dailyMap(http.MethodGet, "/api/v1/stock-king/picks/records?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}}.Encode(), nil)
+}
+func (a *App) GetStockKingDelayedReviews(date, symbol, version string) (map[string]any, error) {
+	return a.dailyMap(http.MethodGet, "/api/v1/stock-king/picks/reviews?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}}.Encode(), nil)
+}
+func (a *App) GetStockKingLearningState() (map[string]any, error) {
+	return a.dailyMap(http.MethodGet, "/api/v1/stock-king/picks/learning", nil)
 }
 
 func syncKingPicksToRecommendations(result map[string]any) (int, error) {
@@ -1123,38 +1129,29 @@ func (a *App) initStockKingSchedule() {
 	if a.cron == nil || a.sidecar == nil {
 		return
 	}
-	run := func() {
-		trainMaster := time.Now().Day() <= 7
-		if _, err := a.StartQuantTraining([]int{1, 5, 20}, trainMaster); err != nil {
-			logger.SugaredLogger.Warnf("Stock King scheduled quant task failed to start: %v", err)
-		}
-		if _, err := a.GetKingPicks(10, true); err != nil {
-			logger.SugaredLogger.Warnf("Stock King scheduled research failed: %v", err)
-			return
-		}
-		_ = a.SaveStockKingPreference("daily.lastRunDate", time.Now().Format("2006-01-02"))
+	jobs := []struct{ slot, expression string }{
+		{"0920", "0 10 9 * * 1-5"}, {"0940", "0 30 9 * * 1-5"},
+		{"0955", "0 45 9 * * 1-5"}, {"1030", "0 20 10 * * 1-5"},
+		{"1455", "0 45 14 * * 1-5"}, {"review", "0 30 15 * * 1-5"}, {"weekly", "0 45 15 * * 5"},
 	}
-	if id, err := a.cron.AddFunc("0 30 18 * * 1-5", run); err == nil {
-		a.setCronEntry("stockKingDailyResearch", id)
-	} else {
-		logger.SugaredLogger.Warnf("Stock King daily schedule unavailable: %v", err)
+	for _, job := range jobs {
+		slot := job.slot
+		run := func() {
+			if (slot == "weekly" && !backgroundLearningEnabled(a.paths)) || (slot != "weekly" && slot != "review" && !autoRecommendationsEnabled(a.paths)) {
+				return
+			}
+			_, err := a.dailyMap(http.MethodPost, "/api/v1/stock-king/picks/runs", map[string]any{"scan_slot": slot, "top_n": 5})
+			if err != nil {
+				logger.SugaredLogger.Warnf("Stock King local scheduled job %s failed: %v", slot, err)
+			}
+		}
+		if id, err := a.cron.AddFunc("CRON_TZ=Asia/Shanghai "+job.expression, run); err == nil {
+			a.setCronEntry("stockKingV11-"+slot, id)
+		} else {
+			logger.SugaredLogger.Warnf("Stock King schedule %s: %v", slot, err)
+		}
 	}
-	go func() {
-		deadline := time.Now().Add(90 * time.Second)
-		for time.Now().Before(deadline) && !a.sidecar.Status().Ready {
-			time.Sleep(500 * time.Millisecond)
-		}
-		if !a.sidecar.Status().Ready {
-			return
-		}
-		now := time.Now()
-		scheduled := time.Date(now.Year(), now.Month(), now.Day(), 18, 30, 0, 0, now.Location())
-		if now.After(scheduled) && now.Weekday() != time.Saturday && now.Weekday() != time.Sunday && a.GetStockKingPreference("daily.lastRunDate") != now.Format("2006-01-02") {
-			run()
-		}
-	}()
 }
-
 func validateJSON(value string) bool {
 	return value == "" || json.Valid([]byte(value))
 }

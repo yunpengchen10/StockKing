@@ -17,6 +17,8 @@ $slots = @(
     # Keep existing task identities. Initial lead is 10 minutes, not a proven
     # latency SLA. Engine records late_seconds and refuses expired publication.
     @{ Name = '0922 Scan'; Time = '09:10'; Slot = '0920' },
+    @{ Name = '0940 Scan'; Time = '09:30'; Slot = '0940' },
+    @{ Name = '0955 Scan'; Time = '09:45'; Slot = '0955' },
     @{ Name = '1030 Scan'; Time = '10:20'; Slot = '1030' },
     @{ Name = '1455 NLS'; Time = '14:45'; Slot = '1455' },
     @{ Name = '1530 Review'; Time = '15:30'; Slot = 'review' },
@@ -64,5 +66,5 @@ foreach ($slot in $slots) {
     $settings = New-ScheduledTaskSettingsSet -Hidden -MultipleInstances IgnoreNew -StartWhenAvailable -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 2) -ExecutionTimeLimit (New-TimeSpan -Minutes 35)
     $userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description 'Stock King local model; free public quotes refreshed at Shanghai 09:20/10:30/14:55; daily review 15:30; Friday learning 15:45; AI review is manual.' -Force | Out-Null
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description 'Stock King V1.1 local engine; Shanghai 09:20 watchlist, 09:40/09:55/10:30/14:55 fresh scans, 15:30 delayed reviews, Friday 15:45 gated learning. No LLM in picks.' -Force | Out-Null
 }

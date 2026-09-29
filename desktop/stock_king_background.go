@@ -30,6 +30,11 @@ func backgroundLearningEnabled(paths AppPaths) bool {
 	return os.IsNotExist(err)
 }
 
+func autoRecommendationsEnabled(paths AppPaths) bool {
+	_, err := os.Stat(filepath.Join(paths.ConfigDir, "auto-recommendations.disabled"))
+	return os.IsNotExist(err)
+}
+
 func backgroundStatusPath(paths AppPaths) string {
 	return filepath.Join(paths.DataDir, "daily", "king-adaptive", "background-status.json")
 }
@@ -45,12 +50,12 @@ func writeBackgroundStatus(paths AppPaths, payload map[string]any) {
 }
 
 func runStockKingBackgroundTask(paths AppPaths, slot string) int {
-	allowed := map[string]bool{"0920": true, "0922": true, "0925": true, "1030": true, "1455": true, "review": true, "weekly": true}
+	allowed := map[string]bool{"0920": true, "0922": true, "0925": true, "0940": true, "0955": true, "1030": true, "1455": true, "review": true, "weekly": true}
 	if !allowed[slot] {
 		writeBackgroundStatus(paths, map[string]any{"slot": slot, "status": "invalid_task"})
 		return 2
 	}
-	if !backgroundLearningEnabled(paths) {
+	if (slot == "weekly" && !backgroundLearningEnabled(paths)) || (slot != "weekly" && slot != "review" && !autoRecommendationsEnabled(paths)) {
 		writeBackgroundStatus(paths, map[string]any{"slot": slot, "status": "disabled_by_user"})
 		return 0
 	}
@@ -110,6 +115,24 @@ func (a *App) GetStockKingBackgroundLearning() bool {
 	return backgroundLearningEnabled(a.paths)
 }
 
+func (a *App) GetStockKingAutoRecommendations() bool { return autoRecommendationsEnabled(a.paths) }
+func (a *App) SetStockKingAutoRecommendations(enabled bool) error {
+	path := filepath.Join(a.paths.ConfigDir, "auto-recommendations.disabled")
+	if enabled {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	} else {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, []byte("disabled by user\n"), 0o600); err != nil {
+			return err
+		}
+	}
+	return a.SaveStockKingPreference("background.recommendations.enabled", fmt.Sprint(enabled))
+}
+
 func (a *App) SetStockKingBackgroundLearning(enabled bool) error {
 	path := backgroundLearningFlagPath(a.paths)
 	if enabled {
@@ -134,5 +157,6 @@ func (a *App) GetStockKingBackgroundStatus() map[string]any {
 		_ = json.Unmarshal(encoded, &payload)
 	}
 	payload["enabled"] = backgroundLearningEnabled(a.paths)
+	payload["autoRecommendations"] = autoRecommendationsEnabled(a.paths)
 	return payload
 }

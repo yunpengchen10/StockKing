@@ -317,6 +317,13 @@ def get_public_market_quotes(codes, *, clock=None, fetcher=None):
     retain their capacity slots until finished; repeated calls cannot grow a queue.
     """
     requested = normalize_quote_codes(codes)
+    if fetcher is None:
+        from src.services.software_market import SoftwareMarketClient
+        software = SoftwareMarketClient.from_environment()
+        if software.available:
+            # Fail visibly if the desktop gateway is unavailable; do not silently
+            # switch the engine to a separate quote clock/provider.
+            return software.quotes(requested, clock=clock)
     clock, fetcher = clock or _now, fetcher or _fetch_payload
     _iso(clock())
     if not _BATCH_SLOTS.acquire(blocking=False):

@@ -5,6 +5,8 @@ APP="$1"
 STAMP="$(TZ=Asia/Shanghai date +%u-%H%M)"
 case "$STAMP" in
   [1-5]-0910) SLOT=0920 ;;
+  [1-5]-0930) SLOT=0940 ;;
+  [1-5]-0945) SLOT=0955 ;;
   [1-5]-1020) SLOT=1030 ;;
   [1-5]-1445) SLOT=1455 ;;
   [1-5]-1530) SLOT=review ;;

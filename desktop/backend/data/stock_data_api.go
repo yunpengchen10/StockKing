@@ -391,25 +391,19 @@ func (receiver StockDataApi) GetStockCodeRealTimeData(StockCodes ...string) (*[]
 	})
 
 	if hkcodes != nil && len(hkcodes) > 0 {
-		hkcodesStr := slice.JoinFunc(hkcodes, ",", func(s string) string {
+		sharedSymbols := slice.Map(hkcodes, func(i int, s string) string {
 			if strutil.HasPrefixAny(s, []string{"hk", "HK"}) {
 				return "r_" + strings.ToLower(s)
 			} else {
 				return strings.ToLower(s)
 			}
 		})
-		url := fmt.Sprintf(txStockUrl, time.Now().Unix(), hkcodesStr)
-		resp, err := receiver.client.R().
-			SetHeader("Host", "qt.gtimg.cn").
-			SetHeader("Referer", "https://gu.qq.com/").
-			SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0").
-			Get(url)
+		str, _, err := FetchSharedQuotePayload("tencent", sharedSymbols)
 		//logger.SugaredLogger.Infof("GetStockCodeRealTimeData %s", url)
 		if err != nil {
 			logger.SugaredLogger.Error(err.Error())
 			return &[]StockInfo{}, err
 		}
-		str := GB18030ToUTF8(resp.Body())
 		dataStr := strutil.SplitAndTrim(strings.Trim(str, "\n"), ";")
 
 		for _, data := range dataStr {
@@ -437,6 +431,9 @@ func (receiver StockDataApi) GetStockCodeRealTimeData(StockCodes ...string) (*[]
 	szzsusCodes := slice.Filter(StockCodes, func(i int, s string) bool {
 		return !strutil.HasPrefixAny(s, []string{"hk", "HK", "sh", "sz"})
 	})
+	if len(szzsusCodes) == 0 {
+		return &stockInfos, nil
+	}
 
 	codes := slice.JoinFunc(szzsusCodes, ",", func(s string) string {
 		if strings.HasPrefix(s, "us") {
@@ -974,9 +971,9 @@ func ParseTxHKStockData(datas []string) (map[string]string, error) {
 	})
 	result["股票代码"] = stockCode
 
-	parts := strutil.SplitAndTrim(datas[1], "~")
+	parts := strings.Split(strings.Trim(datas[1], "\"; \r\n"), "~")
 	//logger.SugaredLogger.Infof("股票数据解析完成 len: %v", len(parts))
-	if len(parts) < 35 {
+	if len(parts) < 38 {
 		return nil, fmt.Errorf("invalid data format")
 	}
 	result["股票名称"] = parts[1]
@@ -986,8 +983,14 @@ func ParseTxHKStockData(datas []string) (map[string]string, error) {
 
 	result["今日最高价"] = parts[33]
 	result["今日最低价"] = parts[34]
+	result["成交的股票数"] = parts[36]
+	result["成交金额"] = parts[37]
 
 	if strutil.HasPrefixAny(stockCode, []string{"sz", "sh"}) {
+		volume, _ := strconv.ParseFloat(parts[36], 64)
+		amount, _ := strconv.ParseFloat(parts[37], 64)
+		result["成交的股票数"] = strconv.FormatFloat(volume*100, 'f', -1, 64)
+		result["成交金额"] = strconv.FormatFloat(amount*10000, 'f', -1, 64)
 		result["买一报价"] = parts[9]
 		result["买一申报"] = parts[10]
 		result["买二报价"] = parts[11]
@@ -1022,10 +1025,11 @@ func ParseTxHKStockData(datas []string) (map[string]string, error) {
 		result["日期"] = strutil.SplitAndTrim(timestr, " ", "")[0]
 		result["时间"] = strutil.SplitAndTrim(timestr, " ", "")[1]
 	} else {
-		result["日期"] = strutil.Trim(parts[29])[0:4] + "-" + strutil.Trim(parts[29])[4:6] + "-" + strutil.Trim(parts[29])[6:8]
-		result["时间"] = strutil.Trim(parts[29])[8:10] + ":" + strutil.Trim(parts[29])[10:12] + ":" + strutil.Trim(parts[29])[12:14]
-		result["今日最高价"] = parts[32]
-		result["今日最低价"] = parts[33]
+		stamp, err := time.Parse("20060102150405", strings.TrimSpace(parts[30]))
+		if err != nil {
+			return nil, fmt.Errorf("invalid provider quote timestamp")
+		}
+		result["日期"], result["时间"] = stamp.Format("2006-01-02"), stamp.Format("15:04:05")
 	}
 	//logger.SugaredLogger.Infof("股票数据解析完成 %s %s 时间: %s,%s", parts[1], parts[3], parts[29], parts[30])
 
@@ -2359,7 +2363,7 @@ func (receiver StockDataApi) GetIndustryValuation(bkName string) *models.Industr
 	return &data
 }
 
-func (receiver StockDataApi) GetAllStocks(page int, pageSize int, name string, technicalIndicators models.TechnicalIndicators) *models.AllStocksResp {
+func (receiver StockDataApi) GetAllStocks(page int, pageSize int, name string, technicalIndicators models.TechnicalIndicators, stableCodeOrder ...bool) *models.AllStocksResp {
 	indicators := ""
 	// 将 TechnicalIndicators 转换为 map 并遍历构建查询条件
 	indicatorConditions := []string{}
@@ -2407,12 +2411,28 @@ func (receiver StockDataApi) GetAllStocks(page int, pageSize int, name string, t
 	}
 	url := "https://data.eastmoney.com/dataapi/xuangu/list?st=CHANGE_RATE&sr=-1&ps=" + convertor.ToString(pageSize) + "&p=" + convertor.ToString(page) + "&sty=SECUCODE%2CSECURITY_CODE%2CSECURITY_NAME_ABBR%2CNEW_PRICE%2CCHANGE_RATE%2CVOLUME_RATIO%2CHIGH_PRICE%2CLOW_PRICE%2CPRE_CLOSE_PRICE%2CVOLUME%2CDEAL_AMOUNT%2CTURNOVERRATE%2CMARKET%2CCONCEPT%2CINDUSTRY&filter=%28MARKET+in+%28%22%E4%B8%8A%E4%BA%A4%E6%89%80%E4%B8%BB%E6%9D%BF%22%2C%22%E6%B7%B1%E4%BA%A4%E6%89%80%E4%B8%BB%E6%9D%BF%22%2C%22%E6%B7%B1%E4%BA%A4%E6%89%80%E5%88%9B%E4%B8%9A%E6%9D%BF%22%2C%22%E4%B8%8A%E4%BA%A4%E6%89%80%E7%A7%91%E5%88%9B%E6%9D%BF%22%2C%22%E4%B8%8A%E4%BA%A4%E6%89%80%E9%A3%8E%E9%99%A9%E8%AD%A6%E7%A4%BA%E6%9D%BF%22%2C%22%E6%B7%B1%E4%BA%A4%E6%89%80%E9%A3%8E%E9%99%A9%E8%AD%A6%E7%A4%BA%E6%9D%BF%22%2C%22%E5%8C%97%E4%BA%AC%E8%AF%81%E5%88%B8%E4%BA%A4%E6%98%93%E6%89%80%22%29%29" + url2.QueryEscape(search+indicators) + "&source=SELECT_SECURITIES&client=WEB&hyversion=v2"
 	//logger.SugaredLogger.Infof("url:%s", url)
+	if len(stableCodeOrder) > 0 && stableCodeOrder[0] {
+		// The research universe is SH/SZ mainboard. Query that exact universe;
+		// mixed-market totals can include instruments absent from quote pages.
+		parsed, parseErr := url2.Parse(url)
+		if parseErr == nil {
+			query := parsed.Query()
+			query.Set("st", "SECURITY_CODE")
+			query.Set("sr", "1")
+			query.Set("filter", `(MARKET in ("上交所主板","深交所主板"))`)
+			// Requesting CONCEPT silently inner-joins the quote page and omits
+			// stocks with no concept record while leaving the total unchanged.
+			query.Set("sty", strings.ReplaceAll(query.Get("sty"), ",CONCEPT,", ","))
+			parsed.RawQuery = query.Encode()
+			url = parsed.String()
+		}
+	}
 	resp, err := receiver.client.SetTimeout(time.Duration(receiver.config.CrawlTimeOut)*time.Second).R().
 		SetHeader("Host", "data.eastmoney.com").
 		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0").
 		Get(url)
-	if err != nil {
-		//logger.SugaredLogger.Errorf("err:%s", err.Error())
+	if err != nil || resp == nil {
+		return &models.AllStocksResp{}
 	}
 	data := models.AllStocksResp{}
 	err = json.Unmarshal(resp.Body(), &data)

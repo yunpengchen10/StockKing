@@ -92,6 +92,9 @@ New-Item -ItemType Directory -Path (Join-Path $backendBuildRoot 'dist\backend') 
 $hiddenImports = @(
   'src.services.economy_review',
   'src.services.yao_scout.local_opportunities',
+  'src.services.yao_scout.signal_learning',
+  'src.services.yao_scout.v11_factors',
+  'src.services.software_market',
   'multipart',
   'multipart.multipart',
   'json_repair',
@@ -202,7 +205,7 @@ if (-not (Test-Path $packagedEntry)) {
 }
 $previousProbe = $env:DSA_PACKAGED_IMPORT_PROBE
 try {
-  foreach ($module in @('src.services.economy_review', 'src.services.yao_scout.local_opportunities', 'src.services.screening.pipeline', 'src.quant.service', 'src.quant.executable_backtest', 'api.v1.endpoints.quant', 'api.v1.endpoints.portfolio', 'src.services.yao_scout.adaptive', 'lightgbm', 'torch', 'futu', 'orjson')) {
+  foreach ($module in @('src.services.economy_review', 'src.services.yao_scout.local_opportunities', 'src.services.yao_scout.signal_learning', 'src.services.yao_scout.v11_factors', 'src.services.software_market', 'src.services.screening.pipeline', 'src.quant.service', 'src.quant.executable_backtest', 'api.v1.endpoints.stock_king', 'api.v1.endpoints.quant', 'api.v1.endpoints.portfolio', 'src.services.yao_scout.adaptive', 'lightgbm', 'torch', 'futu', 'orjson')) {
     $env:DSA_PACKAGED_IMPORT_PROBE = $module
     $probeProcess = Start-Process -FilePath $packagedEntry -WindowStyle Hidden -Wait -PassThru
     if ($probeProcess.ExitCode -ne 0) {

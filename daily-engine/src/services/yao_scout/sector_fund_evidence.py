@@ -19,7 +19,7 @@ import requests
 from src.patches.eastmoney_patch import original_request
 
 from .intraday_evidence import _datetime, SHANGHAI
-from .minute_history import fetch_sina_bars, normalize_bars, window, number
+from .minute_history import fetch_recent_bars, normalize_bars, window, number
 
 BASE = 'https://push2.eastmoney.com/api/qt/'
 HEADERS = {'User-Agent':'Mozilla/5.0','Referer':'https://quote.eastmoney.com/'}
@@ -209,7 +209,7 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
     all_codes = sorted({code for members in boards.values() for code in members})
     def get_minutes(code):
         try:
-            return code, (bar_fetcher or fetch_sina_bars)(code,count=20)
+            return code, (bar_fetcher or fetch_recent_bars)(code,count=20)
         except Exception:
             return code, []
     with ThreadPoolExecutor(max_workers=8) as pool:

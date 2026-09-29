@@ -61,14 +61,15 @@ export function explainPick(pick = {}) {
   const features=pick.featureSnapshot||pick.features||{}, scores=pick.scoreBreakdown||pick.scores||{}
   const branch=pick.strategyBranch||pick.modelBranch||pick.model||scores.selectedModel||features.model_branch||''
   const meta=PICK_BRANCHES[branch]
-  const structured = Boolean(pick.recommendationLogicVersion || Array.isArray(pick.selectionReasons) || Array.isArray(pick.indicatorEvidence))
+  const structured = Boolean(pick.scoreVersion || pick.recommendationLogicVersion || Array.isArray(pick.selectionReasons) || Array.isArray(pick.indicatorEvidence))
   const reasons = unique(strings(structured ? pick.selectionReasons : pick.tierReasons || pick.tier_reasons).filter(recordedReason))
   const reason = reasons.join('；') || (structured ? '本轮未保存充分的入选理由，请先核对证据。' : missingReason)
   const indicators = normalizeIndicatorEvidence(structured ? pick.indicatorEvidence : legacyIndicators(pick, features))
   const risks = unique([...strings(pick.riskReasons), ...strings(pick.risks), ...strings(pick.data_quality?.gaps)])
   const entry = pick.entryPlan || {}
+  const v11 = String(pick.scoreVersion || '').startsWith('stockking-v1.1')
   const entryPlan = {
-    trigger: strings(entry.trigger || pick.upgradeConditions || pick.triggers).join('；') || '未取得',
+    trigger: strings(entry.trigger || pick.triggerConditions || pick.upgradeConditions || pick.triggers).join('；') || '未取得',
     invalidations: strings(entry.invalidations || pick.invalidationConditions || pick.invalidations).join('；') || '未取得',
     noChase: strings(entry.noChase || pick.noChase).join('；') || '未取得',
     holdingWindow: strings(entry.holdingWindow || pick.horizon || pick.expectedHoldingRange).join('；') || '未取得',
@@ -79,17 +80,17 @@ export function explainPick(pick = {}) {
     branch, title:meta?`${branch} · ${meta.name}`:branch||'策略筛选', reason, reasons, logic:meta?.logic||reason,
     structured, legacyNotice: structured ? '' : '旧记录未保存结构化证据链；以下仅展示当时已保存的数值，来源、时间和阈值缺失处标为未取得。',
     savedExplanation: !structured && typeof pick.thesis === 'string' ? pick.thesis : '',
-    logicVersion: pick.recommendationLogicVersion || '旧记录未保存', indicators, risks, entryPlan,
+    logicVersion: pick.scoreVersion || pick.recommendationLogicVersion || '旧记录未保存', indicators, risks, entryPlan,
     evidenceChecks: Object.entries(pick.evidenceChecks || {}).map(([key, passed]) => ({key,
       label: {minute_structure:'分钟结构',sector_resonance:'行业同刻联动',history_20d:'20日同刻基准',relative_volume:'即时放量',fund_direction:'资金方向'}[key] || key,
       passed: passed === true})),
-    baselineDays: pick.baselineEvidence?.historyDays ?? null,
+    baselineDays: pick.historicalCoverageDays ?? pick.baselineHistoryDays ?? pick.baselineEvidence?.historyDays ?? null,
     missingHistoryDates: strings(pick.baselineEvidence?.missingHistoryDates),
     baselineSource: pick.baselineEvidence?.baselineSource || '未取得',
     facts: indicators.map(({label, value}) => ({label, value})),
     scoreMeaning: pick.scoreMeaning || '研究排序分，仅用于候选比较；不是胜率、上涨概率或预期收益。',
-    scoreLabel:nls?'尾盘研究分 NLS':'研究排序分', formula:meta?.formula||'该快照未提供公式版本',
-    modelScores:Object.entries(scores.models||{}).filter(([,value])=>valid(value)).map(([key,value])=>({key,label:PICK_BRANCHES[key]?.name||key,value:number(value),selected:key===branch})),
+    scoreLabel:nls?'尾盘研究分 NLS':'研究排序分', formula:v11?'FinalScore = clip(max(Early, MainRise) − 0.2 × DistributionRisk, 0, 100)。缺失因子按可用权重重新分配；0.2为未验证初值。':meta?.formula||'该快照未提供公式版本',
+    modelScores:v11 ? [['Early',pick.earlyScore],['MainRise',pick.mainRiseScore],['DistributionRisk',pick.distributionRisk], ...Object.entries(pick.factorScores || {})].map(([key,value])=>({key,label:key,value:valid(value)?number(value):'未取得'})) : Object.entries(scores.models||{}).filter(([,value])=>valid(value)).map(([key,value])=>({key,label:PICK_BRANCHES[key]?.name||key,value:number(value),selected:key===branch})),
     nlsScores:nls?Object.entries(nlsLabels).map(([key,[label,max]])=>({key,label,value:valid(scores.nls?.[key])?`${number(scores.nls[key])} / ${max}`:'未提供'})):[],
     evidence:(Array.isArray(pick.evidence)?pick.evidence:[]).map(item=>({...item,url:safeEvidenceURL(item.url)})),
     source:pick.quote?.source||features.snapshot_source||'未取得', quality:pick.data_quality||{},

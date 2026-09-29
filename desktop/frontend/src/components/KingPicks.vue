@@ -1,12 +1,11 @@
 <script setup>
 import { computed, inject, onBeforeMount, onBeforeUnmount, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Follow, GetEngineStatus, GetKingPicks, GetKingPicksHistory, GetStockKingBackgroundLearning, GetStockKingBackgroundStatus, SetStockKingBackgroundLearning, GetStockKingAIProviders, GetStockKingPreference, SetStockKingPicksAIConfig, ReviewStockKingPicks } from '../../wailsjs/go/main/App'
+import { Follow, GetEngineStatus, GetKingPicks, GetKingPicksHistory, GetStockKingBackgroundLearning, GetStockKingBackgroundStatus, SetStockKingBackgroundLearning, GetStockKingAutoRecommendations, SetStockKingAutoRecommendations } from '../../wailsjs/go/main/App'
 import { useMessage } from 'naive-ui'
 import { toResearchCode } from '../utils/symbol'
-import EconomyBudget from './EconomyBudget.vue'
-import SafeMarkdown from './SafeMarkdown.vue'
 import PickIndicatorEvidence from './PickIndicatorEvidence.vue'
+import PicksLedger from './PicksLedger.vue'
 import { explainPick, PICK_BRANCHES } from '../utils/pickExplain.mjs'
 
 const router = useRouter()
@@ -14,24 +13,9 @@ const message = useMessage()
 const darkTheme = inject('appDarkTheme', ref(true))
 const loading = ref(false), refreshError = ref(''), viewingHistory = ref(false), methodVisible = ref(false), selectedPick = ref(null), explanationVisible = ref(false)
 const restoring = ref(true)
-const aiProviders = ref([]), aiPlatform = ref(''), aiConfigId = ref(''), aiSaving = ref(false)
-const aiPlatforms = computed(() => [...new Set(aiProviders.value.map(p => p.name))])
-const aiModels = computed(() => aiProviders.value.filter(p => p.name === aiPlatform.value))
-async function saveAISelection() {
-  if (!aiConfigId.value) return
-  aiSaving.value = true
-  try { await SetStockKingPicksAIConfig(Number(aiConfigId.value)); message.success('模型已保存') }
-  catch (e) { aiConfigId.value = ''; message.error(String(e?.message || e)) }
-  finally { aiSaving.value = false }
-}
-const isDailyRules = computed(() => adaptive.value.modelVersion === 'king-daily-rules-20260908' || adaptive.value.modelVersion?.startsWith('king-local-') || adaptive.value.modelVersion?.startsWith('king-evidence-'))
+const isV11 = computed(() => String(adaptive.value.scoreVersion || adaptive.value.modelVersion || '').startsWith('stockking-v1.1') || adaptivePicks.value.some(pick => isV11Pick(pick)))
 const explanation = computed(() => explainPick(selectedPick.value || {}))
 function showWhy(pick, insufficient = false) { selectedPick.value = pick; selectedIsInsufficient.value = insufficient; explanationVisible.value = true }
-function openAI(pick) {
-  try { sessionStorage.setItem('stock-king:ai-pick:'+toResearchCode(codeOf(pick)), JSON.stringify({ candidate:{...pick,code:codeOf(pick)}, generatedAt:adaptive.value.generatedAt || result.value.generatedAt || '', scanSlot:adaptive.value.scanSlot || '', provenance:'用户选择的精选快照，须与最新行情分开核对' })) }
-  catch { message.error('快照暂存失败，请重试'); return }
-  router.push({name:'aiAdvice',query:{code:codeOf(pick),name:nameOf(pick),template:'builtin-challenge',pick:'1'}})
-}
 const engine = ref({ state: 'starting', ready: false })
 const maxPerBoard = ref(5)
 const result = ref({ tiers: {}, kechuang: [], nonKeChuang: [], generatedAt: '', diagnostics: {} })
@@ -40,6 +24,7 @@ const precisionProfile = ref('regular')
 const activeBoard = ref('nonKeChuang')
 const viewMode = ref('adaptive')
 const backgroundEnabled = ref(true)
+const recommendationsEnabled = ref(true)
 const backgroundStatus = ref({ status: 'never_run', updatedAt: '' })
 const historyVisible = ref(false)
 const historyLoading = ref(false)
@@ -95,7 +80,7 @@ function codeOf(pick) { return pick?.symbol?.code || pick?.code || pick?.stock_c
 function nameOf(pick) { return pick?.symbol?.name || pick?.name || pick?.stock_name || codeOf(pick) }
 function quoteSourceLabel(source) {
   const label = String(source || '')
-  return /tencent/i.test(label) ? '腾讯' : /sina/i.test(label) ? '新浪' : label || '来源未知'
+  return /tencent/i.test(label) ? '腾讯' : /sina/i.test(label) ? '新浪' : /eastmoney/i.test(label) ? '东方财富' : /tdx/i.test(label) ? '通达信' : label || '来源未知'
 }
 function sourceTimestamp(value) {
   if (typeof value !== 'string' || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null
@@ -120,7 +105,7 @@ function quoteEvidence(pick) {
   return [quoteSourceLabel(quote.source), `源 ${sourceClock(source)}`, delay, quote.public_quote_metadata?.status === 'reference_only' ? '参考报价' : ''].filter(Boolean).join(' · ')
 }
 function scoreOf(pick) {
-  const raw = pick?.nls ?? pick?.tierScore ?? pick?.potentialScore ?? pick?.score ?? pick?.final_score
+  const raw = pick?.finalScore ?? pick?.final_score ?? pick?.nls ?? pick?.tierScore ?? pick?.potentialScore ?? pick?.score
   if (raw === null || raw === undefined || raw === '') return '—'
   const value = Number(raw)
   return Number.isFinite(value) ? value.toFixed(1) : '—'
@@ -155,17 +140,6 @@ function internalCode(value) {
   return `${market.toLowerCase()}${symbol.toLowerCase()}`
 }
 
-const reviewLoading=ref(false), reviewResult=ref(null), budgetPanel=ref(null), reviewSnapshot=ref('')
-async function reviewPicks(){
- if(reviewLoading.value || !adaptivePicks.value.length)return
- if(!aiConfigId.value){message.warning('请先选择复审平台和模型');return}
- reviewLoading.value=true
- const snapshot=JSON.parse(JSON.stringify(adaptive.value));reviewSnapshot.value=snapshot.generatedAt || ''
- snapshot.candidates=JSON.parse(JSON.stringify(adaptivePicks.value));snapshot.precisionProfile=precisionProfile.value
- try{reviewResult.value=await ReviewStockKingPicks(crypto.randomUUID(),Number(aiConfigId.value),snapshot)}
- catch(e){message.error(String(e?.message || e))}
- finally{reviewLoading.value=false;budgetPanel.value?.refresh()}
-}
 async function refresh() {
   if (loading.value || restoring.value) return
   loading.value = true; refreshError.value = ''
@@ -209,8 +183,13 @@ function readSnapshot() {
 }
 
 function canSyncSavedResults() {
-  return !disposed && document.visibilityState !== 'hidden' && !loading.value && !viewingHistory.value && !historyVisible.value && !explanationVisible.value && !reviewLoading.value
+  return !disposed && document.visibilityState !== 'hidden' && !loading.value && !viewingHistory.value && !historyVisible.value && !explanationVisible.value
 }
+function isV11Pick(pick) { return String(pick?.scoreVersion || '').startsWith('stockking-v1.1') }
+function calibrationValue(pick, key) {
+  return pick?.probabilityStatus === 'withheld_until_calibrated' || pick?.[key] == null ? '待校准' : percent(pick[key])
+}
+function factorValue(value) { return value == null || !Number.isFinite(Number(value)) ? '未取得' : Number(value).toFixed(1) }
 
 async function syncSavedResults() {
   if (disposed || savedSyncInFlight) return
@@ -261,11 +240,11 @@ async function restoreLatest({ background = false } = {}) {
 
 function historyResult(item) { return item?.result || {} }
 function historyCandidates(item) { return historyResult(item)?.candidates || [] }
-function isScanHistory(item) { return ['king_live', 'king_0920', 'king_0922', 'king_1030', 'king_1455'].includes(item?.mode) }
+function isScanHistory(item) { return ['king_live', 'king_0920', 'king_0922', 'king_0940', 'king_0955', 'king_1030', 'king_1455'].includes(item?.mode) }
 function isReviewHistory(item) { return ['king_review', 'king_weekly'].includes(item?.mode) }
 function isRestorableSnapshot(snapshot) {
   const status = String(snapshot?.status || '')
-  return Array.isArray(snapshot?.candidates) && !['unavailable', 'failed', 'expired', 'cancelled', 'retired_slot'].includes(status) && !status.startsWith('skipped')
+  return Array.isArray(snapshot?.candidates) && !['unavailable', 'failed', 'expired', 'cancelled', 'retired_slot', 'missed_slot', 'not_due', 'already_claimed'].includes(status) && !status.startsWith('skipped')
 }
 function snapshotTime(snapshot) { return Date.parse(snapshot?.generatedAt || snapshot?.generated_at || snapshot?.as_of || '') || 0 }
 function historySlotLabel(item) {
@@ -275,7 +254,7 @@ function historySlotLabel(item) {
 }
 function historyStatusLabel(item) {
   const status = historyResult(item).status || item?.status || ''
-  return { unavailable: '扫描未完成', failed: '扫描失败', expired: '时段已过期', cancelled: '已取消', retired_slot: '旧时点已停用', skipped_non_trading_day: '非交易日已跳过', completed_observations: '观察结果', no_candidates_with_coverage_limits: '未形成候选', audit_only: '已记录' }[status] || (String(status).startsWith('skipped') ? '已跳过' : status)
+  return { unavailable: '扫描未完成', failed: '扫描失败', expired: '时段已过期', missed_slot: '已记录遗漏', not_due: '未到执行时点', already_claimed: '本轮已领取', cancelled: '已取消', retired_slot: '旧时点已停用', skipped_non_trading_day: '非交易日已跳过', completed_observations: '观察结果', no_candidates_with_coverage_limits: '未形成候选', audit_only: '已记录' }[status] || (String(status).startsWith('skipped') ? '已跳过' : status)
 }
 function historyEmptyLabel(item) {
   return historyResult(item).message || (!isRestorableSnapshot(historyResult(item)) ? historyStatusLabel(item) : '本轮无候选 · 请查看覆盖')
@@ -330,32 +309,33 @@ function openKline(pick) {
   router.push({ name: 'klineAnalysis', query: { code: codeOf(pick), name: nameOf(pick) } })
 }
 
-function openRecommendationHistory() {
-  router.push({ name: 'research', query: { name: '股票推荐记录' } })
-}
-
 async function toggleBackground(value) {
   try {
     await SetStockKingBackgroundLearning(value)
     backgroundEnabled.value = value
     backgroundStatus.value = await GetStockKingBackgroundStatus()
-    message.success(value ? '后台自学习已开启' : '后台自学习已暂停；计划任务会静默跳过')
+    message.success(value ? '自动学习已开启' : '自动学习已暂停')
   } catch (error) {
     backgroundEnabled.value = !value
     message.error(error?.message || String(error))
   }
 }
 
+async function toggleRecommendations(value) {
+  try {
+    await SetStockKingAutoRecommendations(value)
+    recommendationsEnabled.value = value
+    backgroundStatus.value = await GetStockKingBackgroundStatus()
+    message.success(value ? '自动推荐已开启' : '自动推荐已暂停')
+  } catch (error) { message.error(error?.message || String(error)) }
+}
+
 onBeforeMount(async () => {
   readSnapshot()
   await syncSavedResults()
   if (disposed) return
-  aiProviders.value = await GetStockKingAIProviders().catch(() => [])
-  aiConfigId.value = String(await GetStockKingPreference('picks.ai.configId').catch(() => '') || '')
-  const configured = aiProviders.value.find(p => String(p.id) === aiConfigId.value)
-  aiPlatform.value = configured?.name || ''
-  if (!configured) aiConfigId.value = ''
   backgroundEnabled.value = await GetStockKingBackgroundLearning().catch(() => true)
+  recommendationsEnabled.value = await GetStockKingAutoRecommendations().catch(() => true)
   restoring.value = false
 })
 onBeforeUnmount(() => {
@@ -370,32 +350,26 @@ onBeforeUnmount(() => {
       <h2>精选</h2>
       <n-button secondary @click="methodVisible=true">如何使用</n-button>
       <n-input-number v-if="viewMode==='classic'" v-model:value="maxPerBoard" :min="5" :max="50" style="width:112px"><template #suffix>只 / 组</template></n-input-number>
-      <div class="background-switch"><n-switch :value="backgroundEnabled" @update:value="toggleBackground" /><span title="控制后台定时扫描与历史反馈学习，不代表实时行情推送">后台学习</span></div>
-      <n-button secondary @click="openHistory">历史</n-button>
-      <n-button secondary @click="openRecommendationHistory">推荐记录</n-button>
-      <n-button type="primary" :loading="loading" :disabled="restoring" title="重新扫描当日机会与策略分组" @click="refresh">刷新全部</n-button>
+      <div class="background-switch"><n-switch :value="recommendationsEnabled" @update:value="toggleRecommendations" /><span title="北京时间交易日定时扫描；手动刷新不重复计入训练">自动推荐</span></div>
+      <div class="background-switch"><n-switch :value="backgroundEnabled" @update:value="toggleBackground" /><span title="控制每周本地训练与模型晋升检查">自动学习</span></div>
+      <n-button secondary @click="openHistory">扫描历史</n-button>
+      <n-button type="primary" :loading="loading" :disabled="restoring" title="重新获取行情并在本地计算，成功保存后显示" @click="refresh">刷新扫描</n-button>
     </header>
     <n-alert v-if="!engine.ready || refreshError || viewingHistory" type="warning" :show-icon="false"><span :title="refreshError || engine.message || engine.state">{{ viewingHistory ? '历史快照' : refreshError ? '更新失败 · 当前为旧结果' : '引擎未就绪 · 就绪后自动读取已存结果' }}</span><n-button v-if="viewingHistory" size="tiny" text @click="restoreLatest">返回当前</n-button></n-alert>
     <div class="picks-meta"><span>{{ result.asOfDate || result.as_of_date || '待生成' }}</span><details class="sk-help-details"><summary>扫描信息</summary><p>生成 {{ result.generatedAt || result.generated_at || '—' }} · 版本 {{ result.methodologyVersion || '兼容旧榜' }}</p><p>后台学习 {{ backgroundEnabled ? '开启' : '暂停' }} · {{ backgroundStatus.status || '未运行' }} {{ backgroundStatus.updatedAt }}</p><p>每轮扫描保留当时证据，可在历史中回看。</p></details></div>
-    <n-tabs v-model:value="viewMode" type="segment" animated class="view-tabs"><n-tab-pane name="adaptive" tab="当日机会" /><n-tab-pane name="classic" tab="策略分组" /></n-tabs>
+    <n-tabs v-model:value="viewMode" type="line" animated class="view-tabs"><n-tab-pane name="adaptive" tab="本地精选" /><n-tab-pane name="records" tab="推荐记录" /><n-tab-pane name="reviews" tab="延后复盘" /><n-tab-pane name="learning" tab="学习状态" /><n-tab-pane name="classic" tab="策略分组" /></n-tabs>
 
     <template v-if="viewMode === 'adaptive'">
-      <n-tabs v-if="adaptive.profileCandidates" v-model:value="precisionProfile" type="segment">
+      <n-tabs v-if="adaptive.profileCandidates && !isV11" v-model:value="precisionProfile" type="segment">
         <n-tab-pane name="conservative" tab="稳健 · 财务与回撤" />
         <n-tab-pane name="regular" tab="均衡 · 趋势与买点" />
         <n-tab-pane name="aggressive" tab="激进 · 突破与延续" />
       </n-tabs>
-      <p v-if="adaptive.profileCandidates" class="quote-coverage">三档入场纪律正在验证；通过检查不等于收益保证。盘前只观察，盘中重新确认。</p>
+      <p v-if="adaptive.profileCandidates && !isV11" class="quote-coverage">三档入场纪律正在验证；盘前只观察，盘中重新确认。</p>
       <details v-if="precisionWatchlist.length" class="sk-help-details"><summary>等待条件的股票（{{ precisionWatchlist.length }}）</summary>
         <p v-for="pick in precisionWatchlist" :key="codeOf(pick)">{{ nameOf(pick) }}：{{ pick.precisionDecision?.profiles?.[precisionProfile]?.reasons?.join('；') }}</p>
       </details>
-      <div class="picks-ai-config">
-        <label>平台<select v-model="aiPlatform" :disabled="loading || aiSaving" @change="aiConfigId=''" aria-label="当日机会AI平台"><option value="">请选择</option><option v-for="name in aiPlatforms" :key="name">{{ name }}</option></select></label>
-        <label>模型<select v-model="aiConfigId" :disabled="loading || aiSaving || !aiPlatform" @change="saveAISelection" aria-label="当日机会AI模型"><option value="">请选择</option><option v-for="p in aiModels" :value="String(p.id)" :key="p.id" :disabled="!p.ready">{{ p.model }}</option></select></label>
-        <n-button :loading="reviewLoading" :disabled="!adaptivePicks.length || loading" @click="reviewPicks">AI 复审</n-button><span>免费行情 + 本地计算 · 点击复审才调用 AI</span>
-      </div>
-      <EconomyBudget ref="budgetPanel" />
-      <details v-if="reviewResult" open class="sk-help-details"><summary>AI 风险审查 · {{reviewResult.cacheHit ? '复用结果' : '新请求'}} · {{reviewResult.analyzedAt}}</summary><p>原候选快照 {{reviewSnapshot}} · token {{reviewResult.usage?.total_tokens ?? '未知'}} · 费用估算 {{reviewResult.estimatedCost ?? '未配置单价或用量未知'}}</p><SafeMarkdown :model-value="reviewResult.markdown" /></details>
+      <p class="quote-coverage">软件行情 · 本地计算 · 沪深主板非ST · 每轮最多5只，不凑数。记录成功保存后展示。</p>
       <n-alert v-if="adaptive.message" type="warning" :show-icon="false">{{ adaptive.message }}</n-alert>
       <div class="adaptive-summary"><div><b>Top 5</b><small>{{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small></div><span>{{ loading ? '更新中…' : `新增 ${adaptive.changes?.added?.length || 0} · 移除 ${adaptive.changes?.removed?.length || 0}` }}</span></div>
       <div v-if="quoteCoverageSummary || scheduleSummary" class="quote-coverage"><span v-if="quoteCoverageSummary" title="新鲜表示通过本轮报价时效核验，不代表已成交。">{{ quoteCoverageSummary }}</span><span v-if="scheduleSummary" :title="`北京时间 · 目标 ${adaptive.delivery.target_at} · 实际 ${adaptive.delivery.decision_at || '未记录'}`">{{ scheduleSummary }}</span></div>
@@ -404,7 +378,7 @@ onBeforeUnmount(() => {
         <span>行业联动确认：{{ adaptive.dataQuality.independent_evidence.sector_confirmed }} 只</span>
         <span>分钟资金数据：{{ adaptive.dataQuality.independent_evidence.fund_source_available }} 只</span>
       </div>
-      <details v-if="isDailyRules" class="sk-help-details picks-method"><summary>规则与覆盖</summary><p>主板非ST · T至T+5 · 最多5只 · 本地规则筛选与风险检查</p><p>行情 {{ adaptive.dataQuality?.snapshot_count ?? '未知' }} 只，主板 {{ adaptive.dataQuality?.mainboard_count ?? '未知' }} 只，深研 {{ adaptive.dataQuality?.deep_research_count ?? '未知' }} 只；历史 {{ adaptive.historicalPrior?.availableTradingDays ?? 0 }}/20 日。</p><p>{{ adaptive.marketSummary }}</p><p>推荐逻辑 {{ adaptive.recommendationLogicVersion || '以单只候选记录为准' }}。分数是研究排序分，不是胜率；本地规则筛选不等于 ChatGPT 的综合推理。</p><p v-for="(call,index) in adaptive.aiAudit" :key="index">{{ call.provider }} / {{ call.model }} · 请求 High · {{ call.completed_at }}；服务端内部强度未知。</p><p>成交与送达链路未联合核验时只显示观察，不计作可执行命中。</p></details>
+      <details v-if="isV11" class="sk-help-details picks-method"><summary>规则与覆盖</summary><p>每轮重新扫描全主板，最多30只进行分钟深度核验。</p><p>行情 {{ adaptive.dataQuality?.snapshot_count ?? '未知' }} 只，主板 {{ adaptive.dataQuality?.mainboard_count ?? '未知' }} 只，深度核验 {{ adaptive.dataQuality?.deep_research_count ?? adaptive.dataQuality?.research_count ?? '未知' }} 只。</p><p>{{ adaptive.marketSummary }}</p><p>算法 {{ adaptive.scoreVersion || adaptive.recommendationLogicVersion || '以单只候选记录为准' }}。同刻历史5～19日按实际覆盖降低置信度，不足5日对应因子留空。可用因子重新分配权重。</p><p>冷启动分数 = max(Early, MainRise) − 0.2 × 风险分，再限制至0～100。风险系数为未验证初值；分数用于排序，概率与收益预测待校准。</p></details>
       <details v-else class="sk-help-details picks-method"><summary>旧版历史口径</summary><p>{{ modelMix }} · {{ adaptive.modelVersion }}。旧分快照保留用于回看；下一次刷新采用当前规则与证据筛选。</p></details>
       <n-spin :show="loading">
         <section v-if="adaptivePicks.length" class="pick-grid">
@@ -415,6 +389,12 @@ onBeforeUnmount(() => {
               <div v-if="detail.indicators.some(row => row.value !== '未取得')" class="indicator-highlights"><span v-for="row in detail.indicators.filter(row => row.value !== '未取得').slice(0, 3)" :key="row.key">{{ row.label }} <b>{{ row.value }}</b></span></div>
               <div class="pick-quote"><strong>{{ pick.referencePrice == null ? '—' : `¥${Number(pick.referencePrice).toFixed(2)}` }}</strong><span :class="Number(pick.currentChange) > 0 ? 'up' : Number(pick.currentChange) < 0 ? 'down' : ''">{{ pick.currentChange == null ? '—' : `${Number(pick.currentChange).toFixed(2)}%` }}</span></div>
               <div v-if="pick.quote" class="quote-evidence" title="北京时间；延迟按采集时间减原始源时间计算。此处为本轮保存的行情快照。">{{ quoteEvidence(pick) }}</div>
+              <div v-if="isV11Pick(pick)" class="v11-facts">
+                <div><span>Early / MainRise</span><b>{{ factorValue(pick.earlyScore) }} / {{ factorValue(pick.mainRiseScore) }}</b></div>
+                <div><span>风险 / 置信度</span><b>{{ factorValue(pick.distributionRisk) }} / {{ percent(pick.dataConfidence ?? pick.confidence, 0) }}</b></div>
+                <div><span>同刻历史覆盖</span><b>{{ pick.historicalCoverageDays ?? pick.baselineHistoryDays ?? 0 }} / 20 日</b></div>
+                <div><span>价格结构</span><b>{{ pick.observableStructure || '待确认' }}</b></div>
+              </div>
               <p v-if="detail.risks.length" class="pick-risk" :title="detail.risks.join('；')"><span>主要风险</span>{{ detail.risks[0] }}</p>
               <p v-else class="pick-risk"><span>主要风险</span>未取得具体风险说明，需进一步核验</p>
               <details class="sk-help-details pick-details"><summary>依据与风险</summary>
@@ -425,6 +405,7 @@ onBeforeUnmount(() => {
                 <p v-if="pick.precisionDecision"><span>财务与事件</span>{{ pick.precisionDecision.sourceContext?.gaps?.join('；') || '已取得财报、预告与解禁覆盖；按记录时点核验' }}</p>
                 <p v-if="pick.precisionDecision"><span>价格位置</span>MA5乖离 {{ pick.precisionDecision.metrics.biasMa5Pct?.toFixed(2) ?? '未知' }}% · ATR距离 {{ pick.precisionDecision.metrics.atrExtension?.toFixed(2) ?? '未知' }} 倍</p>
                 <p><span>研究排序分</span>{{ scoreOf(pick) }} · 不是胜率或收益预测</p>
+                <template v-if="isV11Pick(pick)"><p><span>主升概率</span>{{ calibrationValue(pick, 'mainRiseProbability') }}</p><p><span>预计MFE</span>1日 {{ calibrationValue(pick, 'expectedMFE1') }} · 3日 {{ calibrationValue(pick, 'expectedMFE3') }} · 5日 {{ calibrationValue(pick, 'expectedMFE5') }}</p><p><span>预计MAE</span>1日 {{ calibrationValue(pick, 'expectedMAE1') }} · 3日 {{ calibrationValue(pick, 'expectedMAE3') }} · 5日 {{ calibrationValue(pick, 'expectedMAE5') }}</p></template>
                 <p><span>观察周期</span>{{ detail.entryPlan.holdingWindow }}</p>
                 <p><span>不追条件</span>{{ detail.entryPlan.noChase }}</p>
                 <PickIndicatorEvidence :indicators="detail.indicators" />
@@ -441,7 +422,7 @@ onBeforeUnmount(() => {
                 <p><span>风险</span>{{ detail.risks.join('；') || '未取得' }}</p>
               </details>
             </div>
-            <template #footer><n-space justify="end"><n-button size="small" secondary @click="addWatch(pick)">自选</n-button><n-button size="small" secondary @click="openKline(pick)">图表</n-button><n-button size="small" secondary @click="openAI(pick)">AI 复核</n-button></n-space></template>
+            <template #footer><n-space justify="end"><n-button size="small" secondary @click="addWatch(pick)">自选</n-button><n-button size="small" type="primary" @click="openKline(pick)">图表</n-button></n-space></template>
           </n-card>
         </section>
         <n-empty v-else :description="adaptive.message || (result.generatedAt ? '本轮无候选 · 请查看规则与覆盖' : '点击刷新全部生成候选')" style="padding:56px 0" />
@@ -449,7 +430,9 @@ onBeforeUnmount(() => {
       </n-spin>
     </template>
 
-    <template v-else>
+    <PicksLedger v-else-if="['records', 'reviews', 'learning'].includes(viewMode)" :mode="viewMode" @open-chart="openKline" />
+
+    <template v-else-if="viewMode === 'classic'">
       <n-tabs v-model:value="activeTier" type="segment" animated class="tier-tabs"><n-tab-pane v-for="tier in tierOptions" :key="tier.key" :name="tier.key"><template #tab><span class="tier-tab" :title="tier.note"><b>{{ tier.label }}</b></span></template></n-tab-pane></n-tabs>
       <details class="sk-help-details picks-method"><summary>方法与口径</summary><p>{{ tierData.description || (activeTier === 'regular' ? '均衡多因子与趋势质量策略。' : '暂无新版数据。') }}</p><p v-if="activeTier === 'aggressive'">“生成时未封板”只表示当时有成交、未停牌且低于涨停价至少0.01元，不保证之后可成交。卡片分数为候选百分位；触板概率仅在模型通过发布门槛时显示。</p></details>
       <n-tabs v-model:value="activeBoard" type="line" animated><n-tab-pane name="nonKeChuang" tab="非科创板" /><n-tab-pane name="kechuang" tab="科创板" /></n-tabs>
@@ -472,19 +455,19 @@ onBeforeUnmount(() => {
                 <p v-if="activeTier === 'aggressive' && pick.modelStatus === 'qualified'"><span>触板概率</span>1日 {{ percent(pick.touchProbability1d) }} / 3日 {{ percent(pick.touchProbability3d) }} · 基准 {{ percent(pick.baseRate3d) }}</p>
               </details>
             </div>
-            <template #footer><n-space justify="end"><n-button size="small" secondary @click="addWatch(pick)">自选</n-button><n-button size="small" secondary @click="openKline(pick)">图表</n-button><n-button size="small" type="primary" @click="openAI(pick)">AI 复核</n-button></n-space></template>
+            <template #footer><n-space justify="end"><n-button size="small" secondary @click="addWatch(pick)">自选</n-button><n-button size="small" type="primary" @click="openKline(pick)">图表</n-button></n-space></template>
           </n-card>
         </section>
         <n-empty v-else :description="shortfall ? `合格候选不足，缺额 ${shortfall} 只` : '暂无合格候选'" style="padding:56px 0" />
       </n-spin>
     </template>
     <n-drawer v-model:show="methodVisible" :width="500" placement="right"><n-drawer-content title="精选 · 方法与使用" closable><div class="pick-explanation">
-      <ol class="usage-steps"><li><b>刷新全部</b> · 等引擎就绪，检查列表生成时间。</li><li><b>为何入选</b> · 看实际特征、评分和来源。</li><li><b>图表 / AI 复核</b> · 核对当前条件与反证。</li></ol>
-      <h3>当日机会</h3><p>获取公开行情，通过本地规则筛选主板非ST候选，并核对原始报价时间。最多5只，不凑数；点击“AI复审”才调用所选平台。无成交与送达证据时仅为条件观察。</p>
-      <details><summary>入选依据与指标</summary><p>每只候选展示已保存的入选理由、指标数值、单位、阈值、来源和数据时间，以及触发、失效和不追条件。高波动股票需要具体的入选依据与风险说明；证据不足的股票单独列出，不占候选名额。</p><p>研究排序分不是胜率或收益预测。本地规则不等于 ChatGPT 的综合推理；资金、板块地位、催化、预期差等证据未取得时会明确标注，不能视为已核验。旧记录没有保存的理由和阈值不会事后补写。</p></details>
+      <ol class="usage-steps"><li><b>刷新扫描</b> · 检查列表生成时间、行情源时间和覆盖范围。</li><li><b>为何入选</b> · 查看实际因子、价格结构与失效条件。</li><li><b>图表</b> · 使用共用行情核对当前结构。</li><li><b>延后复盘</b> · 查看T+1、T+3、T+5的观察变化与模拟成交。</li></ol>
+      <h3>本地精选 V1.1</h3><p>使用软件行情、本地因子及两通道评分，筛选沪深主板非ST，每轮最多5只。每轮重新选深度核验队列，候选及未入选对照一同记录。</p>
+      <details><summary>入选依据与指标</summary><p>每只候选展示已保存的入选理由、指标数值、单位、阈值、来源和数据时间，以及触发、失效和不追条件。历史不足5日时，对应历史因子留空；5～19日展示实际天数并降低置信度；达到20日才使用完整基准。成交额缺失保留为空。</p><p>冷启动研究分不是胜率或收益预测。未经校准的MFE、MAE预测及概率显示待校准。风险只扣一次，0.2系数是待验证初值。旧记录没有保存的指标不会事后补写。</p></details>
       <details><summary>旧版历史分支名称</summary><div class="branch-list"><div v-for="(item,key) in PICK_BRANCHES" :key="key"><code>{{ key }}</code><span>{{ item.name }}</span></div></div></details>
-      <h3>策略分组</h3><p>保守、均衡、进攻采用不同目标，分数不能跨组比较。模型未通过发布门槛时显示规则观察；AI只能解释，不能让失败模型变成已验证。</p>
-      <details><summary>后台学习与历史频率</summary><p>进入精选先显示上次快照，引擎就绪后读取最新已存结果；停留页面时每30秒检查一次，查看历史时暂停更新。只有“刷新全部”重新扫描。收盘复盘和学习记录可在“历史”中查看。</p><p>历史频率需20个已成熟官方交易日、60日行情和30个有效相似案例。未积累足够数据仍可使用候选和AI研究，不能把研究分当成胜率。</p></details>
+      <h3>策略分组</h3><p>保守、均衡、进攻采用不同目标，分数不能跨组比较。旧策略记录与V1.1训练集分别保留。</p>
+      <details><summary>定时扫描与学习</summary><p>北京时间09:20盘前观察；09:40、09:55、10:30、14:55独立扫描；15:30归档与到期复盘；周五15:45本地训练。自动推荐和自动学习分别控制。错过时点保留遗漏记录，手动刷新不重复计入训练。</p><p>默认至少120个成熟交易日、1000条有效样本才检验模型晋升。经时间隔离、样本外扣费收益、优势置信下界与回撤检查后，还须完成20个交易日前瞻影子验证。未达门槛继续使用当前版本。</p><p>进入页面读取已存快照，每30秒检查更新；“刷新扫描”才重新扫描。模拟成交采用下一完整分钟入场和期限收盘退出，未成交独立记录。价格观察与模拟收益均不代表用户真实交易。</p></details>
     </div></n-drawer-content></n-drawer>
     <n-drawer v-model:show="explanationVisible" :width="520" placement="right"><n-drawer-content :title="`${nameOf(selectedPick)} · ${selectedIsInsufficient ? '证据不足未入选' : '为什么入选'}`" closable><div class="pick-explanation">
       <h3>{{ explanation.title }}</h3><small>快照 {{ formatTime(adaptive.generatedAt || result.generatedAt) }} · 行情来源 {{ explanation.source }}<br/>推荐逻辑 {{ explanation.logicVersion }}</small>
@@ -497,14 +480,14 @@ onBeforeUnmount(() => {
         <p v-for="check in explanation.evidenceChecks" :key="check.key">{{ check.passed ? '✓' : '—' }} {{ check.label }}：{{ check.passed ? '满足' : '未满足' }}</p>
         <p>同刻历史样本：{{ explanation.baselineDays ?? 0 }}/20 个交易日；来源：{{ explanation.baselineSource }}</p>
         <p v-if="explanation.missingHistoryDates.length">待补齐日期：{{ explanation.missingHistoryDates.join('、') }}</p>
-        <p>盘中五项共同满足才可入选；盘前仅列开盘后待确认的条件线索。资金指标为供应商分类估算。</p>
+        <p>{{ isV11Pick(selectedPick) ? '缺失可选因子保留为空，已取得因子按可用权重计算；报价与交易状态仍须通过检查。' : '此处保留历史快照当时的核验口径。' }}资金指标为供应商分类估算。</p>
       </section>
       <h3>推荐指标 · 当时的数值与判断</h3><PickIndicatorEvidence :indicators="explanation.indicators" />
       <details><summary>{{ explanation.scoreLabel }} · {{ scoreOf(selectedPick) }}（不是胜率）</summary><p>{{ explanation.scoreMeaning }}</p><p>{{ explanation.formula }}</p><div v-for="row in explanation.modelScores" :key="row.key" class="score-row"><span>{{ row.key }} · {{ row.label }}</span><b>{{ row.value }}</b></div></details>
       <h3>证据与来源</h3><p v-if="!explanation.evidence.length">该快照未保留来源；刷新全部后再核对。</p><article v-for="(item,index) in explanation.evidence" :key="index" class="evidence-item"><b>{{ item.title || item.type || '来源' }}</b><p>{{ item.summary || '无摘要' }}</p><small>提取于 {{ formatTime(item.fetched_at) }}（非原始发布时间）</small><a v-if="item.url" :href="item.url" target="_blank" rel="noopener noreferrer">查看来源 ↗</a></article>
       <h3>触发与退出条件</h3><p>观察周期：{{ explanation.entryPlan.holdingWindow }}</p><p>触发：{{ explanation.entryPlan.trigger }}</p><p>失效：{{ explanation.entryPlan.invalidations }}</p><p>不追：{{ explanation.entryPlan.noChase }}</p>
       <details><summary>数据缺口</summary><p>{{ (explanation.quality.gaps || []).join('；') || '旧记录未保存数据缺口检查' }}</p><p>60日历史：{{ explanation.quality.history60d === true ? '有' : '不足 / 未取得' }}；尾盘分钟数据：{{ explanation.quality.minuteTail === true ? '有' : '未取得' }}。文本摘要需回原文核验。</p></details>
-      <n-space style="margin-top:18px"><n-button secondary @click="openKline(selectedPick)">图表</n-button><n-button type="primary" @click="openAI(selectedPick)">AI 复核</n-button></n-space>
+      <n-space style="margin-top:18px"><n-button type="primary" @click="openKline(selectedPick)">图表</n-button></n-space>
     </div></n-drawer-content></n-drawer>
     <n-drawer v-model:show="historyVisible" :width="520" placement="right"><n-drawer-content title="精选历史" closable><n-spin :show="historyLoading">
       <div v-if="historyItems.length" class="history-list">
@@ -535,6 +518,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.v11-facts{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0 12px;padding:10px;background:var(--sk-surface-2);border-radius:6px;font-size:11px}.v11-facts>div{display:flex;flex-direction:column;gap:3px}.v11-facts b{font-weight:500;font-variant-numeric:tabular-nums}.background-switch{white-space:nowrap}
 .indicator-highlights{display:flex;flex-wrap:wrap;gap:5px 12px;margin:0 0 8px;font-size:10px;color:var(--sk-text-muted)}.indicator-highlights b{color:var(--sk-text);font-variant-numeric:tabular-nums}.explanation-reasons{padding-left:18px}.explanation-reasons li{margin:7px 0}.legacy-notice{padding:9px 11px;border-left:3px solid var(--sk-accent);background:var(--sk-surface-2)}.insufficient-evidence{margin:18px 0;font-size:12px}.insufficient-evidence>article{padding:10px 0;border-top:1px solid var(--sk-border)}.insufficient-evidence>article>div{display:flex;align-items:center;gap:10px}.insufficient-evidence code{color:var(--sk-text-muted)}.insufficient-evidence .n-button{margin-left:auto}
 .quote-coverage{display:flex;flex-wrap:wrap;gap:5px 18px;margin:-4px 0 12px;color:var(--sk-text-muted);font-size:11px;line-height:1.6}.quote-evidence{margin:-4px 0 10px;color:var(--sk-text-muted);font-size:10px;line-height:1.6;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .history-review{margin-top:10px;font-size:11px;line-height:1.6}.observation-table{width:100%;border-collapse:collapse;font-size:10px;font-variant-numeric:tabular-nums}.observation-table th,.observation-table td{padding:5px 3px;text-align:right;border-bottom:1px solid var(--sk-border)}.observation-table th:first-child,.observation-table td:first-child{text-align:left}.observation-table th{color:var(--sk-text-muted);font-weight:500}

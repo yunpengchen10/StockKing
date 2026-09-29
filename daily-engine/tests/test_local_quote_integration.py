@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -9,7 +8,7 @@ from src.services.yao_scout import daily_opportunities as base
 from src.services.yao_scout import local_opportunities as local
 
 
-def make_service(monkeypatch, start, fetch=None, batch=None):
+def make_service(monkeypatch, start, tmp_path, fetch=None, batch=None):
     tick = [start]
     events = []
     saved = []
@@ -23,9 +22,8 @@ def make_service(monkeypatch, start, fetch=None, batch=None):
     history['high'], history['low'] = history.close+1, history.close-.2
     history.attrs['daily_source'] = 'test'
     yao = SimpleNamespace(db=db, _fetch_snapshot=snapshot, _snapshot_meta=lambda *a, **kw: {},
-                          history_fetcher=lambda *a, **kw: history, data_dir=Path('.'))
+                          history_fetcher=lambda *a, **kw: history, data_dir=tmp_path)
     monkeypatch.setattr(base, 'is_market_open', lambda *a: True)
-    monkeypatch.setattr(local, 'get_tier_model_service', lambda: SimpleNamespace(score_local_five_day=lambda rows: rows))
     monkeypatch.setattr(base.HighClient, 'ask', lambda *a: pytest.fail('automatic scan called paid AI'))
     def quote(code):
         events.append(('quote', tick[0]))
@@ -50,9 +48,9 @@ def make_service(monkeypatch, start, fetch=None, batch=None):
 
 
 @pytest.mark.parametrize('slot,hour,minute', [('0920', 9, 20), ('1030', 10, 30), ('1455', 14, 55)])
-def test_scheduled_local_scan_prepares_early_then_refreshes_at_target(monkeypatch, slot, hour, minute):
+def test_scheduled_local_scan_prepares_early_then_refreshes_at_target(monkeypatch, tmp_path, slot, hour, minute):
     start = datetime(2026, 9, 14, hour, minute, tzinfo=base.TZ) - timedelta(minutes=10)
-    service, tick, events, saved = make_service(monkeypatch, start)
+    service, tick, events, saved = make_service(monkeypatch, start, tmp_path)
     result = service.run(slot, official=True)
     target = start + timedelta(minutes=10)
     assert events == [('snapshot', start), ('snapshot', target-timedelta(seconds=90)), ('quote', target)]
@@ -62,23 +60,47 @@ def test_scheduled_local_scan_prepares_early_then_refreshes_at_target(monkeypatc
     assert result['generatedAt'] == target.isoformat()
     assert result['dataQuality']['quote_coverage']['fresh'] == 1
     assert result['llmUsed'] is False and result['delivery']['received_at'] is None
+    assert result['learningLedger']['trainingEligible'] is (slot != '0920')
+    assert result['learningLedger']['researchCount'] == 1
     if slot == '0920':
         assert records[0]['status'] == 'premarket'
         assert not any(result['profileCandidates'].values())
 
 
-def test_manual_live_refresh_does_not_wait_for_schedule(monkeypatch):
+def test_manual_live_refresh_does_not_wait_for_schedule(monkeypatch, tmp_path):
     start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
-    service, tick, events, _ = make_service(monkeypatch, start)
+    service, tick, events, _ = make_service(monkeypatch, start, tmp_path)
     result = service.run('live')
     assert tick[0] == start
     assert result['delivery']['target_at'] is None
     assert len(events) == 2
 
 
-def test_expired_slot_never_fetches_or_waits(monkeypatch):
+def test_local_daily_history_reuses_software_chart_provider(monkeypatch, tmp_path):
+    from src.services import software_market
+    start = datetime(2026, 9, 14, 10, 30, tzinfo=base.TZ)
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path)
+    service.yao.history_fetcher = lambda *a,**k: pytest.fail('legacy daily source used')
+    dates = pd.bdate_range(end=start.date()-timedelta(days=1),periods=60)
+    class Client:
+        available=True
+        def bars(self,code,period,count):
+            assert (code,period,count)==('600001','101',100)
+            return {'source':'fixture','adjustment':'none','bars':[
+                {'end':day.date().isoformat()+'T15:00:00+08:00',
+                 'open':9.7,'high':10.8,'low':9.5,'close':9.8}
+                for day in dates]}
+    monkeypatch.setattr(software_market.SoftwareMarketClient,'from_environment',lambda:Client())
+    result = service.run('live')
+    rows = result['candidates'] or result['precisionResearch'] or result['evidenceInsufficient']
+    assert rows
+    evidence = {row['key']:row for row in rows[0]['indicatorEvidence']}
+    assert 'software:go/fixture' in evidence['ma5']['source']
+
+
+def test_expired_slot_never_fetches_or_waits(monkeypatch, tmp_path):
     start = datetime(2026, 9, 14, 14, 57, tzinfo=base.TZ)
-    service, tick, events, _ = make_service(monkeypatch, start)
+    service, tick, events, _ = make_service(monkeypatch, start, tmp_path)
     result = service.run('1455')
     assert result['status'] == 'expired' and events == []
 
@@ -89,16 +111,16 @@ def test_default_provider_is_public_gateway_not_old_dsa_manager():
     assert service.batch_quote_fetcher is base.get_public_market_quotes
 
 
-def test_batch_partial_failure_preserves_good_stock(monkeypatch):
+def test_batch_partial_failure_preserves_good_stock(monkeypatch, tmp_path):
     start = datetime(2026, 9, 14, 14, 55, tzinfo=base.TZ)
-    service, _, _, _ = make_service(monkeypatch, start)
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path)
     service.quote_fetcher = lambda code: {'code': code} if code == '600001' else (_ for _ in ()).throw(ValueError())
     assert service._quotes(['600001', '600002']) == {'600001': {'code': '600001'}, '600002': {}}
 
 
-def test_completion_rechecks_older_quote(monkeypatch):
+def test_completion_rechecks_older_quote(monkeypatch, tmp_path):
     start = datetime(2026, 9, 14, 14, 55, tzinfo=base.TZ)
-    service, tick, _, _ = make_service(monkeypatch, start)
+    service, tick, _, _ = make_service(monkeypatch, start, tmp_path)
     result = service.run('1455')
     tick[0] += timedelta(seconds=31)
     service._finish_quotes(result, result['dataQuality'])
@@ -112,18 +134,18 @@ def test_completion_rechecks_older_quote(monkeypatch):
     assert result['status'] == 'expired'
 
 
-def test_missing_timestamp_stays_missing_and_reviewable(monkeypatch):
+def test_missing_timestamp_stays_missing_and_reviewable(monkeypatch, tmp_path):
     start = datetime(2026, 9, 14, 10, 30, tzinfo=base.TZ)
-    service, _, _, _ = make_service(monkeypatch, start, fetch=lambda code: {'code': code, 'price': 10, 'fetched_at': start.isoformat()})
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path, fetch=lambda code: {'code': code, 'price': 10, 'fetched_at': start.isoformat()})
     result = service.run('1030')
     assert result['dataQuality']['quote_coverage']['source_time_min'] is None
     assert result['candidates'] == []
     assert result['evidenceInsufficient'][0]['status'] == 'evidence_insufficient'
 
 
-def test_scan_reads_prior_review_reminders_without_changing_rank(monkeypatch):
+def test_scan_reads_prior_review_reminders_without_changing_rank(monkeypatch, tmp_path):
     start = datetime(2026, 9, 14, 10, 30, tzinfo=base.TZ)
-    service, _, _, _ = make_service(monkeypatch, start)
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path)
     monkeypatch.setattr(local, 'read_observation_reminders', lambda db, code, now: ['历史缺口需重新核验'])
     result = service.run('1030')
     candidate = result['candidates'][0]
@@ -132,17 +154,16 @@ def test_scan_reads_prior_review_reminders_without_changing_rank(monkeypatch):
     assert candidate['rank'] == 1 and result['llmUsed'] is False
 
 
-def test_daily_review_wires_observations_and_preserves_existing_maintenance(monkeypatch):
+def test_daily_review_wires_observations_and_new_ledger(monkeypatch, tmp_path):
     from src.services.yao_scout import minute_history
     start = datetime(2026, 9, 14, 15, 30, tzinfo=base.TZ)
-    service, _, events, _ = make_service(monkeypatch, start)
+    service, _, events, _ = make_service(monkeypatch, start, tmp_path)
     service.db.save_yao_adaptive_state = lambda *a: None
-    service.yao.mature_outcomes = lambda: {'status': 'maintained'}
     monkeypatch.setattr(local, 'review_local_observations', lambda *a, **kw: {'status': 'reviewed', 'verified_count': 2})
     captured=[]
     monkeypatch.setattr(minute_history,'archive_universe',lambda codes,*a: captured.extend(codes) or {'universe':len(codes),'updated':len(codes)})
     result = service.run('review')
     assert result['observationReview']['verified_count'] == 2
-    assert result['localMaintenance']['status'] == 'maintained'
+    assert result['learningReview']['updated'] == 0
     assert events == [('snapshot',start)] and result['llmUsed'] is False
     assert captured==['600001'] and result['minuteArchiveMaintenance']['updated']==1
