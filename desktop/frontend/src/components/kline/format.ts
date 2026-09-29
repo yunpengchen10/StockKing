@@ -1,5 +1,7 @@
 export function parseNumStr(s) {
-  const n = Number(String(s ?? '').replace(/,/g, '').replace(/%/g, '').trim())
+  const value = String(s ?? '').replace(/,/g, '').replace(/%/g, '').trim()
+  if (!value) return NaN
+  const n = Number(value)
   return Number.isFinite(n) ? n : NaN
 }
 

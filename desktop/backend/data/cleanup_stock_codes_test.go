@@ -6,7 +6,7 @@ import (
 )
 
 func init() {
-	db.Init("D:/go-stock/data/stock.db")
+	db.Init("../../data/stock.db")
 }
 
 // TestCleanupStockCodesDryRun 验证清理工具的扫描能力（dryRun=true，只读不写）。

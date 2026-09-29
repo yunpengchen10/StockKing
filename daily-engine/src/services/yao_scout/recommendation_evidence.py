@@ -79,7 +79,7 @@ def daily_evidence(frame, cutoff):
     return result
 
 
-def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=None, *, sector=None, funds=None):
+def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=None, *, sector=None, funds=None, v11=False):
     snapshot_meta = snapshot_meta or {}
     evidence, reasons, risks = [], [], []
     source = quote.get('source')
@@ -250,13 +250,16 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
     gaps = list((daily or {}).get('gaps') or []) + minute_gaps + independent_gaps
     gaps.append('催化事件及预期差尚未独立核验，不作为本轮入选理由')
     if not sector_ok:
-        gaps.append('未同时满足行业同刻上涨、半数同业上涨及个股相对领先；不按孤立脉冲推荐')
+        gaps.append('行业同刻共振未完整确认；降低置信度，不作为单项否决' if v11 else
+                    '未同时满足行业同刻上涨、半数同业上涨及个股相对领先；不按孤立脉冲推荐')
     if not baseline_ok:
-        gaps.append('同刻20日基准尚未齐全，盘中推荐资格未开放')
+        gaps.append('同刻20日基准尚未齐全；5—19日仅低置信排序，少于5日不生成V1.1分数' if v11 else
+                    '同刻20日基准尚未齐全，盘中推荐资格未开放')
     elif not volume_confirmed:
         risks.append('近3分钟成交额未超过20日同刻中位数，即时放量未确认')
     if not funds_ok:
-        gaps.append('新鲜主动买卖量分类或近3分钟主力估算净额>0未核实')
+        gaps.append('新鲜主动买卖量分类或近3分钟主力估算净额>0未核实；降低置信度' if v11 else
+                    '新鲜主动买卖量分类或近3分钟主力估算净额>0未核实')
     if resistance is None:
         gaps.append('上方可比压力/剩余空间未量化，不编造目标价')
     if support is None:
@@ -270,11 +273,13 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
     # Distinct conditional branches avoid a single numeric gate excluding new
     # highs or deep-water recovery. A daily trend alone is a premarket lead;
     # during the session it waits outside the recommendation list for minutes.
+    history_days = int((intraday or {}).get('historyDays') or 0)
     eligible = bool(p and ((premarket and premarket_quote_ok and aligned and d.get('ma5', 0) > d.get('ma10', 0) > d.get('ma20', 0))
-                          or (not premarket and valid_quote and amount_ok and immediate and sector_ok and volume_confirmed and funds_ok)))
+                          or (not premarket and valid_quote and amount_ok and immediate and
+                              (True if v11 else sector_ok and volume_confirmed and funds_ok))))
     if not immediate and not premarket:
         gaps.append('未取得3/5分钟持续转强及VWAP承接或局部突破的独立证据，本轮不因日涨幅高而入选')
-    triggers = [f'复核VWAP {vwap:.2f}元附近承接、3/5分钟持续转强及板块联动后再评估' if vwap else '开盘后取得有效VWAP和连续分钟成交证据，再核验板块联动']
+    triggers = [f'复核VWAP {vwap:.2f}元附近承接及连续3/5分钟转强；板块联动作为加分证据' if vwap else '开盘后取得连续分钟突破证据，并核验正常可成交性'] if v11 else [f'复核VWAP {vwap:.2f}元附近承接、3/5分钟持续转强及板块联动后再评估' if vwap else '开盘后取得有效VWAP和连续分钟成交证据，再核验板块联动']
     invalidations = [f'跌破{support:.2f}元则原支撑逻辑失效' if support else '失效价位未核实前不形成买入计划',
                      '板块联动消失、放量下跌或报价过期时重新评估']
     no_chase = f'接近{resistance:.2f}元且剩余空间不再大于失效距离时不追' if resistance else '未核实上方空间时不追；封死涨停仅作风向标'
@@ -283,7 +288,8 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
             'riskReasons': risks, 'indicatorEvidence': evidence, 'evidenceEligible': eligible,
             'evidenceGaps': list(dict.fromkeys(gaps)), 'structureRewardRisk': rr,
             'evidenceChecks': {'minute_structure':immediate,'sector_resonance':sector_ok,
-                'history_20d':baseline_ok,'relative_volume':volume_confirmed,'fund_direction':funds_ok},
+                'history_5d':history_days >= 5,'history_20d':baseline_ok,
+                'relative_volume':volume_confirmed,'fund_direction':funds_ok},
             'sectorEvidence':sector,'fundEvidence':funds,
             'baselineEvidence':{key:(intraday or {}).get(key) for key in ('historyDays','baselineReady','baselineMedianAmount','baselineDates','missingHistoryDates','baselineSource','historyAccess')},
             'evidencePriority': 'minute_price_and_turnover' if immediate and (finite(m.get('amount_3m')) or 0)>0 else 'minute_price' if immediate else 'premarket_structure',

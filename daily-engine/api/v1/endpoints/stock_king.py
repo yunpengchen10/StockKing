@@ -23,16 +23,14 @@ router = APIRouter()
 class PicksRequest(BaseModel):
     max_per_board: int = Field(5, ge=5, le=50)
     force: bool = False
-    scan_slot: Literal["auto", "live", "0920", "0922", "1030", "1455"] = "live"
-    ai_config: Dict[str, Any] | None = Field(None, repr=False)
+    scan_slot: Literal["auto", "live", "0920", "0922", "0940", "0955", "1030", "1455"] = "live"
     top_n: int = Field(5, ge=0, le=5)
     official: bool | None = None
     allow_missed: bool = False
 
 
 class AdaptiveRunRequest(BaseModel):
-    scan_slot: Literal["0920", "0922", "0925", "1030", "1455", "review", "weekly"]
-    ai_config: Dict[str, Any] | None = Field(None, repr=False)
+    scan_slot: Literal["0920", "0922", "0925", "0940", "0955", "1030", "1455", "review", "weekly"]
     top_n: int = Field(5, ge=0, le=5)
     allow_missed: bool = False
 
@@ -56,7 +54,6 @@ def get_picks(
         top_n=request.top_n,
         official=request.official,
         allow_missed=request.allow_missed,
-        ai_config=request.ai_config,
     )
 
 
@@ -71,13 +68,13 @@ def start_adaptive_run(
 
     def execute() -> Dict[str, Any]:
         queue.update_task_progress(task_id, 10, "正在读取历史先验与校准状态")
-        result = LocalOpportunityService(YaoScoutService(config=config, db_manager=db_manager), request.ai_config).run(
+        result = LocalOpportunityService(YaoScoutService(config=config, db_manager=db_manager)).run(
             request.scan_slot,
             top_n=request.top_n,
             official=True,
             allow_missed=request.allow_missed,
         )
-        queue.update_task_progress(task_id, 98, "运行快照、DLM与学习状态已原子写入")
+        queue.update_task_progress(task_id, 98, "本地信号、对照样本及复盘状态已保存")
         return result
 
     task = queue.submit_background_task(
@@ -115,7 +112,7 @@ def get_adaptive_task(task_id: str) -> Dict[str, Any]:
 
 @router.get("/picks/latest")
 def get_latest_adaptive_run(
-    scan_slot: Literal["live", "0920", "0922", "0925", "1030", "1455", "review", "weekly"] = "live",
+    scan_slot: Literal["live", "0920", "0922", "0925", "0940", "0955", "1030", "1455", "review", "weekly"] = "live",
     db_manager: DatabaseManager = Depends(get_database_manager),
 ) -> Dict[str, Any]:
     row = db_manager.get_latest_yao_run(mode=f"king_{scan_slot}")
@@ -127,7 +124,7 @@ def get_latest_adaptive_run(
 @router.get("/picks/history")
 def get_adaptive_history(
     limit: int = Query(20, ge=1, le=100),
-    scan_slot: str | None = Query(None, pattern="^(live|0920|0922|0925|1030|1455|review|weekly)$"),
+    scan_slot: str | None = Query(None, pattern="^(live|0920|0922|0925|0940|0955|1030|1455|review|weekly)$"),
     db_manager: DatabaseManager = Depends(get_database_manager),
 ) -> Dict[str, Any]:
     mode = f"king_{scan_slot}" if scan_slot else None
@@ -146,12 +143,24 @@ def get_adaptive_learning(
     config: Config = Depends(get_config_dep),
     db_manager: DatabaseManager = Depends(get_database_manager),
 ) -> Dict[str, Any]:
-    service = AdaptiveKingService(YaoScoutService(config=config, db_manager=db_manager))
-    return {
-        "state": service.get_learning_state(),
-        "dlm": db_manager.list_yao_dlm(limit=20),
-        "metrics": db_manager.get_yao_metrics(),
-    }
+    return _signal_learning(config, db_manager).learning_state()
+
+
+def _signal_learning(config, db_manager):
+    from src.services.yao_scout.signal_learning import SignalLearningService
+    return SignalLearningService(YaoScoutService(config=config, db_manager=db_manager).data_dir)
+
+
+@router.get('/picks/records')
+def get_signal_records(date: str = '', symbol: str = '', version: str = '',
+    config: Config = Depends(get_config_dep), db_manager: DatabaseManager = Depends(get_database_manager)):
+    return _signal_learning(config, db_manager).history({'date': date, 'symbol': symbol, 'version': version})
+
+
+@router.get('/picks/reviews')
+def get_signal_reviews(date: str = '', symbol: str = '', version: str = '',
+    config: Config = Depends(get_config_dep), db_manager: DatabaseManager = Depends(get_database_manager)):
+    return _signal_learning(config, db_manager).reviews({'date': date, 'symbol': symbol, 'version': version})
 
 
 @router.post("/advice")

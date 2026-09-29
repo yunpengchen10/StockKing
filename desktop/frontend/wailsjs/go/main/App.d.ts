@@ -332,11 +332,19 @@ export function GetStockKingAIProviders():Promise<Array<main.StockKingAIProvider
 
 export function GetStockKingAIReview(arg1:string):Promise<Record<string, any>>;
 
+export function GetStockKingAutoRecommendations():Promise<boolean>;
+
 export function GetStockKingBackgroundLearning():Promise<boolean>;
 
 export function GetStockKingBackgroundStatus():Promise<Record<string, any>>;
 
+export function GetStockKingDelayedReviews(arg1:string,arg2:string,arg3:string):Promise<Record<string, any>>;
+
+export function GetStockKingLearningState():Promise<Record<string, any>>;
+
 export function GetStockKingPreference(arg1:string):Promise<string>;
+
+export function GetStockKingRecommendationHistory(arg1:string,arg2:string,arg3:string):Promise<Record<string, any>>;
 
 export function GetStockKingResearchEvidence(arg1:string):Promise<Record<string, any>>;
 
@@ -470,8 +478,6 @@ export function RemoveStockGroup(arg1:string,arg2:string,arg3:number):Promise<st
 
 export function ResumeQuantTask(arg1:string):Promise<Record<string, any>>;
 
-export function ReviewStockKingPicks(arg1:string,arg2:number,arg3:Record<string, any>):Promise<Record<string, any>>;
-
 export function RunExecutableBacktest(arg1:Record<string, any>):Promise<Record<string, any>>;
 
 export function RunStockKingAIResearch(arg1:main.StockKingAIResearchRequest):Promise<Record<string, any>>;
@@ -528,9 +534,9 @@ export function SetCostPriceAndVolume(arg1:string,arg2:number,arg3:number):Promi
 
 export function SetStockAICron(arg1:string,arg2:string):Promise<void>;
 
-export function SetStockKingBackgroundLearning(arg1:boolean):Promise<void>;
+export function SetStockKingAutoRecommendations(arg1:boolean):Promise<void>;
 
-export function SetStockKingPicksAIConfig(arg1:number):Promise<void>;
+export function SetStockKingBackgroundLearning(arg1:boolean):Promise<void>;
 
 export function SetStockSort(arg1:number,arg2:string):Promise<void>;
 

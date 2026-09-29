@@ -32,16 +32,18 @@ type EngineStatus struct {
 }
 
 type SidecarManager struct {
-	mu       sync.RWMutex
-	paths    AppPaths
-	status   EngineStatus
-	token    string
-	port     int
-	cmd      *exec.Cmd
-	cancel   context.CancelFunc
-	done     chan struct{}
-	client   *http.Client
-	stopping bool
+	mu          sync.RWMutex
+	paths       AppPaths
+	status      EngineStatus
+	token       string
+	port        int
+	cmd         *exec.Cmd
+	cancel      context.CancelFunc
+	done        chan struct{}
+	client      *http.Client
+	stopping    bool
+	marketURL   string
+	marketToken string
 }
 
 func NewSidecarManager(paths AppPaths) *SidecarManager {
@@ -106,6 +108,12 @@ func (m *SidecarManager) Status() EngineStatus {
 }
 
 func (m *SidecarManager) supervise(ctx context.Context) {
+	marketURL, marketToken, err := startMarketGateway(ctx)
+	if err != nil {
+		m.setStatus(EngineStatus{State: "unavailable", Message: "行情接口启动失败: " + err.Error()})
+		return
+	}
+	m.marketURL, m.marketToken = marketURL, marketToken
 	restarts := 0
 	for {
 		if ctx.Err() != nil {
@@ -214,6 +222,8 @@ func (m *SidecarManager) launch(ctx context.Context, restarts int) (*exec.Cmd, e
 		}
 	}
 	cmd.Env = append(os.Environ(),
+		"STOCK_KING_MARKET_URL="+m.marketURL,
+		"STOCK_KING_MARKET_TOKEN="+m.marketToken,
 		"STOCK_KING_SIDECAR_TOKEN="+token,
 		"DATABASE_PATH="+filepath.Join(dailyData, "stock-analysis.db"),
 		"LOG_DIR="+dailyLogs,

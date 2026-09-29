@@ -15,7 +15,7 @@ if sys.platform != "darwin":
 label = "com.stockking.research"
 domain = f"gui/{os.getuid()}"
 agents = Path.home() / "Library/LaunchAgents"
-slots = ("0920", "1030", "1455", "review", "weekly")
+slots = ("0920", "0940", "0955", "1030", "1455", "review", "weekly")
 if args.remove:
     for suffix in ("",) + tuple(f".{slot}" for slot in slots):
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}{suffix}"], check=False)
@@ -38,4 +38,4 @@ for slot in slots:
     subprocess.run(["launchctl", "bootout", f"{domain}/{task}"], check=False)
     plist.write_bytes(plistlib.dumps(payload))
     subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True)
-print("Installed: 09:20, 10:30, 14:55 picks; 15:30 review; Friday 15:45 learning (Shanghai time).")
+print("Installed: 09:20 watchlist; 09:40, 09:55, 10:30, 14:55 picks; 15:30 review; Friday 15:45 learning (Shanghai time).")

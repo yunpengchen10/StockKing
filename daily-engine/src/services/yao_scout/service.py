@@ -388,6 +388,10 @@ class YaoScoutService:
         }
 
     def _fetch_snapshot(self) -> pd.DataFrame:
+        from src.services.software_market import SoftwareMarketClient
+        software = SoftwareMarketClient.from_environment()
+        if software.available and self.snapshot_fetcher is fetch_snapshot_with_fallback:
+            return software.snapshot()
         return self.snapshot_fetcher(
             list(self.screening.snapshot_source_priority),
             required_columns=["code", "name", "price", "amount", "change_pct"],

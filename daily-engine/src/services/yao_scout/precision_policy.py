@@ -52,6 +52,35 @@ def evaluate(candidate, context, daily=None):
     unlock = sum(number(r.get("floatRatioPct")) or 0 for r in context.get("unlocks", []))
     event_covered = all(context.get("coverage", {}).get(k) for k in ("forecast", "unlock"))
     premarket = candidate.get("status") == "premarket" or "盘前" in str(candidate.get("strategyBranch", ""))
+    if candidate.get('scoreVersion') == 'stockking-v1.1-rules':
+        # V1.1 treats independently missing research factors as uncertainty.
+        # The quote/identity, normal-trade and completed-minute structure gates
+        # are already captured by evidenceEligible and candidate.status.
+        ready = bool(candidate.get('evidenceEligible') and candidate.get('finalScore') is not None
+                     and candidate.get('status') == 'conditional' and not premarket)
+        limitations = []
+        if bias is None or extension is None:
+            limitations.append('日线乖离或ATR缺失，未参与排序')
+        if rr is None:
+            limitations.append('历史压力空间未量化，剩余收益预测暂不发布')
+        if not event_covered:
+            limitations.append('事件接口覆盖不足，催化因子为空')
+        if not (candidate.get('evidenceChecks') or {}).get('sector_resonance'):
+            limitations.append('行业共振未确认')
+        if not (candidate.get('evidenceChecks') or {}).get('fund_direction'):
+            limitations.append('主动资金方向未确认')
+        reason = ('满足有效报价、正常交易和完整分钟结构；历史样本不足已降低置信，实际成交仍待验证'
+                  if ready else '报价、正常交易或完整分钟结构不足')
+        policies = {key:{'label':rule.label,'state':'conditional' if ready else 'watch',
+                         'entryEligible':ready,'reasons':[reason],
+                         'uncertainties':limitations,'thresholds':asdict(rule)}
+                    for key,rule in POLICIES.items()}
+        return {'version':'king-precision-v1.1','validationStatus':'uncalibrated_rules',
+                'probability':None,'metrics':{'biasMa5Pct':bias,'atrExtension':extension,
+                    'trendConfirmed':trend,'rewardRisk':rr,
+                    'unlock14dPct':unlock if context.get('coverage',{}).get('unlock') else None},
+                'profiles':policies,'sourceContext':context,
+                'meaning':'缺失研究因子降低置信度；正式候选依赖有效报价、正常交易与可计算分钟结构'}
     policies = {}
     for key, rule in POLICIES.items():
         blocked, waiting = [], []

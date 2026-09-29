@@ -63,7 +63,6 @@ class StockKingService:
         top_n: int = 5,
         official: bool | None = None,
         allow_missed: bool = False,
-        ai_config: dict | None = None,
     ) -> Dict[str, Any]:
         """Return Schema 4 with a fresh adaptive scan and v2.2 classic fields.
 
@@ -78,7 +77,7 @@ class StockKingService:
             from src.services.yao_scout.local_opportunities import LocalOpportunityService
 
             yao = YaoScoutService(config=self.config, db_manager=self.db_manager)
-            adaptive = LocalOpportunityService(yao, ai_config).run(
+            adaptive = LocalOpportunityService(yao).run(
                 scan_slot,
                 top_n=top_n,
                 official=official,

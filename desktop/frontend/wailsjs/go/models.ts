@@ -1065,6 +1065,10 @@ export namespace data {
 	export class KLineSourceResult {
 	    data?: KLineData[];
 	    source: string;
+	    fetched_at?: string;
+	    volume_unit?: string;
+	    amount_unit?: string;
+	    adjustment?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new KLineSourceResult(source);
@@ -1074,6 +1078,10 @@ export namespace data {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.data = this.convertValues(source["data"], KLineData);
 	        this.source = source["source"];
+	        this.fetched_at = source["fetched_at"];
+	        this.volume_unit = source["volume_unit"];
+	        this.amount_unit = source["amount_unit"];
+	        this.adjustment = source["adjustment"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

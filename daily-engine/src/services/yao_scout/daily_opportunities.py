@@ -194,6 +194,8 @@ class DailyOpportunityService:
         now = self.clock()
         run['delivery']['quote_refresh_started_at'] = now.isoformat()
         run['delivery']['late_seconds'] = max(0, (now - datetime.fromisoformat(target_at)).total_seconds()) if target_at else None
+        if target_at and run.get('official') and (now-datetime.fromisoformat(target_at)).total_seconds() >= 120:
+            raise ValueError('错过计划时点，不使用后续行情补造历史推荐')
         if run['scanSlot'] == '1455' and now.time() >= time(14, 57):
             raise ValueError('14:57后停止本轮刷新；不补发尾盘候选')
         if run['scanSlot'] == '0920' and now.time() >= time(9, 25):
@@ -238,7 +240,7 @@ class DailyOpportunityService:
                 continue
             state, gaps = validate_candidate(candidate, candidate['quote'], now, run['scanSlot'])
             candidate.update(status=state, stateLabel={'conditional':'条件观察','premarket':'盘前观察','expired':'已过期','windvane':'不可买风向标','data_insufficient':'数据不足'}[state])
-            candidate['data_quality'] = {'gaps': list(dict.fromkeys(gaps + candidate.get('evidenceGaps', [])
+            candidate['data_quality'] = {**candidate.get('data_quality', {}), 'gaps': list(dict.fromkeys(gaps + candidate.get('evidenceGaps', [])
                 + candidate.get('precisionDecision', {}).get('sourceContext', {}).get('gaps', [])))}
             candidate['risks'] = list(dict.fromkeys([*candidate.get('risks', []), *gaps]))
             if not candidate.get('evidenceEligible', True) and state not in {'expired', 'windvane'}:
@@ -275,6 +277,9 @@ class DailyOpportunityService:
         target_at = run['delivery'].get('target_at')
         if target_at:
             run['delivery']['late_seconds'] = max(0, (now - datetime.fromisoformat(target_at)).total_seconds())
+            if run.get('official') and run['delivery']['late_seconds'] >= 120:
+                run.update(status='missed_slot', candidates=[], message='行情核验完成时已错过发布窗口，本轮仅保存遗漏记录')
+                run['profileCandidates'] = {key: [] for key in run.get('profileCandidates', {})}
         if records and all(p.get('status') == 'expired' for p in records):
             run.update(status='expired', message='生成结果时已超过有效时段，仅保留历史观察')
 
@@ -291,15 +296,24 @@ class DailyOpportunityService:
         code = row['code']
         result = {'snapshot': row, 'history': [], 'history_status': 'unavailable'}
         try:
-            frame = self.yao.history_fetcher(code, lookback_days=100, source='auto', retries=1,
-                cache_dir=self.yao.data_dir / 'daily_history', cache_ttl_seconds=3600)
+            from src.services.software_market import SoftwareMarketClient
+            software = SoftwareMarketClient.from_environment()
+            if software.available:
+                packet = software.bars(code, period='101', count=100)
+                frame = pd.DataFrame([{**bar, 'date': bar['end'][:10], 'volume':bar.get('volume_shares'),
+                    'amount':bar.get('amount_cny')} for bar in packet.get('bars', [])])
+                result['history_source'] = packet.get('source')
+                result['history_adjustment'] = packet.get('adjustment')
+            else:
+                frame = self.yao.history_fetcher(code, lookback_days=100, source='auto', retries=1,
+                    cache_dir=self.yao.data_dir / 'daily_history', cache_ttl_seconds=3600)
             if 'date' in frame:
                 # Prior completed sessions only. No current full-day bar in a
                 # premarket packet, and no label masquerading as live evidence.
                 frame = frame[pd.to_datetime(frame.date).dt.date < cutoff.date()].tail(60)
                 cols = [c for c in ('date', 'open', 'high', 'low', 'close', 'volume', 'amount') if c in frame]
                 result['history'] = clean(frame[cols].to_dict('records'))
-                result['history_status'] = f'{len(frame)} sessions; adjustment basis must be checked separately'
+                result['history_status'] = f"{len(frame)} sessions; adjustment={result.get('history_adjustment', 'provider_unspecified')}"
         except Exception:
             pass
         try:
@@ -309,6 +323,10 @@ class DailyOpportunityService:
         return code, result
 
     def run(self, scan_slot='live', *, top_n=5, official=None, **_):
+        from .scan_claim import run_once
+        return run_once(self, scan_slot, dict(top_n=top_n, official=official, **_))
+
+    def _run(self, scan_slot='live', *, top_n=5, official=None, **_):
         slot = '0920' if scan_slot in ('0922', '0920') else scan_slot
         now = self.clock()
         history, coverage = self._history()
@@ -324,11 +342,17 @@ class DailyOpportunityService:
         quality = {'critical_complete': False, 'source_time': None, 'source_time_meaning': '未知，提取时间不代替源时间',
             'quoteMaxAgeSeconds': 30, 'freshnessSettingStatus': 'engineering_default_not_latency_guarantee'}
         run['dataQuality'] = run['data_quality'] = quality
-        target = {'0920': (9, 20), '1030': (10, 30), '1455': (14, 55)}.get(slot)
+        target = {'0920': (9, 20), '0940': (9, 40), '0955': (9, 55), '1030': (10, 30), '1455': (14, 55)}.get(slot)
         run['delivery']['target_at'] = now.replace(hour=target[0], minute=target[1], second=0, microsecond=0).isoformat() if target else None
         try:
             if not is_market_open('cn', now.date()):
                 run['status'] = 'skipped_non_trading_day'
+            elif run['official'] and slot in ('0940','0955','1030') and target and (now-datetime.fromisoformat(run['delivery']['target_at'])).total_seconds() >= 120:
+                run.update(status='missed_slot', message='错过计划时点，已记录遗漏；不使用后来的行情补造推荐')
+            elif slot == 'weekly' and (now.weekday() != 4 or now.time() < time(15,45)):
+                run.update(status='not_due', message='周五15:45收盘后才运行学习')
+            elif slot == 'review' and now.time() < time(15,30):
+                run.update(status='not_due', message='15:30后才运行归档复盘')
             elif slot in ('review', 'weekly'):
                 # Old MFE labels cannot enter the new executable-success pool.
                 audit = {'version': VERSION, 'reviewedAt': now.isoformat(), 'runCount': len(history),
@@ -353,8 +377,11 @@ class DailyOpportunityService:
         new = {p['code'] for p in run['candidates']}
         run['changes'] = {'added': sorted(new-old), 'removed': sorted(old-new), 'changed': new != old,
             'items': [{'code': c, 'action': '撤销 / 本轮未入选'} for c in sorted(old-new)]}
-        self.db.save_yao_run(clean(run))
-        return clean(run)
+        return self._persist_run(clean(run))
+
+    def _persist_run(self, run):
+        self.db.save_yao_run(run)
+        return run
 
     def _scan(self, run, quality, history, dlm, previous, now, slot, top_n):
         ai = self.ai or HighClient(self.ai_config)

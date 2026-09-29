@@ -12,7 +12,7 @@ Prefer the free local workflow: leave AI disabled, use Ollama as described below
 2. Enter a configuration name, Base URL, API key and model name. The configuration name is a local label; the model name must be the exact API Model ID.
 3. Click **测试并刷新模型列表** (Test and refresh models), then select a model your account can access. If the provider does not expose a model list, enter the exact ID manually. A failed list request alone does not establish that generation is unavailable.
 4. Click **确定** (Confirm) in the drawer, then **保存配置** (Save configuration) on the list page. Confirming the drawer alone does not persist the configuration.
-5. Return to **AI 研究**, select the platform, model and symbol, and run one manual research request to verify generation. You can also manually request **AI 复审** for eligible candidates in **精选 → 当日机会**.
+5. Return to **AI 研究**, select the platform, model and symbol, and run one manual research request to verify generation. Evidence from local picks may be used as context; launch any model interpretation separately in **AI 研究**.
 
 The legacy entry point is **设置 → AI设置 → AI诊股 → 前往管理**. Its switch does not replace platform configuration or mean that scheduled picks automatically call a model.
 
@@ -52,7 +52,7 @@ Install and start Ollama, download a model suited to your machine's memory, and 
 
 **AI 研究 — AI research:** Select a symbol and template, review retrieved evidence timestamps and gaps, then choose a platform/model and run. When saving or comparing reports, inspect analysis time, expiration, provenance and verification flags. Model-generated text cannot turn missing quotes into verified facts.
 
-**精选 → 当日机会 — Daily opportunities:** Run the local scan and inspect conservative/balanced/aggressive conditions first, then manually request AI review. AI summarizes candidate evidence, risks and disagreements without changing local ranking or bypassing entry checks. Do not fill an empty eligible list merely to make an AI call.
+**精选 → 当日机会 — Daily opportunities:** The local scan shows conservative/balanced/aggressive conditions and candidate evidence. To have a model summarize evidence, risks or disagreements, select the symbol and run a separate request in **AI 研究**. Research output does not change local ranking or bypass entry checks.
 
 **External reports:** AI research can export a research package and manually import an external AI report in Markdown, TXT or JSON. Enter source and time information as requested, then inspect parsing and verification flags. This route does not require saving a remote model key in the application. You still decide what to share when submitting an exported package to another service.
 
