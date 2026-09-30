@@ -1,4 +1,4 @@
-# Stock King
+# Stock King · 本地股票研究工作台
 
 <img src="branding/stock-king-logo.png" alt="Stock King" width="140" />
 
@@ -6,23 +6,43 @@
 
 面向股票量化与 A 股量化研究的本地桌面软件：行情、K 线、自选、定时精选、账户回测、复盘和手动 AI 研究。支持 Windows x64 与 Apple Silicon（M 系列，macOS 15+）。
 
+## 看看软件怎么用
+
+![Stock King 操作演示：自选、K 线图表、精选与复盘](docs/media/stockking-workspace-tour.gif)
+
+**当前 Vue 前端的实际界面，使用隔离的演示数据。** 动图展示软件操作，不代表实时行情、真实推荐或实际收益。[查看大图](docs/media/stockking-workspace-tour.gif) · [静态预览](docs/media/stockking-workspace-tour.png) · [演示数据与复现方法](docs/WORKSPACE_TOUR.md)
+
+[快速开始](#快速开始) · [Windows 安装](docs/WINDOWS_INSTALL.md) · [本地构建](docs/LOCAL_BUILD.md) · [AI 配置](docs/AI_CONFIGURATION.md) · [MCP 行情服务](quote-service/README.md)
+
+## 主要功能
+
 - 图表与精选共用软件的通达信、东方财富、新浪、腾讯行情服务及缓存，保留来源时间与获取时间；关闭图表后仍可运行扫描。
 - 09:20 盘前观察；09:40、09:55、10:30、14:55 独立扫描；15:30 归档与到期复盘；周五 15:45 学习，均按北京时间并检查交易日。
-- 精选采用 StockKing V1.1 本地算法，每轮最多深度核验30只、入选5只，不凑数；推荐、复盘和学习全程不调用大模型，AI 研究保留为独立页面。
+- 精选采用 StockKing V1.1 本地算法，深研队列按主板池的 10% 向上取整、至少 300 只且不超过实际股票数安排，每轮最多入选 5 只、不凑数；显示实际覆盖和缺口，推荐、复盘和学习全程不调用大模型。
 - 数据、模型和设置保存在本机。软件不自动下单。
 - 核心流程无需付费 API、云服务器或 GitHub Actions；构建和校验在自己的电脑完成。AI 可使用本地 Ollama，也可手动导入报告。
 
 需要让 AI 工具复用同一套行情，可使用 [只读 MCP 行情服务](quote-service/README.md)。支持 Windows、macOS 的 Python 运行方式；ChatGPT 云端仍需完成远程连接授权和实测。
 
-## 实际行情演示
+## 本次代码更新
+
+- **刷新看得见进度：** 本地精选使用后台任务，展示扫描阶段；切换页面或行情请求失败时保留上次有效结果。
+- **推荐记录更完整：** 修复大响应截断，单独读取最新报价，同时保留推荐时的原始价格与时间。
+- **研究覆盖更清楚：** 扩大深研队列，记录各阶段耗时、请求预算与数据缺口；必要证据不足时保留说明。
+- **训练与精选口径一致：** 记录算法契约，让准入、排序与验证使用同一套规则；独立日线模型单独展示。
+
+<details>
+<summary>另看：带日期与来源的真实行情研究回放</summary>
 
 ![StockKing V1.1 真实行情研究回放](docs/media/stockking-v11-real-market.gif)
 
-**真实行情研究回放，非桌面录屏。** 示例使用已记录的实际行情展示研究流程，保留日期与来源；演示股票不代表当时扫描入选、用户真实成交或未来收益。查看[示例口径与复现说明](docs/research/stockking-v11-market-sample.md)和[原始行情样本](docs/research/stockking-v11-market-sample.json)。
+这是已记录行情的研究回放，非桌面录屏。演示股票不代表当时扫描入选、用户真实成交或未来收益。查看[示例口径与复现说明](docs/research/stockking-v11-market-sample.md)和[原始行情样本](docs/research/stockking-v11-market-sample.json)。
+
+</details>
 
 ## 快速开始
 
-Windows v2.6.1 提供 `Stock-King-Setup-x64-v2.6.1.exe` 一键安装包，包含本地引擎和离线 WebView2，无需安装 Python、Go 或 Node.js；修复了更新后隐藏窗口及重复打开不恢复的问题。参见[安装与启动修复说明](docs/WINDOWS_INSTALL.md)。以下 wheel 为可选安装方式。
+Windows v2.6.2 提供 `Stock-King-Setup-x64-v2.6.2.exe` 一键安装包，包含本地引擎和离线 WebView2，无需安装 Python、Go 或 Node.js；修复了推荐记录响应超过 16 MiB 时被截断、无法显示的问题，并包含 v2.6.1 的窗口启动修复。参见[安装与修复说明](docs/WINDOWS_INSTALL.md)。以下 wheel 为可选安装方式。
 
 1. 已有安装包时，Mac 用户直接解压 `Stock-King-macos-arm64.zip`，将 `Stock King.app` 放入“应用程序”并打开；看到界面左下角“已连接”即表示本地引擎已启动。此方式无需安装 Python、Go 或 Node.js。Windows 也可选择平台原生 wheel。也可从本公开仓库获取源码，按 [本地构建与分发](docs/LOCAL_BUILD.md) 在自己的电脑构建，无需 Actions、付费构建平台或云服务器。
 2. 使用原生 wheel 时，安装对应平台的 64 位 Python 3.11+（推荐 3.12），在 wheel 所在目录运行（版本号变化时使用实际文件名）：
@@ -101,7 +121,7 @@ stock-king doctor
 
 ## 推荐算法
 
-精选采用 **StockKing V1.1**：每轮重新读取沪深主板非 ST 快照，安排最多 30 只进行分钟深度核验，最多入选 5 只。每轮重新选队列，允许新启动股票进入，并保存实际扫描范围；未深度核验不等于已经排除。
+精选采用 **StockKing V1.1**：每轮重新读取沪深主板非 ST 快照，按 `min(实际股票数, max(300, ceil(实际股票数 × 10%)))` 安排深研队列，最多入选 5 只。队列规模不等于完成核验数量：软件记录实际覆盖、超时和缺口。每轮重新选队列，允许新启动股票进入；未深度核验不等于已经排除。
 
 冷启动版本为 `stockking-v1.1-rules`，保留 Early / MainRise 两个通道及原始人工权重，可用因子重新分配权重：
 
