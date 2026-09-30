@@ -6,6 +6,8 @@ Build Stock King on your own computer without GitHub Actions, cloud servers or p
 
 ## 1. Installation for users
 
+Windows users can run `Stock-King-Setup-x64-v2.6.1.exe` without Python, Go or Node.js. It includes the local engine and offline WebView2. See [Windows installation instructions](WINDOWS_INSTALL.en.md) for installation and installer packaging. Native wheels remain optional.
+
 Prefer a maintainer-supplied native wheel. It contains the desktop and frozen research engine, so users do not need Go, Node.js or Wails. Install 64-bit Python 3.11+ (3.12 recommended), then run from the package directory:
 
 ```text
@@ -15,11 +17,11 @@ stock-king
 
 On Apple Silicon, use `stock_king-2.6.0-py3-none-macosx_15_0_arm64.whl` with native ARM64 Python. Alternatively, extract `Stock-King-macos-arm64.zip`, move `Stock King.app` to `/Applications`, open it, and check that the interface says “已连接” (Connected). The `.app` route does not require Python on the user's Mac. Windows requires Microsoft WebView2 Runtime. Use the actual filename when the package version changes.
 
-The repository is currently in private testing, with no PyPI release or public download page. Reading source requires repository access; an existing package can be installed on your own computer. The display name is **Stock King** and the repository is **StockKing**. The `stock-king` command and `stock_king` Python module remain compatible.
+The source repository is public, with no PyPI release or public installer download page yet. An existing package can be installed on your own computer. The display name is **Stock King** and the repository is **StockKing**. The `stock-king` command and `stock_king` Python module remain compatible.
 
 ## 2. Research tools from source
 
-Install Git and Python 3.11+ (3.12 recommended), and obtain access to the current private repository. Configure Git access through normal GitHub authentication; never embed a token in the installation command.
+Install Git and Python 3.11+ (3.12 recommended), then clone the public repository. Never embed a token in the installation command.
 
 ```text
 python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing.git@main"
@@ -45,7 +47,7 @@ Output is `dist/desktop/*win_amd64.whl`, with SHA-256 printed in the terminal. R
 
 ## 4. Apple Silicon packaging
 
-Use an Apple Silicon Mac, macOS 15+ and native ARM64 tools, without Rosetta. Go must be 1.26; Go 1.27.1 failed while compiling this project's Wails 2.11 bindings. First install an official macOS universal2 Python 3.12 (or 3.11) from [python.org](https://www.python.org/downloads/macos/). If `brew` is missing, follow the [official Homebrew installer](https://brew.sh/). Check the command line tools with `xcode-select -p`; if missing, run `xcode-select --install` and wait for installation to finish. Then run the following commands from a Terminal session with access to the private repository:
+Use an Apple Silicon Mac, macOS 15+ and native ARM64 tools, without Rosetta. Go must be 1.26; Go 1.27.1 failed while compiling this project's Wails 2.11 bindings. First install an official macOS universal2 Python 3.12 (or 3.11) from [python.org](https://www.python.org/downloads/macos/). If `brew` is missing, follow the [official Homebrew installer](https://brew.sh/). Check the command line tools with `xcode-select -p`; if missing, run `xcode-select --install` and wait for installation to finish. Then run the following commands from a Terminal session:
 
 ```bash
 xcode-select -p
@@ -74,7 +76,7 @@ python3 scripts/install-macos-schedule.py
 # Remove later: python3 scripts/install-macos-schedule.py --remove
 ```
 
-The schedule installer is independent of the build and registers five user `launchd` jobs. Keep the Mac awake and the user logged in for the scheduled slots. On weekdays, preparation starts at 09:10, 10:20 and 14:45, with refreshes at 09:20, 10:30 and 14:55. Review runs at 15:30, and Friday learning at 15:45. All times are Asia/Shanghai; missed intraday slots are not backfilled.
+The schedule installer is independent of the build and registers seven user `launchd` jobs. Keep the Mac awake and the user logged in. Premarket observation runs at 09:20, independent scans at 09:40, 09:55, 10:30 and 14:55, review at 15:30, and Friday learning at 15:45. Scan tasks prepare in advance. All times are Asia/Shanghai; missed intraday slots are not backfilled.
 
 ## 5. Generic research-package checks
 
@@ -94,4 +96,4 @@ Prepare locally built packages for both platforms, SHA-256 hashes, bilingual qui
 
 Distribute only the application, dependencies and licenses, excluding personal databases, API keys, quote archives, trained weights and notification recipients. Retain GPL-3.0 and third-party notices. The default new-user flow is free quotes → watchlist → local picks → chart verification, with optional local Ollama or report imports and no paid API requirement.
 
-During private testing, only authorized users can access the source. Public promotion requires separately preparing publicly accessible source and release entry points.
+The source is public. Build artifacts still require separate distribution; publishing source does not itself publish platform installers.

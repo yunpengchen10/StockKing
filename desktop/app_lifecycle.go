@@ -5,12 +5,21 @@ import (
 	"fmt"
 	"github.com/duke-git/lancet/v2/convertor"
 	"github.com/duke-git/lancet/v2/strutil"
+	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"go-stock/backend/data"
 	"go-stock/backend/db"
 	"go-stock/backend/logger"
 	"time"
 )
+
+// A second shortcut launch restores the existing window, including a window
+// hidden by an older updater. Wails also focuses/restores minimized windows.
+func (a *App) onSecondInstanceLaunch(_ options.SecondInstanceData) {
+	if a.ctx != nil {
+		runtime.WindowShow(a.ctx)
+	}
+}
 
 // startup is called at application startup
 func (a *App) startup(ctx context.Context) {

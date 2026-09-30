@@ -22,7 +22,9 @@
 
 ## 快速开始
 
-1. 已有安装包时，Mac 用户直接解压 `Stock-King-macos-arm64.zip`，将 `Stock King.app` 放入“应用程序”并打开；看到界面左下角“已连接”即表示本地引擎已启动。此方式无需安装 Python、Go 或 Node.js。Windows 用户使用平台原生 wheel。也可从本公开仓库获取源码，按 [本地构建与分发](docs/LOCAL_BUILD.md) 在自己的电脑构建，无需 Actions、付费构建平台或云服务器。
+Windows v2.6.1 提供 `Stock-King-Setup-x64-v2.6.1.exe` 一键安装包，包含本地引擎和离线 WebView2，无需安装 Python、Go 或 Node.js；修复了更新后隐藏窗口及重复打开不恢复的问题。参见[安装与启动修复说明](docs/WINDOWS_INSTALL.md)。以下 wheel 为可选安装方式。
+
+1. 已有安装包时，Mac 用户直接解压 `Stock-King-macos-arm64.zip`，将 `Stock King.app` 放入“应用程序”并打开；看到界面左下角“已连接”即表示本地引擎已启动。此方式无需安装 Python、Go 或 Node.js。Windows 也可选择平台原生 wheel。也可从本公开仓库获取源码，按 [本地构建与分发](docs/LOCAL_BUILD.md) 在自己的电脑构建，无需 Actions、付费构建平台或云服务器。
 2. 使用原生 wheel 时，安装对应平台的 64 位 Python 3.11+（推荐 3.12），在 wheel 所在目录运行（版本号变化时使用实际文件名）：
 
    ```text
@@ -42,7 +44,7 @@ python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/S
 stock-king doctor
 ```
 
-源码安装提供研究 CLI，完整桌面请使用平台原生 wheel 或 macOS `.app` 安装包。项目显示名为 **Stock King**，GitHub 仓库名为 **StockKing**；兼容现有安装的命令仍为 `stock-king`。详情见 [本地构建与分发](docs/LOCAL_BUILD.md)。
+源码安装提供研究 CLI，完整桌面请使用 Windows 一键安装包、平台原生 wheel 或 macOS `.app` 安装包。项目显示名为 **Stock King**，GitHub 仓库名为 **StockKing**；兼容现有安装的命令仍为 `stock-king`。详情见 [本地构建与分发](docs/LOCAL_BUILD.md)。
 
 ## 页面与使用流程
 

@@ -1,9 +1,12 @@
 Unicode true
+SetCompressor /SOLID lzma
 
 !define INFO_PROJECTNAME "stock-king"
 !define INFO_COMPANYNAME "Stock King"
 !define INFO_PRODUCTNAME "Stock King"
-!define INFO_PRODUCTVERSION "2.5.0"
+!ifndef INFO_PRODUCTVERSION
+    !define INFO_PRODUCTVERSION "2.6.1"
+!endif
 !define PRODUCT_EXECUTABLE "Stock King.exe"
 !define REQUEST_EXECUTION_LEVEL "user"
 
@@ -13,6 +16,13 @@ Unicode true
 # path limit on Windows.
 !ifndef ARG_STOCKKING_SIDECAR_ROOT
     !define ARG_STOCKKING_SIDECAR_ROOT "..\..\..\..\daily-engine\dist\backend"
+!endif
+
+!ifndef ARG_STOCKKING_WEBVIEW2_INSTALLER
+    !define ARG_STOCKKING_WEBVIEW2_INSTALLER "tmp\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+!endif
+!ifndef ARG_STOCKKING_OUTPUT
+    !define ARG_STOCKKING_OUTPUT "..\..\bin\Stock-King-Setup-x64-v${INFO_PRODUCTVERSION}.exe"
 !endif
 
 ####
@@ -69,6 +79,8 @@ ManifestDPIAware true
 !define MUI_UNICON "..\icon.ico"
 !define MUI_FINISHPAGE_NOAUTOCLOSE # Wait on the INSTFILES page so the user can take a look into the details of the installation steps
 !define MUI_ABORTWARNING # This will warn the user if they exit from the installer.
+!define MUI_FINISHPAGE_RUN "$INSTDIR\${PRODUCT_EXECUTABLE}"
+!define MUI_FINISHPAGE_RUN_TEXT "Open Stock King"
 
 !insertmacro MUI_PAGE_WELCOME # Welcome to the installer page.
 !insertmacro MUI_PAGE_LICENSE "..\..\..\LICENSE"
@@ -79,18 +91,29 @@ ManifestDPIAware true
 !insertmacro MUI_UNPAGE_INSTFILES # Uinstalling page
 
 !insertmacro MUI_LANGUAGE "English" # Set the Language of the installer
+!insertmacro MUI_LANGUAGE "SimpChinese"
 
 ## The following two statements can be used to sign the installer and the uninstaller. The path to the binaries are provided in %1
 #!uninstfinalize 'signtool --file "%1"'
 #!finalize 'signtool --file "%1"'
 
 Name "${INFO_PRODUCTNAME}"
-OutFile "..\..\bin\Stock-King-Setup-x64-v2.5.0.exe"
+OutFile "${ARG_STOCKKING_OUTPUT}"
 InstallDir "$LOCALAPPDATA\Programs\${INFO_PRODUCTNAME}"
+InstallDirRegKey HKCU "${UNINST_KEY}" "InstallLocation"
 ShowInstDetails show # This will always show the installation details.
+
+Var ExtractOnly
 
 Function .onInit
    !insertmacro wails.checkArchitecture
+   StrCpy $ExtractOnly "0"
+   ${GetParameters} $R0
+   ClearErrors
+   ${GetOptions} $R0 "/EXTRACTONLY" $R1
+   ${IfNot} ${Errors}
+       StrCpy $ExtractOnly "1"
+   ${EndIf}
 FunctionEnd
 
 !macro stockking.webview2runtime
@@ -104,7 +127,7 @@ FunctionEnd
         InitPluginsDir
         CreateDirectory "$pluginsdir\stockking-webview2"
         SetOutPath "$pluginsdir\stockking-webview2"
-        File "tmp\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+        File "${ARG_STOCKKING_WEBVIEW2_INSTALLER}"
         ExecWait '"$pluginsdir\stockking-webview2\MicrosoftEdgeWebView2RuntimeInstallerX64.exe" /silent /install' $0
         ${If} $0 != 0
             Abort "Microsoft WebView2 Runtime installation failed with exit code $0"
@@ -115,7 +138,9 @@ FunctionEnd
 Section
     !insertmacro wails.setShellContext
 
-    !insertmacro stockking.webview2runtime
+    ${If} $ExtractOnly != "1"
+        !insertmacro stockking.webview2runtime
+    ${EndIf}
 
     SetOutPath $INSTDIR
 
@@ -130,17 +155,23 @@ Section
     File "/oname=MASTER-MIT.txt" "..\..\..\..\licenses\MASTER-MIT.txt"
     File "/oname=THIRD-PARTY-NOTICES.md" "..\..\..\..\THIRD_PARTY_NOTICES.md"
     File "/oname=THIRD-PARTY-NOTICES.zh-CN.md" "..\..\..\..\THIRD_PARTY_NOTICES.zh-CN.md"
-    File "/oname=CHANGELOG-v2.5.0.md" "..\..\..\..\CHANGELOG-v2.5.0.md"
-    File "/oname=VALIDATION-v2.5.0.md" "..\..\..\..\VALIDATION-v2.5.0.md"
 
     SetOutPath "$INSTDIR\resources"
     File "/oname=register-stock-king-tasks.ps1" "..\..\..\..\scripts\register-stock-king-tasks.ps1"
 
     SetOutPath "$INSTDIR\docs"
     File "/oname=README.md" "..\..\..\..\README.md"
-    File "/oname=README.zh-CN.md" "..\..\..\..\README.zh-CN.md"
+    File "/oname=README.en.md" "..\..\..\..\README.en.md"
+    File "/oname=WINDOWS_INSTALL.md" "..\..\..\..\docs\WINDOWS_INSTALL.md"
+    File "/oname=WINDOWS_INSTALL.en.md" "..\..\..\..\docs\WINDOWS_INSTALL.en.md"
 
     SetOutPath $INSTDIR
+
+    # Extraction is used to verify the payload without changing the user's
+    # shortcuts, tasks, uninstall registry, WebView2, or application data.
+    ${If} $ExtractOnly == "1"
+        Goto installed
+    ${EndIf}
 
     ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\register-stock-king-tasks.ps1" -InstallDir "$INSTDIR"' $0
     ${If} $0 != 0
@@ -153,7 +184,16 @@ Section
     !insertmacro wails.associateFiles
     !insertmacro wails.associateCustomProtocols
 
-    !insertmacro wails.writeUninstaller
+    # RequestExecutionLevel is user: register in HKCU, never rely on HKLM.
+    WriteUninstaller "$INSTDIR\uninstall.exe"
+    WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "${INFO_COMPANYNAME}"
+    WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "${INFO_PRODUCTNAME}"
+    WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${INFO_PRODUCTVERSION}"
+    WriteRegStr HKCU "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
+    WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXECUTABLE}"
+    WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '$\"$INSTDIR\uninstall.exe$\"'
+    WriteRegStr HKCU "${UNINST_KEY}" "QuietUninstallString" '$\"$INSTDIR\uninstall.exe$\" /S'
+    installed:
 SectionEnd
 
 Section "uninstall"
@@ -167,7 +207,8 @@ Section "uninstall"
     !insertmacro wails.unassociateFiles
     !insertmacro wails.unassociateCustomProtocols
 
-    !insertmacro wails.deleteUninstaller
+    Delete "$INSTDIR\uninstall.exe"
+    DeleteRegKey HKCU "${UNINST_KEY}"
 
     # User databases, settings, models and logs are deliberately stored under
     # %APPDATA%\Stock King and %LOCALAPPDATA%\Stock King and are not removed.
