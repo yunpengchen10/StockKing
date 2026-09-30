@@ -48,5 +48,18 @@
     958
   ],
   "loop": 0,
-  "gifBytes": 566842
+  "gifBytes": 566330,
+  "publicMediaIntegrity": {
+    "stockking-workspace-tour.gif": {
+      "bytes": 566330,
+      "sha256": "85916cda3ad187ca35555e271b0e5ff4f8be2f9c25fb796e38e5f5540aa68cc8",
+      "gitBlob": "1ca08eb70729a102fd7b157b9e44f16f0293453f"
+    },
+    "stockking-workspace-tour.png": {
+      "bytes": 130561,
+      "sha256": "ee2ae7e064b0d692808607290032a923e2b9c5e23722f5393451c0c357138afb",
+      "gitBlob": "276e163e3644a788969831d102703f521f37c3dc"
+    }
+  },
+  "publicMediaVerification": "Decoded original image bytes; Node raw read and Git blob bytes match. No encrypted file wrapper."
 }

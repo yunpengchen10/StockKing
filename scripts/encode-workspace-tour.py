@@ -1,12 +1,14 @@
 """Compose captions around unmodified browser screenshots and encode a GIF."""
+import base64
+import hashlib
 import json
 import os
 import sys
+from io import BytesIO
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
-source, destination = map(Path, sys.argv[1:3])
-destination.mkdir(parents=True, exist_ok=True)
+source = Path(sys.argv[1])
 manifest = json.loads((source / 'frames.json').read_text(encoding='utf-8'))
 font_candidates = [os.getenv('TOUR_FONT', ''), 'C:/Windows/Fonts/msyh.ttc',
                    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc']
@@ -69,14 +71,27 @@ for index, frame in enumerate(frames):
     atlas.paste(frame.resize((640, 479)), ((index % 4) * 640, (index // 4) * 479))
 palette = atlas.quantize(colors=192)
 encoded = [frame.quantize(palette=palette, dither=Image.Dither.NONE) for frame in frames]
-gif_path = destination / 'stockking-workspace-tour.gif'
-encoded[0].save(gif_path, save_all=True, append_images=encoded[1:], duration=durations, loop=0, optimize=True, disposal=1)
+gif_buffer = BytesIO()
+encoded[0].save(gif_buffer, format='GIF', save_all=True, append_images=encoded[1:], duration=durations, loop=0, optimize=True, disposal=1)
 poster = compose(manifest['frames'][0], poster=True)
-poster.save(destination / 'stockking-workspace-tour.png', optimize=True)
+poster_buffer = BytesIO()
+poster.save(poster_buffer, format='PNG', optimize=True)
+
+def payload(name, target, data):
+    return {'name': name, 'target': target, 'bytes': len(data),
+            'sha256': hashlib.sha256(data).hexdigest(),
+            'base64': base64.b64encode(data).decode('ascii')}
+
+# Transfer bytes through stdout. Some Windows file filters transform Python's
+# binary file writes, leaving files that Python can read but Git cannot decode.
+files = [payload('stockking-workspace-tour.gif', 'media', gif_buffer.getvalue()),
+         payload('stockking-workspace-tour.png', 'media', poster_buffer.getvalue())]
 for index in (0, 6, 8, 10, 12, 16, 18):
     frame = manifest['frames'][index]
-    compose(frame).save(source / f"review-{frame['file']}")
-with Image.open(gif_path) as check:
+    review_buffer = BytesIO()
+    compose(frame).save(review_buffer, format='PNG')
+    files.append(payload(f"review-{frame['file']}", 'review', review_buffer.getvalue()))
+with Image.open(BytesIO(gif_buffer.getvalue())) as check:
     assert check.info.get('loop') == 0
     total = 0
     for index in range(check.n_frames):
@@ -85,5 +100,5 @@ with Image.open(gif_path) as check:
         total += check.info.get('duration', 0)
     assert check.size == (width, height)
     assert total == sum(durations)
-    assert check.n_frames > 1
-    print(json.dumps({'size': check.size, 'frames': check.n_frames, 'durationMs': total, 'bytes': gif_path.stat().st_size}))
+    assert check.n_frames == len(encoded) and check.n_frames > 1
+    print(json.dumps({'size': check.size, 'frames': check.n_frames, 'durationMs': total, 'files': files}))
