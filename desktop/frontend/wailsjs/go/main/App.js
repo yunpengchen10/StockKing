@@ -518,6 +518,18 @@ export function GetKingPicksHistory(arg1) {
   return window['go']['main']['App']['GetKingPicksHistory'](arg1);
 }
 
+export function StartKingPicksRefresh(arg1) {
+  return window['go']['main']['App']['StartKingPicksRefresh'](arg1);
+}
+
+export function GetKingPicksRefreshTask(arg1) {
+  return window['go']['main']['App']['GetKingPicksRefreshTask'](arg1);
+}
+
+export function GetDisplayedKingPicks() {
+  return window['go']['main']['App']['GetDisplayedKingPicks']();
+}
+
 export function GetLatestKingPicks(arg1) {
   return window['go']['main']['App']['GetLatestKingPicks'](arg1);
 }
@@ -680,6 +692,10 @@ export function GetStockKingPreference(arg1) {
 
 export function GetStockKingRecommendationHistory(arg1, arg2, arg3) {
   return window['go']['main']['App']['GetStockKingRecommendationHistory'](arg1, arg2, arg3);
+}
+
+export function GetStockKingRecordQuotes(arg1) {
+  return window['go']['main']['App']['GetStockKingRecordQuotes'](arg1);
 }
 
 export function GetStockKingResearchEvidence(arg1) {

@@ -6,23 +6,26 @@ Fund flows are vendor estimates, not verified institutional account movements.
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
 import re
 from statistics import mean
+from threading import Lock
+from time import monotonic
 from uuid import uuid4
 
 import requests
 from src.patches.eastmoney_patch import original_request
 
 from .intraday_evidence import _datetime, SHANGHAI
-from .minute_history import fetch_recent_bars, normalize_bars, window, number
+from .minute_history import fetch_recent_bars, normalize_bars, window, number, bounded_fetch_map
 
 BASE = 'https://push2.eastmoney.com/api/qt/'
 HEADERS = {'User-Agent':'Mozilla/5.0','Referer':'https://quote.eastmoney.com/'}
+_recent_sector_bars = {}
+_recent_sector_lock = Lock()
 
 
 def public_get(url, **kwargs):
@@ -88,7 +91,7 @@ def cached_metadata(directory, key, cutoff, fetch):
     return value
 
 
-def discover_sectors(codes, cutoff, cache_dir, *, getter=None):
+def discover_sectors(codes, cutoff, cache_dir, *, getter=None, deadline=None):
     directory = Path(cache_dir)/'sector-membership'
     industries = cached_metadata(directory,'industry-list',cutoff,lambda:all_members('m:90+t:2',getter))
     industry_map = {row['code']:row['name'] for row in industries}
@@ -105,8 +108,10 @@ def discover_sectors(codes, cutoff, cache_dir, *, getter=None):
             return code, cached_metadata(directory,'stock-'+code,cutoff,fetch)
         except Exception:
             return code, {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        membership = dict(pool.map(lookup,codes))
+    if deadline is None:
+        deadline = monotonic() + 20
+    completed, _ = bounded_fetch_map(lookup,codes,workers=4,timeout=max(0,deadline-monotonic()))
+    membership = dict(completed)
     selected = {row['code']:row for row in membership.values() if row}
     def constituents(board):
         try:
@@ -115,14 +120,16 @@ def discover_sectors(codes, cutoff, cache_dir, *, getter=None):
             return board, codes
         except Exception:
             return board, []
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        peers = dict(pool.map(constituents,selected))
+    completed, _ = bounded_fetch_map(constituents,selected,workers=4,timeout=max(0,deadline-monotonic()))
+    peers = dict(completed)
     return membership, peers
 
 
-def discover_sina_sectors(codes, cutoff, cache_dir, *, getter=None):
+def discover_sina_sectors(codes, cutoff, cache_dir, *, getter=None, deadline=None):
     """Independent industry fallback; caches the complete classification map."""
     get = getter or public_get
+    if deadline is None:
+        deadline = monotonic() + 20
     def fetch():
         response = get('https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php',timeout=5)
         response.raise_for_status()
@@ -149,8 +156,12 @@ def discover_sina_sectors(codes, cutoff, cache_dir, *, getter=None):
                 return {'code':key,'name':fields[1],'provider':'Sina','members':sorted(code for code in rows if re.fullmatch(r'(?:60|68|00|30)\d{4}',code))}
             except Exception:
                 return None
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            return [row for row in pool.map(members,sorted(catalogue.items())) if row]
+        completed, missing = bounded_fetch_map(members,sorted(catalogue.items()),workers=4,
+                                               timeout=max(0,deadline-monotonic()))
+        if missing:
+            # Never cache a partial industry catalogue as complete for the day.
+            raise TimeoutError('行业目录采集达到时间预算')
+        return [row for row in completed if row]
     all_boards=cached_metadata(Path(cache_dir)/'sector-membership','sina-industries',cutoff,fetch)
     membership={code:next(({k:v for k,v in board.items() if k!='members'} for board in all_boards if code in board['members']),{}) for code in codes}
     selected={row.get('code') for row in membership.values()}
@@ -194,28 +205,60 @@ def compute_sector_evidence(code, stock_minutes, sector, peers, minute_rows, cut
     return result
 
 
-def prepare_sector_membership(codes, cutoff, cache_dir, *, getter=None):
-    try:
-        return discover_sectors(codes,cutoff,cache_dir,getter=getter)
-    except Exception:
-        return discover_sina_sectors(codes,cutoff,cache_dir,getter=getter)
+def prepare_sector_membership(codes, cutoff, cache_dir, *, getter=None, timeout=20):
+    deadline = monotonic() + max(0, timeout)
+    def bounded_get(url, **kwargs):
+        remaining = deadline-monotonic()
+        if remaining <= 0:
+            raise requests.Timeout('行业成员采集达到时间预算')
+        kwargs['timeout'] = min(float(kwargs.get('timeout',4)),remaining)
+        return (getter or public_get)(url,**kwargs)
+    def discover(_):
+        try:
+            return discover_sectors(codes,cutoff,cache_dir,getter=bounded_get,deadline=deadline)
+        except Exception:
+            return discover_sina_sectors(codes,cutoff,cache_dir,getter=bounded_get,deadline=deadline)
+    completed, _ = bounded_fetch_map(discover,[None],workers=1,timeout=timeout)
+    if not completed:
+        raise TimeoutError('行业成员读取失败或达到时间预算，未生成行业证据')
+    return completed[0]
 
 
-def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_fetcher=None, prepared=None):
+def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_fetcher=None, prepared=None, timeout=20):
+    deadline = monotonic() + max(0, timeout)
     try:
-        membership, boards = prepared or prepare_sector_membership(codes,cutoff,cache_dir,getter=getter)
+        membership, boards = prepared or prepare_sector_membership(codes,cutoff,cache_dir,getter=getter,timeout=timeout)
     except Exception as exc:
         return {code:{'metrics':{},'gaps':['板块成员源读取失败：'+type(exc).__name__]} for code in codes}
     all_codes = sorted({code for members in boards.values() for code in members})
     def get_minutes(code):
         try:
-            return code, (bar_fetcher or fetch_recent_bars)(code,count=20)
+            if bar_fetcher is None:
+                with _recent_sector_lock:
+                    saved = _recent_sector_bars.get(code)
+                    if saved and 0 <= monotonic()-saved[0] < 10:
+                        return code, saved[1]
+            bars = (bar_fetcher or fetch_recent_bars)(code,count=20)
+            if bar_fetcher is None:
+                with _recent_sector_lock:
+                    if len(_recent_sector_bars) >= 6000:
+                        _recent_sector_bars.clear()
+                    _recent_sector_bars[code] = (monotonic(),bars)
+            return code, bars
         except Exception:
             return code, []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        rows = dict(pool.map(get_minutes,all_codes))
-    return {code:compute_sector_evidence(code,intraday.get(code,{}),membership.get(code,{}),
+    completed, missing = bounded_fetch_map(get_minutes,all_codes,workers=8,
+                                           timeout=max(0,deadline-monotonic()))
+    rows = dict(completed)
+    results = {code:compute_sector_evidence(code,intraday.get(code,{}),membership.get(code,{}),
                 boards.get(membership.get(code,{}).get('code'),[]),rows,cutoff) for code in codes}
+    for code, result in results.items():
+        peers = set(boards.get(membership.get(code,{}).get('code'),[])) - {code}
+        missing_peers = len(peers.intersection(missing))
+        result['fetchBudget'] = {'seconds':timeout,'unfinishedPeers':missing_peers}
+        if missing_peers:
+            result['gaps'].append(f'行业分钟采集达到时间预算，{missing_peers}只成分未返回；完整成分分母与80%覆盖门槛保持不变')
+    return results
 
 
 def compute_fund_evidence(code, data, cutoff):

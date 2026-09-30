@@ -6,7 +6,7 @@ Build Stock King on your own computer without GitHub Actions, cloud servers or p
 
 ## 1. Installation for users
 
-Windows users can run `Stock-King-Setup-x64-v2.6.1.exe` without Python, Go or Node.js. It includes the local engine and offline WebView2. See [Windows installation instructions](WINDOWS_INSTALL.en.md) for installation and installer packaging. Native wheels remain optional.
+Windows users can run `Stock-King-Setup-x64-v2.6.2.exe` without Python, Go or Node.js. It includes the local engine and offline WebView2. See [Windows installation instructions](WINDOWS_INSTALL.en.md) for installation and installer packaging. Native wheels remain optional.
 
 Prefer a maintainer-supplied native wheel. It contains the desktop and frozen research engine, so users do not need Go, Node.js or Wails. Install 64-bit Python 3.11+ (3.12 recommended), then run from the package directory:
 

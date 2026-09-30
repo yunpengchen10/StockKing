@@ -102,6 +102,9 @@ def test_out_of_pool_hallucination_fails_without_fallback(tmp_path, monkeypatch)
 def test_late_retry_and_reviews_do_not_call_ai_or_generate_legacy_returns(tmp_path, monkeypatch):
     service, db, calls = fixture(tmp_path, monkeypatch, [], datetime(2026, 9, 8, 14, 57, tzinfo=mod.TZ))
     assert service.run('1455')['status'] == 'expired'
+    assert service.run('review')['status'] == 'not_due'
+    assert db.states == []
+    service.clock = lambda: datetime(2026, 9, 8, 15, 30, tzinfo=mod.TZ)
     assert service.run('review')['review']['weightsChanged'] is False
     assert calls == []
 

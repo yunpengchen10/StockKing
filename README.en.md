@@ -1,4 +1,4 @@
-# Stock King
+# Stock King · Local Stock Research Workspace
 
 <img src="branding/stock-king-logo.png" alt="Stock King" width="140" />
 
@@ -6,23 +6,43 @@
 
 A local desktop for stock quantitative research and China A-share research: quotes, charts, watchlists, scheduled picks, account backtests, observation review and manual AI research. Supports Windows x64 and Apple Silicon (M series, macOS 15+).
 
+## See the workspace in action
+
+![Stock King workflow: watchlists, candlestick charts, local picks and review](docs/media/stockking-workspace-tour.gif)
+
+**The actual current Vue interface, using isolated demonstration data.** This animation illustrates software operation, not live quotes, actual recommendations or realized returns. [Full-size GIF](docs/media/stockking-workspace-tour.gif) · [Still preview](docs/media/stockking-workspace-tour.png) · [Data and reproduction](docs/WORKSPACE_TOUR.md)
+
+[Quick start](#quick-start) · [Windows installation](docs/WINDOWS_INSTALL.en.md) · [Local builds](docs/LOCAL_BUILD.en.md) · [AI setup](docs/AI_CONFIGURATION.en.md) · [MCP quote service](quote-service/README.md)
+
+## Features
+
 - Charts and picks share the application's Tongdaxin, Eastmoney, Sina and Tencent market services and caches, retaining source and retrieval timestamps. Scans run with the chart closed.
 - Premarket observation at 09:20; independent scans at 09:40, 09:55, 10:30 and 14:55; archiving and due reviews at 15:30; Friday learning at 15:45. All use Asia/Shanghai time and trading-day checks.
-- StockKing V1.1 runs locally, deeply verifies at most 30 symbols and selects at most five per round without filling a quota. Picks, review and learning never call an LLM; AI research remains a separate page.
+- StockKing V1.1 runs locally. Its research queue covers 10% of the main-board universe rounded up, at least 300 symbols and never more than the available universe. Each round selects at most five, reports actual coverage and gaps, and never calls an LLM for picks, review or learning.
 - User data, models and settings are stored locally. No automatic trading.
 - Core workflows need no paid API, cloud server or GitHub Actions. Build and validate on your own computer; AI can use local Ollama or manually imported reports.
 
 AI tools can reuse the same quotes through the [read-only MCP quote service](quote-service/README.md). Python execution is supported on Windows and macOS; the ChatGPT cloud connection still requires remote authorization and end-to-end testing.
 
-## Real market demonstration
+## What's new in this source update
+
+- **Visible scan progress:** Local picks refresh in a background task with stage updates. Navigation and data-source failures preserve the last valid display.
+- **Complete recommendation records:** Large responses are no longer truncated. Fresh quotes are read separately while original recommendation prices and timestamps remain intact.
+- **Clear research coverage:** A broader queue records stage timings, request budgets and missing evidence, including incomplete verification.
+- **Consistent selection and validation:** An algorithm contract ties admission, ranking and validation to the same rules. Independent daily models remain a separate research view.
+
+<details>
+<summary>Also explore: a recorded-market replay with dates and sources</summary>
 
 ![StockKing V1.1 recorded market walkthrough](docs/media/stockking-v11-real-market.gif)
 
-**A recorded-data walkthrough, not a desktop screen recording.** The example uses recorded real market data with dates and sources. Demonstration symbols do not imply selection by the original scan, actual user trades or future returns. See the [methodology and reproduction notes](docs/research/stockking-v11-market-sample.en.md) and [source market sample](docs/research/stockking-v11-market-sample.json).
+This is a recorded-data walkthrough, not a desktop screen recording. Demonstration symbols do not imply selection by the original scan, actual user trades or future returns. See the [methodology and reproduction notes](docs/research/stockking-v11-market-sample.en.md) and [source market sample](docs/research/stockking-v11-market-sample.json).
+
+</details>
 
 ## Quick start
 
-Windows v2.6.1 includes a one-click `Stock-King-Setup-x64-v2.6.1.exe` installer with the local engine and offline WebView2. No Python, Go or Node.js installation is needed. It fixes hidden windows after updates and restores the existing window on repeated launches. See [installation and launch-fix instructions](docs/WINDOWS_INSTALL.en.md). The wheel below is an optional installation method.
+Windows v2.6.2 includes a one-click `Stock-King-Setup-x64-v2.6.2.exe` installer with the local engine and offline WebView2. No Python, Go or Node.js installation is needed. It fixes recommendation records failing to display when responses exceed 16 MiB, and includes the window-launch fixes from v2.6.1. See [installation and fix instructions](docs/WINDOWS_INSTALL.en.md). The wheel below is an optional installation method.
 
 1. If you have the Mac package, extract `Stock-King-macos-arm64.zip`, copy `Stock King.app` to `/Applications`, open it, and confirm the interface says “已连接” (Connected). This does not require installing Python, Go or Node.js. Windows users may alternatively use a platform-native wheel. You can also obtain the source from this public repository and follow [local building and distribution](docs/LOCAL_BUILD.en.md); no Actions, paid build platform or cloud server is required.
 2. For native wheels, use Python 3.11+ (3.12 recommended), with a native 64-bit interpreter matching your platform. From the wheel directory, run the following command, substituting the actual filename if its version differs:
@@ -101,7 +121,7 @@ This repository does not use GitHub Actions or require GitHub Pro or paid build 
 
 ## Recommendation algorithms
 
-Picks use **StockKing V1.1**: each round rereads Shanghai/Shenzhen main-board, non-ST snapshots, deeply verifies at most 30 symbols and selects at most five. A fresh queue allows newly active stocks to enter each round, and actual scan coverage is recorded. A symbol outside the deep-verification queue has not been ruled out.
+Picks use **StockKing V1.1**: each round rereads Shanghai/Shenzhen main-board, non-ST snapshots and builds a research queue of `min(universe size, max(300, ceil(universe size × 10%)))`, selecting at most five. Queue size is not completed verification: actual coverage, timeouts and gaps are recorded. A fresh queue allows newly active stocks to enter each round. A symbol outside the deep-verification queue has not been ruled out.
 
 The cold-start version is `stockking-v1.1-rules`. It retains Early / MainRise channels and the original manual weights, redistributed across available factors:
 

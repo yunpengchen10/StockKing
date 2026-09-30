@@ -1,24 +1,28 @@
 <script setup>
 import { computed, inject, onBeforeMount, onBeforeUnmount, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Follow, GetEngineStatus, GetKingPicks, GetKingPicksHistory, GetStockKingBackgroundLearning, GetStockKingBackgroundStatus, SetStockKingBackgroundLearning, GetStockKingAutoRecommendations, SetStockKingAutoRecommendations } from '../../wailsjs/go/main/App'
+import { Follow, GetEngineStatus, GetKingPicks, GetKingPicksHistory, GetDisplayedKingPicks, StartKingPicksRefresh, GetKingPicksRefreshTask, GetStockKingBackgroundLearning, GetStockKingBackgroundStatus, SetStockKingBackgroundLearning, GetStockKingAutoRecommendations, SetStockKingAutoRecommendations } from '../../wailsjs/go/main/App'
 import { useMessage } from 'naive-ui'
 import { toResearchCode } from '../utils/symbol'
 import PickIndicatorEvidence from './PickIndicatorEvidence.vue'
 import PicksLedger from './PicksLedger.vue'
 import { explainPick, PICK_BRANCHES } from '../utils/pickExplain.mjs'
+import { createPicksRefreshController, readDisplayedPicks, saveDisplayedPicks, selectDisplayedPicks } from '../utils/picksRefresh.mjs'
 
 const router = useRouter()
 const message = useMessage()
 const darkTheme = inject('appDarkTheme', ref(true))
 const loading = ref(false), refreshError = ref(''), viewingHistory = ref(false), methodVisible = ref(false), selectedPick = ref(null), explanationVisible = ref(false)
 const restoring = ref(true)
+const refreshProgress = ref(0), refreshStage = ref(''), refreshElapsed = ref(0)
 const isV11 = computed(() => String(adaptive.value.scoreVersion || adaptive.value.modelVersion || '').startsWith('stockking-v1.1') || adaptivePicks.value.some(pick => isV11Pick(pick)))
 const explanation = computed(() => explainPick(selectedPick.value || {}))
 function showWhy(pick, insufficient = false) { selectedPick.value = pick; selectedIsInsufficient.value = insufficient; explanationVisible.value = true }
 const engine = ref({ state: 'starting', ready: false })
 const maxPerBoard = ref(5)
 const result = ref({ tiers: {}, kechuang: [], nonKeChuang: [], generatedAt: '', diagnostics: {} })
+const displayedResult = ref(null)
+const classicResult = ref({ tiers: {}, kechuang: [], nonKeChuang: [], generatedAt: '', diagnostics: {} })
 const activeTier = ref('regular')
 const precisionProfile = ref('regular')
 const activeBoard = ref('nonKeChuang')
@@ -29,8 +33,31 @@ const backgroundStatus = ref({ status: 'never_run', updatedAt: '' })
 const historyVisible = ref(false)
 const historyLoading = ref(false)
 const historyItems = ref([])
-const snapshotKey = 'stock-king:picks:snapshot:v2.3'
-let disposed = false, savedSyncTimer = null, savedSyncInFlight = false, latestReadPromise = null, startupPolls = 0
+let disposed = false, savedSyncTimer = null, savedSyncInFlight = false, displayReadPromise = null, displayLoaded = false, displayRevision = 0, startupPolls = 0
+const pageResult = computed(() => viewMode.value === 'classic' ? classicResult.value : result.value)
+let snapshotStorage = null
+try { snapshotStorage = window.localStorage } catch (_) { /* Server persistence remains available. */ }
+const refreshController = createPicksRefreshController({
+  startTask: StartKingPicksRefresh,
+  getTask: GetKingPicksRefreshTask,
+  storage: snapshotStorage,
+  onState(state) {
+    loading.value = state.loading
+    refreshProgress.value = state.progress
+    refreshStage.value = state.message
+    refreshElapsed.value = state.elapsedSeconds
+    refreshError.value = state.error
+  },
+  onResult(fresh) {
+    displayRevision++
+    displayLoaded = true
+    displayedResult.value = fresh
+    result.value = fresh
+    viewingHistory.value = false
+    saveDisplayedPicks(snapshotStorage, fresh)
+    if (fresh.recommendationSyncError) message.warning(`精选已生成，但推荐记录同步失败：${fresh.recommendationSyncError}`)
+  },
+})
 
 const tierOptions = [
   { key: 'conservative', label: '保守', note: '低波稳健' },
@@ -39,22 +66,38 @@ const tierOptions = [
 ]
 
 const tierData = computed(() => {
-  const data = result.value?.tiers?.[activeTier.value]
+  const data = classicResult.value?.tiers?.[activeTier.value]
   if (data) return data
   if (activeTier.value === 'regular') {
-    return { kechuang: result.value?.kechuang || [], nonKeChuang: result.value?.nonKeChuang || result.value?.non_kechuang || [] }
+    return { kechuang: classicResult.value?.kechuang || [], nonKeChuang: classicResult.value?.nonKeChuang || classicResult.value?.non_kechuang || [] }
   }
   return { kechuang: [], nonKeChuang: [] }
 })
 const picks = computed(() => tierData.value?.[activeBoard.value] || [])
 const shortfall = computed(() => Number(tierData.value?.shortfall?.[activeBoard.value] || 0))
 const adaptive = computed(() => result.value?.adaptive || { candidates: [], changes: {}, calibration: {} })
+const snapshotIsOld = computed(() => {
+  const raw = adaptive.value.generatedAt || result.value.generatedAt
+  const stamp = raw ? new Date(raw) : null
+  if (!stamp || Number.isNaN(stamp.getTime())) return false
+  const options = { timeZone: 'Asia/Shanghai' }
+  return stamp.toLocaleDateString('sv-SE', options) < new Date().toLocaleDateString('sv-SE', options)
+})
 const adaptivePicks = computed(() => adaptive.value?.profileCandidates?.[precisionProfile.value] || adaptive.value?.candidates || [])
 const precisionWatchlist = computed(() => (adaptive.value?.precisionWatchlist || []).filter(p => !p.precisionDecision?.profiles?.[precisionProfile.value]?.entryEligible))
 const adaptiveCards = computed(() => adaptivePicks.value.map((pick, index) => ({ pick: { ...pick, rank: index + 1 }, detail: explainPick(pick) })))
 const insufficientCards = computed(() => (Array.isArray(adaptive.value?.evidenceInsufficient) ? adaptive.value.evidenceInsufficient : []).map(pick => ({ pick, detail: explainPick(pick) })))
 const selectedIsInsufficient = ref(false)
 const quoteCoverage = computed(() => adaptive.value?.dataQuality?.quote_coverage)
+const researchCoverage = computed(() => {
+  const quality = adaptive.value?.dataQuality || {}
+  return {
+    universe: quality.research_universe_count ?? quality.mainboard_count ?? '未知',
+    queued: quality.research_count ?? '未知',
+    completed: quality.deep_research_count ?? quality.evidence_screen?.researched ?? quality.research_count ?? '未知',
+    description: quality.research_coverage || '每轮先做全主板初筛，再对候选进行深度核验；覆盖范围以本轮记录为准。',
+  }
+})
 const quoteCoverageSummary = computed(() => {
   const coverage = quoteCoverage.value
   if (!coverage) return ''
@@ -142,24 +185,21 @@ function internalCode(value) {
 
 async function refresh() {
   if (loading.value || restoring.value) return
+  if (viewMode.value !== 'classic') {
+    displayRevision++
+    await refreshController.start(maxPerBoard.value)
+    return
+  }
   loading.value = true; refreshError.value = ''
+  refreshStage.value = '正在计算策略分组'; refreshProgress.value = 0; refreshElapsed.value = 0
   try {
     engine.value = await GetEngineStatus()
     if (!engine.value?.ready) throw new Error(engine.value?.message || 'Daily 研究引擎正在启动')
     const fresh = await GetKingPicks(maxPerBoard.value, true)
-    if (fresh?.adaptive?.status === 'unavailable') throw new Error(fresh.adaptive.message || '当日机会未完成')
-    result.value=fresh
-    viewingHistory.value = false
-    persistSnapshot()
-    if (result.value?.recommendationSyncError) message.warning(`精选已生成，但推荐记录同步失败：${result.value.recommendationSyncError}`)
+    if (!disposed) classicResult.value = fresh
   } catch (error) {
-    refreshError.value = error?.message || String(error)
-    message.error(refreshError.value)
-  } finally { loading.value = false }
-}
-
-function persistSnapshot() {
-  try { localStorage.setItem(snapshotKey, JSON.stringify(result.value)) } catch (_) { /* backend history remains the fallback */ }
+    if (!disposed) refreshError.value = error?.message || String(error)
+  } finally { if (!disposed) loading.value = false }
 }
 
 function mergeAdaptive(snapshot) {
@@ -175,15 +215,13 @@ function mergeAdaptive(snapshot) {
 }
 
 function readSnapshot() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(snapshotKey) || 'null')
-    if (parsed?.adaptive) result.value = parsed
-    return !!parsed?.adaptive
-  } catch (_) { return false }
+  const parsed = readDisplayedPicks(snapshotStorage)
+  if (parsed) { displayedResult.value = parsed; result.value = parsed; classicResult.value = parsed }
+  return !!parsed
 }
 
 function canSyncSavedResults() {
-  return !disposed && document.visibilityState !== 'hidden' && !loading.value && !viewingHistory.value && !historyVisible.value && !explanationVisible.value
+  return !disposed && document.visibilityState !== 'hidden'
 }
 function isV11Pick(pick) { return String(pick?.scoreVersion || '').startsWith('stockking-v1.1') }
 function calibrationValue(pick, key) {
@@ -201,8 +239,8 @@ async function syncSavedResults() {
     engine.value = status
     if (!status?.ready) { startupPolls++; return }
     startupPolls = 0
-    await restoreLatest({ background: true })
-    if (!canSyncSavedResults()) return
+    if (!displayLoaded && !loading.value) await restoreDisplayed()
+    if (disposed) return
     const background = await GetStockKingBackgroundStatus().catch(() => null)
     if (background && !disposed) backgroundStatus.value = background
   } finally {
@@ -214,28 +252,26 @@ async function syncSavedResults() {
   }
 }
 
-async function restoreLatest({ background = false } = {}) {
-  if (disposed || (background && !canSyncSavedResults())) return false
-  const restored = background ? Boolean(result.value?.adaptive) : readSnapshot()
-  if (!background) viewingHistory.value = false
-  // Keep the cached snapshot visible while reading saved background results.
-  // This read never starts a market scan or an AI request.
+async function restoreDisplayed() {
+  if (disposed || loading.value) return
+  const revision = displayRevision
   try {
-    if (!latestReadPromise) latestReadPromise = GetKingPicksHistory(100).finally(() => { latestReadPromise = null })
-    const payload = await latestReadPromise
-    if (disposed || (background && !canSyncSavedResults())) return restored
-    const latest = (payload?.items || []).filter(isScanHistory)
-      .map(historyResult).filter(isRestorableSnapshot)
-      .sort((a, b) => snapshotTime(b) - snapshotTime(a))[0]
-    if (!latest) return restored
-    if (!restored || !isRestorableSnapshot(adaptive.value) || snapshotTime(latest) >= snapshotTime(adaptive.value)) {
-      mergeAdaptive(latest)
-      persistSnapshot()
+    if (!displayReadPromise) displayReadPromise = GetDisplayedKingPicks().finally(() => { displayReadPromise = null })
+    const payload = await displayReadPromise
+    if (disposed || revision !== displayRevision) return
+    displayLoaded = true
+    const saved = selectDisplayedPicks(displayedResult.value, payload)
+    if (saved) {
+      displayedResult.value = saved
+      if (!viewingHistory.value) result.value = saved
+      saveDisplayedPicks(snapshotStorage, saved)
     }
-    return true
-  } catch (_) {
-    return restored
-  }
+    refreshController.resume(payload?.refreshTask)
+  } catch (_) { /* Keep the local display and retry once the engine becomes ready. */ }
+}
+function returnToDisplayed() {
+  viewingHistory.value = false
+  result.value = displayedResult.value || { adaptive: { candidates: [] }, generatedAt: '' }
 }
 
 function historyResult(item) { return item?.result || {} }
@@ -246,7 +282,6 @@ function isRestorableSnapshot(snapshot) {
   const status = String(snapshot?.status || '')
   return Array.isArray(snapshot?.candidates) && !['unavailable', 'failed', 'expired', 'cancelled', 'retired_slot', 'missed_slot', 'not_due', 'already_claimed'].includes(status) && !status.startsWith('skipped')
 }
-function snapshotTime(snapshot) { return Date.parse(snapshot?.generatedAt || snapshot?.generated_at || snapshot?.as_of || '') || 0 }
 function historySlotLabel(item) {
   if (item?.mode === 'king_review') return '收盘复盘'
   if (item?.mode === 'king_weekly') return '学习检查'
@@ -332,14 +367,20 @@ async function toggleRecommendations(value) {
 
 onBeforeMount(async () => {
   readSnapshot()
-  await syncSavedResults()
+  const preferences = Promise.allSettled([
+    GetStockKingBackgroundLearning().then(value => { if (!disposed) backgroundEnabled.value = value }),
+    GetStockKingAutoRecommendations().then(value => { if (!disposed) recommendationsEnabled.value = value }),
+  ])
+  await restoreDisplayed()
   if (disposed) return
-  backgroundEnabled.value = await GetStockKingBackgroundLearning().catch(() => true)
-  recommendationsEnabled.value = await GetStockKingAutoRecommendations().catch(() => true)
   restoring.value = false
+  refreshController.resume()
+  void syncSavedResults()
+  await preferences
 })
 onBeforeUnmount(() => {
   disposed = true
+  refreshController.dispose()
   if (savedSyncTimer !== null) clearTimeout(savedSyncTimer)
 })
 </script>
@@ -355,8 +396,10 @@ onBeforeUnmount(() => {
       <n-button secondary @click="openHistory">扫描历史</n-button>
       <n-button type="primary" :loading="loading" :disabled="restoring" title="重新获取行情并在本地计算，成功保存后显示" @click="refresh">刷新扫描</n-button>
     </header>
-    <n-alert v-if="!engine.ready || refreshError || viewingHistory" type="warning" :show-icon="false"><span :title="refreshError || engine.message || engine.state">{{ viewingHistory ? '历史快照' : refreshError ? '更新失败 · 当前为旧结果' : '引擎未就绪 · 就绪后自动读取已存结果' }}</span><n-button v-if="viewingHistory" size="tiny" text @click="restoreLatest">返回当前</n-button></n-alert>
-    <div class="picks-meta"><span>{{ result.asOfDate || result.as_of_date || '待生成' }}</span><details class="sk-help-details"><summary>扫描信息</summary><p>生成 {{ result.generatedAt || result.generated_at || '—' }} · 版本 {{ result.methodologyVersion || '兼容旧榜' }}</p><p>后台学习 {{ backgroundEnabled ? '开启' : '暂停' }} · {{ backgroundStatus.status || '未运行' }} {{ backgroundStatus.updatedAt }}</p><p>每轮扫描保留当时证据，可在历史中回看。</p></details></div>
+    <n-alert v-if="refreshError" type="warning" :show-icon="false" class="sync-alert">更新未完成：{{ refreshError }}<br/>已保存的推荐仍保留，可点击“刷新扫描”重试。</n-alert>
+    <n-alert v-if="viewingHistory || (!engine.ready && !loading)" type="warning" :show-icon="false" class="sync-alert"><span>{{ viewingHistory ? '正在浏览历史快照' : (engine.message || '引擎正在启动，已保存推荐可以继续查看。') }}</span><n-button v-if="viewingHistory" size="tiny" text @click="returnToDisplayed">返回当前</n-button></n-alert>
+    <div v-if="loading" class="refresh-progress" role="status" aria-live="polite"><div><b>{{ refreshStage || '正在扫描' }}</b><span>已用 {{ refreshElapsed }} 秒 · {{ refreshProgress }}%</span></div><n-progress type="line" :percentage="refreshProgress" :show-indicator="false" /><small>完成并保存后更新列表；切换页面后可继续查看进度。</small></div>
+    <div class="picks-meta"><span>{{ pageResult.asOfDate || pageResult.as_of_date || '待生成' }}</span><details class="sk-help-details"><summary>扫描信息</summary><p>生成 {{ pageResult.generatedAt || pageResult.generated_at || '—' }} · 版本 {{ pageResult.methodologyVersion || '兼容旧榜' }}</p><p>后台学习 {{ backgroundEnabled ? '开启' : '暂停' }} · {{ backgroundStatus.status || '未运行' }} {{ backgroundStatus.updatedAt }}</p><p>每轮扫描保留当时证据，可在历史中回看。</p></details></div>
     <n-tabs v-model:value="viewMode" type="line" animated class="view-tabs"><n-tab-pane name="adaptive" tab="本地精选" /><n-tab-pane name="records" tab="推荐记录" /><n-tab-pane name="reviews" tab="延后复盘" /><n-tab-pane name="learning" tab="学习状态" /><n-tab-pane name="classic" tab="策略分组" /></n-tabs>
 
     <template v-if="viewMode === 'adaptive'">
@@ -369,18 +412,21 @@ onBeforeUnmount(() => {
       <details v-if="precisionWatchlist.length" class="sk-help-details"><summary>等待条件的股票（{{ precisionWatchlist.length }}）</summary>
         <p v-for="pick in precisionWatchlist" :key="codeOf(pick)">{{ nameOf(pick) }}：{{ pick.precisionDecision?.profiles?.[precisionProfile]?.reasons?.join('；') }}</p>
       </details>
-      <p class="quote-coverage">软件行情 · 本地计算 · 沪深主板非ST · 每轮最多5只，不凑数。记录成功保存后展示。</p>
+      <p class="quote-coverage">软件行情 · 本地计算 · 沪深主板非ST · 每轮最多5只，不凑数。已保存推荐会在重启后保留，手动刷新成功后更新。</p>
       <n-alert v-if="adaptive.message" type="warning" :show-icon="false">{{ adaptive.message }}</n-alert>
-      <div class="adaptive-summary"><div><b>Top 5</b><small>{{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small></div><span>{{ loading ? '更新中…' : `新增 ${adaptive.changes?.added?.length || 0} · 移除 ${adaptive.changes?.removed?.length || 0}` }}</span></div>
+      <div class="adaptive-summary"><div><b>{{ result.adaptive ? '已保存推荐' : '本地精选' }}</b><n-tag v-if="snapshotIsOld" size="small" type="warning" :bordered="false">历史结果</n-tag><small>生成时间 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small></div><span>{{ loading ? '扫描中 · 暂时保留原列表' : `新增 ${adaptive.changes?.added?.length || 0} · 移除 ${adaptive.changes?.removed?.length || 0}` }}</span></div>
+      <p class="quote-coverage">本轮主板初筛 {{ researchCoverage.universe }} 只 · 进入深研 {{ researchCoverage.queued }} 只 · 完成深研 {{ researchCoverage.completed }} 只 · 本档入选 {{ adaptivePicks.length }} 只</p>
+      <p v-if="snapshotIsOld" class="quote-coverage">以上为已保存的历史结果，价格与证据截至标注的生成时间；刷新成功后才会更新。</p>
       <div v-if="quoteCoverageSummary || scheduleSummary" class="quote-coverage"><span v-if="quoteCoverageSummary" title="新鲜表示通过本轮报价时效核验，不代表已成交。">{{ quoteCoverageSummary }}</span><span v-if="scheduleSummary" :title="`北京时间 · 目标 ${adaptive.delivery.target_at} · 实际 ${adaptive.delivery.decision_at || '未记录'}`">{{ scheduleSummary }}</span></div>
       <div v-if="adaptive.dataQuality?.independent_evidence" class="quote-coverage">
+        <span v-if="adaptive.dataQuality?.minute_coverage">有效分钟证据：{{ adaptive.dataQuality.minute_coverage.usable }}/{{ adaptive.dataQuality.minute_coverage.requested }} 只</span>
         <span>20日同刻基准齐全：{{ adaptive.dataQuality.independent_evidence.history_20d_ready }}/{{ adaptive.dataQuality.research_count }} 只</span>
         <span>行业联动确认：{{ adaptive.dataQuality.independent_evidence.sector_confirmed }} 只</span>
         <span>分钟资金数据：{{ adaptive.dataQuality.independent_evidence.fund_source_available }} 只</span>
       </div>
-      <details v-if="isV11" class="sk-help-details picks-method"><summary>规则与覆盖</summary><p>每轮重新扫描全主板，最多30只进行分钟深度核验。</p><p>行情 {{ adaptive.dataQuality?.snapshot_count ?? '未知' }} 只，主板 {{ adaptive.dataQuality?.mainboard_count ?? '未知' }} 只，深度核验 {{ adaptive.dataQuality?.deep_research_count ?? adaptive.dataQuality?.research_count ?? '未知' }} 只。</p><p>{{ adaptive.marketSummary }}</p><p>算法 {{ adaptive.scoreVersion || adaptive.recommendationLogicVersion || '以单只候选记录为准' }}。同刻历史5～19日按实际覆盖降低置信度，不足5日对应因子留空。可用因子重新分配权重。</p><p>冷启动分数 = max(Early, MainRise) − 0.2 × 风险分，再限制至0～100。风险系数为未验证初值；分数用于排序，概率与收益预测待校准。</p></details>
+      <details v-if="isV11" class="sk-help-details picks-method"><summary>规则与覆盖</summary><p>{{ researchCoverage.description }}</p><p>行情 {{ adaptive.dataQuality?.snapshot_count ?? '未知' }} 只；深研完成表示已逐只核验，缺失和过期证据仍单独记录，不代表全部证据齐全。</p><p>{{ adaptive.marketSummary }}</p><p>算法 {{ adaptive.scoreVersion || adaptive.recommendationLogicVersion || '以单只候选记录为准' }}。同刻历史5～19日按实际覆盖降低置信度，不足5日对应因子留空。可用因子重新分配权重。</p><p>冷启动分数 = max(Early, MainRise) − 0.2 × 风险分，再限制至0～100。风险系数为未验证初值；分数用于排序，概率与收益预测待校准。</p></details>
       <details v-else class="sk-help-details picks-method"><summary>旧版历史口径</summary><p>{{ modelMix }} · {{ adaptive.modelVersion }}。旧分快照保留用于回看；下一次刷新采用当前规则与证据筛选。</p></details>
-      <n-spin :show="loading">
+      <n-spin :show="loading && !adaptivePicks.length">
         <section v-if="adaptivePicks.length" class="pick-grid">
           <n-card v-for="{ pick, detail } in adaptiveCards" :key="codeOf(pick)" size="small" :bordered="false" class="pick-card tier-adaptive">
             <template #header><div class="pick-title"><b>{{ pick.rank }}</b><strong>{{ nameOf(pick) }}</strong><code>{{ codeOf(pick) }}</code><n-tag size="small" :bordered="false" type="info" :title="pick.modelBranch || pick.model">{{ pick.stateLabel || `${scoreOf(pick)} 分` }}</n-tag></div></template>
@@ -425,7 +471,7 @@ onBeforeUnmount(() => {
             <template #footer><n-space justify="end"><n-button size="small" secondary @click="addWatch(pick)">自选</n-button><n-button size="small" type="primary" @click="openKline(pick)">图表</n-button></n-space></template>
           </n-card>
         </section>
-        <n-empty v-else :description="adaptive.message || (result.generatedAt ? '本轮无候选 · 请查看规则与覆盖' : '点击刷新全部生成候选')" style="padding:56px 0" />
+        <n-empty v-else :description="adaptive.message || (result.generatedAt ? '本轮无候选 · 请查看规则与覆盖' : '尚未保存推荐，请点击“刷新扫描”。盘前当日分钟证据可能尚未形成。')" style="padding:56px 0" />
         <details v-if="insufficientCards.length" class="sk-help-details insufficient-evidence"><summary>证据不足未入选 · {{ insufficientCards.length }} 只</summary><p>这些股票未进入推荐候选；查看缺失证据和未满足的条件。</p><article v-for="{ pick, detail } in insufficientCards" :key="codeOf(pick)"><div><b>{{ nameOf(pick) }}</b><code>{{ codeOf(pick) }}</code><n-button size="tiny" secondary @click="showWhy(pick, true)">查看证据缺口</n-button></div><p>{{ detail.risks.join('；') || detail.reason }}</p></article></details>
       </n-spin>
     </template>
@@ -467,7 +513,7 @@ onBeforeUnmount(() => {
       <details><summary>入选依据与指标</summary><p>每只候选展示已保存的入选理由、指标数值、单位、阈值、来源和数据时间，以及触发、失效和不追条件。历史不足5日时，对应历史因子留空；5～19日展示实际天数并降低置信度；达到20日才使用完整基准。成交额缺失保留为空。</p><p>冷启动研究分不是胜率或收益预测。未经校准的MFE、MAE预测及概率显示待校准。风险只扣一次，0.2系数是待验证初值。旧记录没有保存的指标不会事后补写。</p></details>
       <details><summary>旧版历史分支名称</summary><div class="branch-list"><div v-for="(item,key) in PICK_BRANCHES" :key="key"><code>{{ key }}</code><span>{{ item.name }}</span></div></div></details>
       <h3>策略分组</h3><p>保守、均衡、进攻采用不同目标，分数不能跨组比较。旧策略记录与V1.1训练集分别保留。</p>
-      <details><summary>定时扫描与学习</summary><p>北京时间09:20盘前观察；09:40、09:55、10:30、14:55独立扫描；15:30归档与到期复盘；周五15:45本地训练。自动推荐和自动学习分别控制。错过时点保留遗漏记录，手动刷新不重复计入训练。</p><p>默认至少120个成熟交易日、1000条有效样本才检验模型晋升。经时间隔离、样本外扣费收益、优势置信下界与回撤检查后，还须完成20个交易日前瞻影子验证。未达门槛继续使用当前版本。</p><p>进入页面读取已存快照，每30秒检查更新；“刷新扫描”才重新扫描。模拟成交采用下一完整分钟入场和期限收盘退出，未成交独立记录。价格观察与模拟收益均不代表用户真实交易。</p></details>
+      <details><summary>定时扫描与学习</summary><p>北京时间09:20盘前观察；09:40、09:55、10:30、14:55独立扫描；15:30归档与到期复盘；周五15:45本地训练。自动推荐和自动学习分别控制。错过时点保留遗漏记录，手动刷新不重复计入训练。</p><p>默认至少120个成熟交易日、1000条有效样本才检验模型晋升。经时间隔离、样本外扣费收益、优势置信下界与回撤检查后，还须完成20个交易日前瞻影子验证。未达门槛继续使用当前版本。</p><p>进入页面读取已保存的展示快照，关闭再开也会保留；后台定时扫描记入历史，不替换当前展示。“刷新扫描”成功后才更新，刷新期间或失败时仍显示原推荐；新一轮确实无合格候选时会明确显示空结果。模拟成交采用下一完整分钟入场和期限收盘退出，未成交独立记录。价格观察与模拟收益均不代表用户真实交易。</p></details>
     </div></n-drawer-content></n-drawer>
     <n-drawer v-model:show="explanationVisible" :width="520" placement="right"><n-drawer-content :title="`${nameOf(selectedPick)} · ${selectedIsInsufficient ? '证据不足未入选' : '为什么入选'}`" closable><div class="pick-explanation">
       <h3>{{ explanation.title }}</h3><small>快照 {{ formatTime(adaptive.generatedAt || result.generatedAt) }} · 行情来源 {{ explanation.source }}<br/>推荐逻辑 {{ explanation.logicVersion }}</small>
@@ -518,6 +564,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.refresh-progress{margin:12px 0;padding:12px;background:var(--sk-surface-2);border-radius:8px;font-size:12px}.refresh-progress>div{display:flex;justify-content:space-between;gap:14px;margin-bottom:8px}.refresh-progress span,.refresh-progress small{color:var(--sk-text-muted)}.refresh-progress small{display:block;margin-top:7px}.adaptive-summary>div{flex-wrap:wrap}
 .v11-facts{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0 12px;padding:10px;background:var(--sk-surface-2);border-radius:6px;font-size:11px}.v11-facts>div{display:flex;flex-direction:column;gap:3px}.v11-facts b{font-weight:500;font-variant-numeric:tabular-nums}.background-switch{white-space:nowrap}
 .indicator-highlights{display:flex;flex-wrap:wrap;gap:5px 12px;margin:0 0 8px;font-size:10px;color:var(--sk-text-muted)}.indicator-highlights b{color:var(--sk-text);font-variant-numeric:tabular-nums}.explanation-reasons{padding-left:18px}.explanation-reasons li{margin:7px 0}.legacy-notice{padding:9px 11px;border-left:3px solid var(--sk-accent);background:var(--sk-surface-2)}.insufficient-evidence{margin:18px 0;font-size:12px}.insufficient-evidence>article{padding:10px 0;border-top:1px solid var(--sk-border)}.insufficient-evidence>article>div{display:flex;align-items:center;gap:10px}.insufficient-evidence code{color:var(--sk-text-muted)}.insufficient-evidence .n-button{margin-left:auto}
 .quote-coverage{display:flex;flex-wrap:wrap;gap:5px 18px;margin:-4px 0 12px;color:var(--sk-text-muted);font-size:11px;line-height:1.6}.quote-evidence{margin:-4px 0 10px;color:var(--sk-text-muted);font-size:10px;line-height:1.6;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}

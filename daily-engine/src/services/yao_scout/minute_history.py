@@ -7,7 +7,7 @@ backfill the full preceding twenty. Missing sessions remain explicitly missing.
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timedelta
 import json
 import math
@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+from time import monotonic
 import zlib
 from statistics import median
 
@@ -24,6 +25,48 @@ from .intraday_evidence import SHANGHAI, _datetime, _prior_sessions, METRIC_DEFI
 
 SINA_URL = 'https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData'
 HEADERS = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://finance.sina.com.cn/'}
+
+
+def bounded_fetch_map(fetch, items, *, workers=4, timeout=30):
+    """Return completed values and missing inputs without waiting for slow I/O.
+
+    Only ``workers`` calls can be in flight; queued work is never submitted after
+    the deadline. Each provider must also set its own network timeout so the few
+    already-running calls eventually release their connections.
+    """
+    items = list(items)
+    deadline = monotonic() + max(0, timeout)
+    if not items or timeout <= 0:
+        return [], items
+    pool = ThreadPoolExecutor(max_workers=max(1, workers))
+    pending, completed = {}, {}
+    cursor = 0
+    try:
+        while cursor < len(items) and len(pending) < max(1, workers):
+            pending[pool.submit(fetch, items[cursor])] = cursor
+            cursor += 1
+        while pending:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            done, _ = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            if not done:
+                break
+            for future in done:
+                index = pending.pop(future)
+                try:
+                    completed[index] = future.result()
+                except Exception:
+                    pass
+            while cursor < len(items) and len(pending) < max(1, workers) and monotonic() < deadline:
+                pending[pool.submit(fetch, items[cursor])] = cursor
+                cursor += 1
+    finally:
+        # A context manager would wait for every pending request on exit and turn
+        # the deadline into a cosmetic timeout.
+        pool.shutdown(wait=False, cancel_futures=True)
+    return ([completed[i] for i in sorted(completed)],
+            [item for i, item in enumerate(items) if i not in completed])
 
 
 def number(value):
@@ -162,11 +205,12 @@ def fetch_sina_bars(code, *, count=1970, timeout=5, getter=None):
              'amount_cny':row.get('amount'), 'volume_shares':row.get('volume'), 'source':'Sina 1min unadjusted'} for row in raw]
 
 
-def fetch_software_bars(code, *, count=8000, client=None, end=None):
+def fetch_software_bars(code, *, count=8000, client=None, end=None, timeout=12):
     """Reuse the desktop chart provider and its loopback cache for raw bars."""
     if client is None:
         from src.services.software_market import SoftwareMarketClient
         client = SoftwareMarketClient.from_environment()
+        client.read_timeout = timeout
     if not client.available:
         raise RuntimeError('software market gateway unavailable')
     options = {'end':end} if end else {}
@@ -182,7 +226,7 @@ def fetch_software_bars(code, *, count=8000, client=None, end=None):
 def fetch_recent_bars(code, *, count=240):
     """Prefer software bars; use the existing public feed if desktop is absent."""
     try:
-        return fetch_software_bars(code,count=count)
+        return fetch_software_bars(code,count=count,timeout=4)
     except (requests.RequestException,RuntimeError,ValueError,TypeError,KeyError):
         return fetch_sina_bars(code,count=count)
 
@@ -380,12 +424,21 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
 def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, backfill=True, software_count=8000):
     cutoff = _datetime(cutoff)
     archive = MinuteArchive(cache_dir)
+    archived = archive.read(code, cutoff)
+    # Once history is warm, merge the current session into that archive. Do not
+    # call an old or incomplete archive current, or reduce cold-start coverage.
+    if archived and software_count > 240:
+        latest = max(_datetime(row['end']) for row in archived)
+        history = compute_bar_evidence(archived, cutoff)
+        if (cutoff-latest).total_seconds() < 300 and history['historyDays'] >= 5:
+            software_count = 240
     errors = []
     software_fetched = False
     client = None
     if getter is None:
         from src.services.software_market import SoftwareMarketClient
         client = SoftwareMarketClient.from_environment()
+        client.read_timeout = 12
         if client.available:
             try:
                 bars = fetch_software_bars(code,count=software_count,client=client)

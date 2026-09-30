@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+import threading
 from typing import Any, Dict, Literal
 
 from fastapi import APIRouter, Depends, Query
@@ -16,8 +17,11 @@ from src.services.stock_king_service import StockKingService
 from src.services.yao_scout import AdaptiveKingService, YaoScoutService
 from src.storage import DatabaseManager
 from src.services.yao_scout.local_opportunities import LocalOpportunityService
+from src.services.stock_king_display import LocalPicksDisplayStore
 
 router = APIRouter()
+_refresh_lock = threading.RLock()
+_refresh_tasks: dict[str, str] = {}
 
 
 class PicksRequest(BaseModel):
@@ -39,6 +43,83 @@ class AdviceRequest(BaseModel):
     symbol_code: str = Field(..., min_length=1, max_length=32)
     research_note: Dict[str, str] = Field(default_factory=dict)
     technical_snapshot: Dict[str, Any] = Field(default_factory=dict)
+
+
+def _refresh_task_payload(task) -> Dict[str, Any]:
+    def timestamp(value):
+        return value.astimezone().isoformat() if value is not None else None
+    return {
+        "task_id": task.task_id,
+        "trace_id": task.trace_id or task.task_id,
+        "status": task.status.value if isinstance(task.status, QueueTaskStatus) else str(task.status),
+        "progress": task.progress,
+        "message": task.message,
+        "error": task.error,
+        "created_at": timestamp(task.created_at),
+        "started_at": timestamp(task.started_at),
+        "completed_at": timestamp(task.completed_at),
+        "result": task.result if task.status == QueueTaskStatus.COMPLETED and isinstance(task.result, dict) else None,
+    }
+
+
+def _active_refresh(queue, storage_key):
+    task_id = _refresh_tasks.get(storage_key)
+    task = queue.get_task(task_id) if task_id else None
+    return task if task and task.status in (QueueTaskStatus.PENDING, QueueTaskStatus.PROCESSING) else None
+
+
+@router.post("/picks/refresh", status_code=202)
+def refresh_local_picks(
+    request: PicksRequest,
+    config: Config = Depends(get_config_dep),
+    db_manager: DatabaseManager = Depends(get_database_manager),
+) -> Dict[str, Any]:
+    store = LocalPicksDisplayStore(db_manager)
+    queue = get_task_queue()
+    with _refresh_lock:
+        active = _active_refresh(queue, store.storage_key)
+        if active:
+            return _refresh_task_payload(active)
+        task_id = uuid.uuid4().hex
+
+        def execute() -> Dict[str, Any]:
+            def report(progress, message):
+                queue.update_task_progress(task_id, progress, message)
+            report(10, "正在读取历史记录，准备本地精选刷新")
+            result = LocalOpportunityService(
+                YaoScoutService(config=config, db_manager=db_manager), progress_callback=report,
+            ).run("live", top_n=request.top_n, official=False)
+            report(98, "扫描完成，正在保存本次展示结果")
+            return store.save(result)
+
+        task = queue.submit_background_task(
+            execute, stock_code="king_local_refresh", stock_name="本地精选刷新",
+            report_type="stock_king_local_refresh", message="本地精选刷新已加入队列",
+            task_id=task_id, trace_id=task_id,
+        )
+        _refresh_tasks[store.storage_key] = task_id
+        return _refresh_task_payload(task)
+
+
+@router.get("/picks/refresh/tasks/{task_id}")
+def get_local_picks_refresh_task(task_id: str) -> Dict[str, Any]:
+    task = get_task_queue().get_task(task_id)
+    if task is None or task.report_type != "stock_king_local_refresh":
+        raise api_error(404, "stock_king_refresh_task_not_found", "本地精选刷新任务不存在或已过期，上次展示结果仍保留")
+    return _refresh_task_payload(task)
+
+
+@router.get("/picks/display")
+def get_local_picks_display(
+    db_manager: DatabaseManager = Depends(get_database_manager),
+) -> Dict[str, Any]:
+    store = LocalPicksDisplayStore(db_manager)
+    payload = store.read()
+    with _refresh_lock:
+        active = _active_refresh(get_task_queue(), store.storage_key)
+        if active:
+            payload["refreshTask"] = _refresh_task_payload(active)
+    return payload
 
 
 @router.post("/picks")

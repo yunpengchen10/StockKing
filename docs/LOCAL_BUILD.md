@@ -6,7 +6,7 @@ Stock King 在自己的电脑构建，不使用 GitHub Actions、云服务器或
 
 ## 1. 普通用户安装
 
-Windows 可直接双击 `Stock-King-Setup-x64-v2.6.1.exe`，无需 Python、Go 或 Node.js；包含本地引擎和离线 WebView2。安装和生成该安装包的方法见 [Windows 安装说明](WINDOWS_INSTALL.md)。下面的原生 wheel 是可选方式。
+Windows 可直接双击 `Stock-King-Setup-x64-v2.6.2.exe`，无需 Python、Go 或 Node.js；包含本地引擎和离线 WebView2。安装和生成该安装包的方法见 [Windows 安装说明](WINDOWS_INSTALL.md)。下面的原生 wheel 是可选方式。
 
 Mac 用户可直接解压维护者提供的 `Stock-King-macos-arm64.zip`，将 `Stock King.app` 移入“应用程序”并打开。界面左下角显示“已连接”表示桌面已连接到包内研究引擎；此安装方式无需 Python、Go、Node.js 或 Wails。
 

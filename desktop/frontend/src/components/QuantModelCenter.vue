@@ -3,19 +3,21 @@ import {computed, nextTick, onBeforeUnmount, onMounted, ref} from 'vue'
 import {useMessage} from 'naive-ui'
 import * as echarts from 'echarts'
 import {GetEngineStatus, GetModelMetrics, ListQuantTasks, PauseQuantTask, ResumeQuantTask,
+  GetStockKingLearningState,
   StartQuantTrainingScoped, RunExecutableBacktest, GetExecutableBacktestTemplate,
   ListExecutableBacktests, GetExecutableBacktestReport} from '../../wailsjs/go/main/App'
 
 const message = useMessage()
 const engine = ref({ready: false, state: 'starting'})
 const metrics = ref({models: {}, modelCount: 0})
+const localValidation = ref({})
 const tasks = ref([])
 const refreshError = ref('')
 const starting = ref(false)
 const actingTask = ref('')
 const symbolsText = ref('')
 const objectives = ref(['regular'])
-const activeTab = ref('account')
+const activeTab = ref('models')
 const dataset = ref(null)
 const datasetName = ref('我的事前信号研究')
 const calendarSource = ref('')
@@ -48,6 +50,10 @@ const balancedModel = computed(() => metrics.value?.tiers?.regular || {})
 const balancedReview = computed(() => balancedModel.value.metadata?.lastChallenger || balancedModel.value)
 const holdingRows = computed(() => Object.values(balancedReview.value.metrics?.holdingPeriods || {}))
 const validationRange = computed(() => balancedReview.value.metadata?.nestedValidation || {})
+const localAlgorithm = computed(() => localValidation.value.algorithm || {})
+const localStageLabel = computed(() => ({active: '已启用通过发布门槛的排序模型', shadow: '规则排序 · 模型影子验证中', rules_cold_start: '规则排序 · 尚未完成收益验证'})[localValidation.value.stage] || '验证状态未读取')
+const localGateRows = computed(() => [['holdout', '隔离样本验收'], ['shadow', '前向影子验证'], ['liveRolling', '启用后滚动复核']].map(([key, label]) => ({key, label, ...(localValidation.value.gates?.[key] || {})})))
+const localWeightRows = computed(() => [['early', '早期结构'], ['main', '主升结构'], ['distribution', '分歧风险']].map(([key, label]) => ({key, label, weights: localAlgorithm.value.weights?.[key] || {}})))
 const csvComplete = computed(() => ['signals', 'bars', 'calendar', 'benchmark'].every(key => csvParts.value[key]))
 const inputReady = computed(() => Boolean(dataset.value || (csvComplete.value && calendarSource.value.trim())))
 const isDemo = computed(() => dataset.value?.provenance === 'synthetic_demo')
@@ -80,14 +86,21 @@ async function refresh() {
   if (refreshing) return
   refreshing = true
   try {
-    const values = await Promise.allSettled([GetEngineStatus(), GetModelMetrics(), ListQuantTasks(12)])
+    const requests = [['engine', GetEngineStatus()]]
+    if (activeTab.value === 'models') requests.push(['local', GetStockKingLearningState()])
+    if (activeTab.value === 'legacy-models') requests.push(['metrics', GetModelMetrics()], ['tasks', ListQuantTasks(12)])
+    const values = await Promise.allSettled(requests.map(([, promise]) => promise))
     const failures = []
-    if (values[0].status === 'fulfilled') engine.value = values[0].value
-    else { engine.value = {ready: false, state: 'unavailable'}; failures.push(errorText(values[0].reason)) }
-    if (values[1].status === 'fulfilled') metrics.value = values[1].value || {models: {}, modelCount: 0}
-    else failures.push(errorText(values[1].reason))
-    if (values[2].status === 'fulfilled') tasks.value = values[2].value?.tasks || []
-    else failures.push(errorText(values[2].reason))
+    for (const [index, response] of values.entries()) {
+      const key = requests[index][0]
+      if (response.status === 'rejected') {
+        if (key === 'engine') engine.value = {ready: false, state: 'unavailable'}
+        failures.push(`${{engine: '引擎状态', local: '本地精选验证', metrics: '日线研究', tasks: '研究任务'}[key]}：${errorText(response.reason)}`)
+      } else if (key === 'engine') engine.value = response.value
+      else if (key === 'local') localValidation.value = response.value || {}
+      else if (key === 'metrics') metrics.value = response.value || {models: {}, modelCount: 0}
+      else if (key === 'tasks') tasks.value = response.value?.tasks || []
+    }
     refreshError.value = failures.join('；')
   } finally { refreshing = false }
 }
@@ -201,7 +214,13 @@ function drawChart() {
       {name: '账户回撤', type: 'line', xAxisIndex: 1, yAxisIndex: 1, showSymbol: false, lineStyle: {width: 1, color: '#23b58e'}, areaStyle: {color: '#23b58e', opacity: .18}, data: rows.map(r => r.drawdown)}]})
   observer = new ResizeObserver(() => chart?.resize()); observer.observe(chartElement.value)
 }
-onMounted(() => { void refresh(); void refreshReports(); timer = setInterval(refresh, 5000) })
+function tabChanged(value) {
+  activeTab.value = value
+  void refresh()
+  if (value === 'account') void refreshReports()
+  void nextTick(() => chart?.resize())
+}
+onMounted(() => { void refresh(); timer = setInterval(refresh, 5000) })
 onBeforeUnmount(() => { clearInterval(timer); observer?.disconnect(); chart?.dispose() })
 </script>
 
@@ -212,7 +231,7 @@ onBeforeUnmount(() => { clearInterval(timer); observer?.disconnect(); chart?.dis
       <div class="engine-pill" :title="engine.lastError || engine.message || engine.state"><i :class="{'is-ready': engine.ready}" />{{ engine.ready ? '引擎在线' : engine.state === 'starting' ? '启动中' : '未就绪' }}<n-button text size="small" @click="refresh">刷新</n-button></div>
     </header>
     <n-alert v-if="refreshError" type="warning" :bordered="false" class="notice">{{ refreshError }}</n-alert>
-    <n-tabs v-model:value="activeTab" type="line" animated @update:value="() => nextTick(() => chart?.resize())">
+    <n-tabs v-model:value="activeTab" type="line" animated @update:value="tabChanged">
       <n-tab-pane name="account" tab="账户回测">
         <div class="workspace-grid">
           <aside class="panel controls-panel">
@@ -309,7 +328,28 @@ onBeforeUnmount(() => { clearInterval(timer); observer?.disconnect(); chart?.dis
         </div>
       </n-tab-pane>
       <n-tab-pane name="models" tab="模型验证">
-        <div class="model-intro panel"><div><h3>模型验证</h3><p>复用缓存 · 未通过仅作研究参考</p></div><n-button secondary @click="refresh">刷新指标</n-button></div>
+        <div class="model-intro panel"><div><h3>本地精选 · 算法与验证</h3><p>读取精选实际使用的规则、排序模型和同一推荐账本。刷新仅核对已保存的验证状态。</p></div><n-button secondary @click="refresh">刷新验证状态</n-button></div>
+        <n-alert v-if="!localAlgorithm.contractId" type="warning" :bordered="false" class="notice">尚未取得本地精选算法契约，不能确认当前版本的验证结果。</n-alert>
+        <section class="panel holding-review local-contract">
+          <div class="section-title"><h3>{{ localStageLabel }}</h3><n-tag size="small" :bordered="false" :type="localValidation.stage === 'active' ? 'info' : 'warning'">{{ localValidation.stage === 'active' ? '排序模型已发布' : '未宣称已验证收益' }}</n-tag></div>
+          <dl class="contract-fields"><div><dt>评分规则</dt><dd>{{ localAlgorithm.scoreVersion || '未读取' }}</dd></div><div><dt>实际排序版本</dt><dd>{{ localValidation.effectiveRankVersion || '未读取' }}</dd></div><div><dt>准入规则</dt><dd>{{ localAlgorithm.entryPolicyVersion || '未读取' }}</dd></div><div><dt>证据规则</dt><dd>{{ localAlgorithm.evidenceVersion || '未读取' }}</dd></div><div><dt>算法契约</dt><dd>{{ localAlgorithm.contractId || '未读取' }}</dd></div><div><dt>最近训练</dt><dd>{{ localValidation.lastTrainingAt || '尚未训练' }}</dd></div></dl>
+          <p>{{ localValidation.reason || '当前验证状态尚未读取。' }}</p>
+          <p v-if="localValidation.rankingFallbackReason">排序回退原因：{{ localValidation.rankingFallbackReason }}</p>
+          <p>精选与验证共用评分权重、版本检查和事前准入。实时行情时间与历史验证时点不同，结果不要求相同；旧快照保留其生成时版本。</p>
+        </section>
+        <section class="stat-grid validation-stats">
+          <article class="stat"><span>成熟交易日</span><strong>{{ localValidation.matureDays ?? '—' }} <small>/ {{ localValidation.minimumMatureDays ?? '—' }}</small></strong><small>按同一算法契约统计</small></article>
+          <article class="stat"><span>有效成熟样本</span><strong>{{ localValidation.validSamples ?? '—' }} <small>/ {{ localValidation.minimumValidSamples ?? '—' }}</small></strong><small>缺证据、旧契约与手动刷新不进入训练</small></article>
+          <article class="stat"><span>前向影子交易日</span><strong>{{ localValidation.shadowDays ?? '—' }} <small>/ {{ localValidation.shadowRequiredDays ?? '—' }}</small></strong><small>{{ localValidation.shadowVersion || '尚无通过隔离验收的影子模型' }}</small></article>
+          <article class="stat"><span>实际排序来源</span><strong class="rank-source">{{ {rules: '本地规则', champion: '验证模型', rollback: '回退模型'}[localValidation.effectiveRankSource] || '未读取' }}</strong><small>规则分和模型排名分均不等于上涨概率</small></article>
+        </section>
+        <section class="tier-model-grid local-gates">
+          <article v-for="gate in localGateRows" :key="gate.key" class="panel tier-model-card"><div class="tier-head"><span>{{ gate.label }}</span><n-tag size="small" :bordered="false" :type="gate.passed === true ? 'info' : 'warning'">{{ gate.passed === true ? '通过' : gate.passed === false ? '未通过' : '尚未运行' }}</n-tag></div><p v-if="gate.passed == null">等待真实成熟样本与前置验收条件。</p><p v-else>{{ gate.reason || `已核验 ${gate.days ?? '—'} 个对齐净值交易日` }}</p><dl><div><dt>模拟账户净收益</dt><dd>{{ percent(gate.simulatedAccountNet) }}</dd></div><div><dt>扣费收益区间下界</dt><dd>{{ percent(gate.net95Lower) }}</dd></div><div><dt>相对当前规则优势下界</dt><dd>{{ percent(gate.advantage95Lower) }}</dd></div></dl><p>使用同一事前可入选池及成交约束；未成交保留为现金，数据缺失不补造结果。</p></article>
+        </section>
+        <section class="panel holding-review"><n-collapse><n-collapse-item title="共用评分、准入与样本口径"><p>{{ localAlgorithm.formula || '等待算法契约' }}</p><p>{{ localAlgorithm.missingFactorPolicy }}</p><p v-for="row in localWeightRows" :key="row.key">{{ row.label }}：{{ Object.entries(row.weights).map(([key, weight]) => `${key} ${percent(weight)}`).join(' · ') || '未读取' }}</p><p>风险扣减系数：{{ localAlgorithm.riskPenaltyCoefficient ?? '未读取' }}</p><p>准入：{{ (localAlgorithm.entryConditions || []).join('；') }}</p><p>{{ localAlgorithm.profilePolicy }}</p><p>{{ localAlgorithm.samplePolicy }}</p><p>{{ localAlgorithm.rankingPolicy }}</p><p>延后复盘记录 T+1 / T+3 / T+5 的分钟证据模拟结果；模型发布仍需隔离验收、前向影子验证和启用后复核。人工规则阶段不会因刷新页面变成已验证模型。</p></n-collapse-item></n-collapse></section>
+      </n-tab-pane>
+      <n-tab-pane name="legacy-models" tab="独立日线研究">
+        <div class="model-intro panel"><div><h3>独立日线研究模型</h3><p>SafeBound / BalancedRank / LimitPulse 使用各自的日线样本与研究标签。这里的训练与验收不驱动“本地精选”，也不代表精选算法已通过验证。</p></div><n-button secondary @click="refresh">刷新研究指标</n-button></div>
         <section class="tier-model-grid">
           <article v-for="tier in tierRows" :key="tier.key" class="panel tier-model-card">
             <div class="tier-head"><span>{{ tier.title }}</span><n-tag size="small" :type="tier.qualified ? 'info' : 'warning'" :bordered="false">{{ tier.qualified ? '研究验证通过' : '未验证 / 未通过' }}</n-tag></div>
@@ -331,7 +371,7 @@ onBeforeUnmount(() => { clearInterval(timer); observer?.disconnect(); chart?.dis
         </section>
         <div class="training-grid">
           <section class="panel">
-            <div class="section-title"><h3>训练</h3><span>20–200 只 A 股</span></div>
+            <div class="section-title"><h3>独立日线模型训练</h3><span>20–200 只 A 股</span></div>
             <n-input v-model:value="symbolsText" type="textarea" :autosize="{minRows: 3, maxRows: 6}" placeholder="股票代码，逗号或换行分隔" />
             <n-checkbox-group v-model:value="objectives" class="objective-options"><n-space><n-checkbox value="conservative">稳健</n-checkbox><n-checkbox value="regular">波段</n-checkbox><n-checkbox value="aggressive">短期</n-checkbox></n-space></n-checkbox-group>
             <n-button type="primary" :loading="starting" :disabled="!canTrain" @click="train">开始训练</n-button>
@@ -355,5 +395,6 @@ onBeforeUnmount(() => { clearInterval(timer); observer?.disconnect(); chart?.dis
 </template>
 
 <style scoped>
+.contract-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 24px;font-size:12px;margin:18px 0}.contract-fields>div{min-width:0}.contract-fields dt{color:var(--q-muted);margin-bottom:5px}.contract-fields dd{margin:0;overflow-wrap:anywhere}.validation-stats{margin-bottom:16px}.stat strong.rank-source{font-size:20px}.local-gates{margin-top:16px}@media(max-width:850px){.contract-fields{grid-template-columns:1fr}}
 .quant-page{--q-muted:var(--sk-text-muted,#8e9bb0);min-height:100%;padding:28px 30px 80px;background:var(--sk-page-bg,#0b101a);color:var(--sk-text,#e7edf7);box-sizing:border-box}.quant-header{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:22px}.eyebrow{font-size:10px;letter-spacing:2px;font-weight:700;color:var(--sk-accent,#699cff)}h1{font-size:28px;letter-spacing:-.7px;margin:7px 0}h1 span{font-size:13px;font-weight:400;letter-spacing:0;margin-left:17px;color:var(--q-muted)}h2,h3,p{margin-top:0}.quant-header p,.panel p{color:var(--q-muted);line-height:1.7;font-size:12px;margin-bottom:12px}.quant-header p{margin:0}.engine-pill{display:flex;align-items:center;gap:9px;font-size:11px;color:var(--q-muted);padding:9px 13px;border:1px solid var(--sk-border,#263044);border-radius:20px}.engine-pill i{height:6px;width:6px;border-radius:50%;background:#d49c51}.engine-pill i.is-ready{background:var(--sk-accent,#699cff);box-shadow:0 0 10px #699cff55}.engine-pill .n-button{margin-left:6px}.notice{margin-bottom:14px}.workspace-grid{display:grid;grid-template-columns:325px minmax(0,1fr);gap:18px;align-items:start;margin-top:8px}.panel{background:var(--sk-surface,#111a29);border:1px solid var(--sk-border,#253045);border-radius:12px;padding:20px;min-width:0}.controls-panel{padding:20px 18px}.section-label{display:flex;align-items:center;gap:10px;margin-bottom:12px}.section-label>span{font-size:10px;color:var(--sk-accent,#699cff);background:var(--sk-surface-2,#1c2a40);padding:4px 6px;border-radius:4px}.section-label h3,.chart-title h3,.section-title h3{font-size:14px;margin:0;font-weight:600}.section-label.second{border-top:1px solid var(--sk-border,#263044);padding-top:20px;margin-top:20px}.muted{color:var(--q-muted)}.tiny{font-size:11px!important}.import-grid{display:grid;grid-template-columns:1fr auto;gap:8px}.file-button{display:flex;align-items:center;justify-content:center;min-height:34px;padding:4px 9px;box-sizing:border-box;font-size:12px;border:1px solid var(--sk-border,#263044);border-radius:5px;cursor:pointer;background:var(--sk-surface-2,#182337);text-align:center;overflow-wrap:anywhere}.file-button:hover{border-color:var(--sk-accent,#699cff)}.primary-file{border-color:#4b78c766;color:#8ab2ff}.file-button input{display:none}.template-link{display:flex;justify-content:space-between;align-items:center;margin-top:9px;font-size:10px;color:var(--q-muted)}.dataset-status{display:flex;flex-direction:column;gap:6px;font-size:11px;padding:12px;margin:12px 0;background:var(--sk-surface-2,#182337);border-radius:6px}.dataset-status b{font-size:12px;font-weight:500}.dataset-status span{color:var(--q-muted)}.dataset-status .n-tag{align-self:start}.csv-collapse{margin-top:12px}.csv-files{display:grid;grid-template-columns:1fr 1fr;gap:7px}.field-gap{margin-top:8px}.confirmation{font-size:11px;margin-top:15px;line-height:1.6}.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px 10px}.field-grid label{display:flex;flex-direction:column;gap:6px;font-size:11px;color:var(--q-muted)}.field-grid .n-input-number{width:100%}.field-grid+p{margin-top:12px}.run-button{margin-top:19px;font-weight:600}.compare-button{margin-top:8px}.saved-reports{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;margin-top:12px}.results-column{display:flex;flex-direction:column;gap:14px;min-width:0}.result-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:17px 20px}.result-heading h3{font-size:15px;margin:6px 0}.result-heading p{font-size:11px;margin:0}.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.stat{padding:15px;background:var(--sk-surface,#111a29);border:1px solid var(--sk-border,#253045);border-radius:9px;display:flex;flex-direction:column;gap:9px}.stat>span{font-size:11px;color:var(--q-muted)}.stat strong{font-size:24px;font-weight:600;letter-spacing:-.7px;font-variant-numeric:tabular-nums}.stat small{font-size:10px;color:var(--q-muted);line-height:1.5}.rise{color:var(--sk-up,#f56574)!important}.fall{color:var(--sk-down,#23b58e)!important}.chart-panel{padding:17px 20px 8px}.chart-title,.section-title{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.chart-title>span,.section-title>span{font-size:10px;color:var(--q-muted)}.equity-chart{height:325px;width:100%}.ledger-panel{padding:8px 16px 14px}.methodology{padding:15px 20px}.parameter-details{margin-top:15px}.empty-mark{font-size:64px;line-height:1;color:var(--sk-accent,#699cff);opacity:.7}.task-error{color:var(--sk-up,#f56574)!important}.methodology p{font-size:11px}.methodology code{display:block;overflow-wrap:anywhere;font-size:10px;color:var(--q-muted)}.comparison{display:flex;flex-wrap:wrap;align-items:center;gap:16px;padding:12px 20px;font-size:11px;color:var(--q-muted)}.comparison strong{font-size:18px}.empty-state{min-height:400px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:40px}.empty-state h2{font-size:20px;font-weight:500;margin:16px 0 11px}.empty-state p{max-width:470px}.empty-chart{width:min(420px,100%);color:#4c79c5;margin-bottom:38px}.empty-chart svg{width:100%;opacity:.6}.execution-rules{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin:9px 0 24px}.execution-rules span{font-size:10px;background:var(--sk-surface-2,#1a2538);color:var(--q-muted);border:1px solid var(--sk-border,#253045);padding:6px 9px;border-radius:4px}.model-intro{display:flex;justify-content:space-between;align-items:center;gap:20px;margin:8px 0 16px}.model-intro h3{margin:7px 0;font-size:18px}.model-intro p{margin:0;max-width:760px}.tier-model-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:16px}.tier-head{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--q-muted);margin-bottom:18px}.tier-model-card h2{font-size:24px;font-weight:500;letter-spacing:-.5px;margin-bottom:7px}.tier-model-card dl{font-size:11px;display:flex;flex-direction:column;gap:8px;margin:18px 0}.tier-model-card dl>div{display:flex;justify-content:space-between}.tier-model-card dt{color:var(--q-muted)}.tier-model-card dd{margin:0}.holding-review{margin-bottom:16px}.holding-review .n-empty{padding:25px}.training-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.objective-options{margin:16px 0}.task{padding:12px 0;border-bottom:1px solid var(--sk-border,#253045)}.task:last-child{border-bottom:0}.task>div:first-child{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px;font-size:11px}.task strong{font-size:11px;font-weight:500;overflow-wrap:anywhere}.task span{color:var(--q-muted);white-space:nowrap}.task p{font-size:11px;margin:5px 0}.task-actions{display:flex;justify-content:flex-end}pre{font-size:10px;line-height:1.6;max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--q-muted)}:deep(.n-tabs-nav){margin-bottom:12px}:deep(.n-tab-pane){padding-top:8px}:deep(.n-data-table-th){font-size:11px}:deep(.n-data-table-td){font-size:11px}@media(max-width:1200px){.quant-page{padding:20px 18px 70px}.workspace-grid{grid-template-columns:300px minmax(0,1fr)}.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.tier-model-grid{grid-template-columns:1fr}.training-grid{grid-template-columns:1fr}}@media(max-width:850px){.workspace-grid{grid-template-columns:1fr}.quant-header{align-items:flex-start}.quant-header h1 span{display:block;margin:6px 0 0}.engine-pill{white-space:nowrap}.empty-state{min-height:360px}.model-intro{align-items:flex-start}.result-heading{flex-wrap:wrap}}
 </style>

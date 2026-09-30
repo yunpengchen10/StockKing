@@ -1,10 +1,10 @@
-# Windows 安装与启动修复
+# Windows 安装与修复
 
 [English](WINDOWS_INSTALL.en.md)
 
-## v2.6.1 一键安装包
+## v2.6.2 一键安装包
 
-文件名：`Stock-King-Setup-x64-v2.6.1.exe`。适用于 Windows 10/11 x64，包含桌面程序、StockKing V1.1 本地研究引擎及离线 WebView2 安装程序，无需另外安装 Python、Go 或 Node.js。仅在缺少 WebView2 时安装该组件；行情下载仍需要网络。
+文件名：`Stock-King-Setup-x64-v2.6.2.exe`。适用于 Windows 10/11 x64，包含桌面程序、StockKing V1.1 本地研究引擎及离线 WebView2 安装程序，无需另外安装 Python、Go 或 Node.js。仅在缺少 WebView2 时安装该组件；行情下载仍需要网络。
 
 1. 关闭正在运行的 Stock King，再双击安装包。
 2. 已有安装时选择原来的安装目录，例如 `D:\Stock King`。新用户可使用默认目录。
@@ -13,9 +13,11 @@
 
 安装不会把个人数据库、密钥、自选或训练模型装入发行包。已有数据存放在 `%APPDATA%\Stock King` 与 `%LOCALAPPDATA%\Stock King`；卸载程序保留这些用户数据。升级前建议备份这两个目录。安装器注册七个当前用户后台任务；自动推荐与学习仍分别由软件开关控制，电脑需保持开机并登录。
 
-安装包附 `SHA256SUMS.txt`。可用 `Get-FileHash .\Stock-King-Setup-x64-v2.6.1.exe -Algorithm SHA256` 核对。Stock King 程序与安装包未购买代码签名证书，内置 WebView2 安装程序已验证微软签名。
+安装包附 `SHA256SUMS.txt`。可用 `Get-FileHash .\Stock-King-Setup-x64-v2.6.2.exe -Algorithm SHA256` 核对。Stock King 程序与安装包未购买代码签名证书，内置 WebView2 安装程序已验证微软签名。
 
 ## 修复了什么
+
+v2.6.2 修复推荐记录响应超过 16 MiB 时被截断的问题。此前会出现 `unexpected end of JSON input` 并显示“记录暂不可用”；更新后可完整读取和显示记录，保留原有信号数据。
 
 旧的本地更新脚本会以隐藏窗口方式启动桌面程序，重复打开时只提示“已运行”。v2.6.1 改为显示窗口，并在更新完成前检查可见窗口；再次点击快捷方式会恢复并聚焦已有窗口。
 

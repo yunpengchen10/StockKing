@@ -15,6 +15,7 @@ import math
 from pathlib import Path
 import re
 import sqlite3
+from time import monotonic
 from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
 import zlib
@@ -36,6 +37,7 @@ MIN_VALID_SAMPLES = 1000
 PURGE_DAYS = 5
 SHADOW_DAYS = 20
 MAX_HISTORY = 500
+_ARTIFACT_PROBES: dict[str, tuple[float, bool]] = {}
 
 
 def _at(value: datetime | str) -> datetime:
@@ -107,6 +109,8 @@ def _snapshot(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "finalScore", "distributionRisk", "dataConfidence", "baselineHistoryDays",
         "scoreVersion", "minuteArchivePath", "firstTradablePrice", "selectionReasons",
         "invalidationConditions", "indicatorEvidence",
+        "algorithmContractId", "learningRankVersion", "learningRankScore",
+        "rank", "rankingTieBreakOrder",
     )
     return {key: candidate[key] for key in keys if key in candidate}
 
@@ -120,8 +124,17 @@ def _source_time(candidate: Mapping[str, Any]) -> str | None:
         return None
 
 
+def _current_entry_eligible(candidate: Mapping[str, Any]) -> bool:
+    from .local_algorithm import algorithm_contract, is_entry_eligible
+    return bool(isinstance(candidate, Mapping)
+                and candidate.get("algorithmContractId") == algorithm_contract()["contractId"]
+                and is_entry_eligible(candidate))
+
+
 def _signal_preflight(candidate: Mapping[str, Any], published_at: datetime) -> bool:
     """Admit only signal-time usable examples; later no-fills stay in the sample."""
+    if not _current_entry_eligible(candidate):
+        return False
     code = _code(candidate.get("code"))
     if code is None or not _feature_values(candidate):
         return False
@@ -677,7 +690,7 @@ class SignalLearningService:
         """Point-in-time signals; no-fill remains a zero-return cash decision."""
         with self._connect() as db:
             rows = db.execute(
-                "SELECT e.*,r.trading_day,r.slot,o1.status h1,o3.status h3,o5.status h5,"
+                "SELECT e.*,r.trading_day,r.slot,r.version scan_version,o1.status h1,o3.status h3,o5.status h5,"
                 "o5.simulated_net_return net,o5.mfe mfe,o5.mae mae,o5.exit_at exit_at,"
                 "o5.entry_at entry_at,o5.entry_price entry_price,o5.exit_price exit_price,"
                 "o5.details_json details_json "
@@ -690,11 +703,18 @@ class SignalLearningService:
                 (as_of.date().isoformat(),),
             ).fetchall()
         result, seen = [], set()
+        from .local_algorithm import algorithm_contract
+        contract = algorithm_contract()
         for row in rows:
+            try:
+                snapshot = json.loads(row["snapshot_json"])
+            except (TypeError, ValueError):
+                continue
+            if row["scan_version"] != contract["scoreVersion"] or not _current_entry_eligible(snapshot):
+                continue
             key = (row["trading_day"], row["code"])
             if dedupe and key in seen:
                 continue
-            seen.add(key)
             states = (row["h1"], row["h3"], row["h5"])
             if any(state not in {"mature", "no_fill"} for state in states):
                 continue
@@ -704,6 +724,7 @@ class SignalLearningService:
             details = json.loads(row["details_json"])
             if row["h5"] == "mature" and not details.get("dailyCloseMarks"):
                 continue
+            seen.add(key)
             result.append({"day": row["trading_day"], "code": row["code"], "runId": row["run_id"],
                            "signalId": row["signal_id"], "features": features,
                            "net": float(row["net"] or 0.0), "filled": row["h5"] == "mature",
@@ -713,7 +734,11 @@ class SignalLearningService:
                            "exitPrice": row["exit_price"], "marks": details.get("dailyCloseMarks") or {},
                            "entryMinuteVolume": details.get("entryMinuteVolume"),
                            "selected": bool(row["selected"]), "decisionAt": row["decision_at"],
-                           "slot": row["slot"]})
+                           "slot": row["slot"], "algorithmContractId": contract["contractId"],
+                           "entryEligibleAtSignal": True,
+                           "selectionRank": _number(snapshot.get("rank"), positive=True),
+                           "recordedRankScore": _number(snapshot.get("learningRankScore")),
+                           "rankingTieBreakOrder": _number(snapshot.get("rankingTieBreakOrder"))})
         return result
 
     def _registry(self) -> dict[str, Any]:
@@ -736,20 +761,63 @@ class SignalLearningService:
         as_of = _at(as_of or self.clock())
         samples = self._dataset(as_of)
         registry = self._registry()
+        from .local_algorithm import algorithm_contract
+        contract = algorithm_contract()
+        effective_version, effective_source, fallback = "rules_v1.1", "rules", None
+        for key, source in (("championVersion", "champion"), ("rollbackVersion", "rollback")):
+            version = registry.get(key)
+            if not version:
+                continue
+            artifact = self._model_artifact(version, active_only=True)
+            if artifact is None:
+                fallback = "排序模型缺失、损坏或与当前算法契约不一致，使用可用后备排序"
+                continue
+            try:
+                # The median-feature row only verifies the frozen artifact can
+                # execute. It never becomes a signal, sample or reported return.
+                fingerprint = sha256(_json(artifact).encode()).hexdigest()
+                probe = _ARTIFACT_PROBES.get(fingerprint)
+                if probe is None or monotonic()-probe[0] >= 30:
+                    try:
+                        self._predict_artifact(artifact, [{"features": {}}])
+                    except Exception:
+                        _ARTIFACT_PROBES[fingerprint] = (monotonic(), False)
+                        raise
+                    if len(_ARTIFACT_PROBES) > 32:
+                        _ARTIFACT_PROBES.clear()
+                    _ARTIFACT_PROBES[fingerprint] = (monotonic(), True)
+                elif not probe[1]:
+                    raise ValueError("cached_artifact_probe_failed")
+            except Exception:
+                fallback = "排序模型执行校验失败，使用可用后备排序"
+                continue
+            effective_version, effective_source = version, source
+            break
+        valid_shadow = registry.get("shadowVersion") if self._model_artifact(registry.get("shadowVersion")) else None
+        validation_matches = registry.get("algorithmContractId") == contract["contractId"]
         days = len({sample["day"] for sample in samples})
-        stage = ("active" if registry.get("championVersion") else
-                 "shadow" if registry.get("shadowVersion") else "rules_cold_start")
+        stage = ("active" if effective_source != "rules" else
+                 "shadow" if valid_shadow else "rules_cold_start")
         reason = registry.get("reason")
         if days < MIN_MATURE_DAYS or len(samples) < MIN_VALID_SAMPLES:
             reason = (f"待积累独立成熟交易日/有效样本：{days}/{MIN_MATURE_DAYS} 天，"
                       f"{len(samples)}/{MIN_VALID_SAMPLES} 条")
         return {
-            "stage": stage, "championVersion": registry.get("championVersion"),
-            "shadowVersion": registry.get("shadowVersion"),
-            "shadowDays": registry.get("shadowDays", 0), "shadowRequiredDays": SHADOW_DAYS,
+            "stage": stage, "championVersion": effective_version if effective_source != "rules" else None,
+            "shadowVersion": valid_shadow,
+            "algorithm": contract, "effectiveRankVersion": effective_version,
+            "effectiveRankSource": effective_source, "rankingFallbackReason": fallback,
+            "configuredChampionVersion": registry.get("championVersion"),
+            "configuredShadowVersion": registry.get("shadowVersion"),
+            "shadowDays": registry.get("shadowDays", 0) if valid_shadow and validation_matches else 0,
+            "shadowRequiredDays": SHADOW_DAYS,
             "matureDays": days, "validSamples": len(samples),
             "minimumMatureDays": MIN_MATURE_DAYS, "minimumValidSamples": MIN_VALID_SAMPLES,
-            "gates": registry.get("gates") or {}, "lastTrainingAt": registry.get("lastTrainingAt"),
+            "gates": (registry.get("gates") or {}) if validation_matches else {},
+            "validationContractId": contract["contractId"] if validation_matches else None,
+            "historicalValidationAvailable": bool(registry.get("gates") and not validation_matches
+                                                  or (registry.get("priorValidation") or {}).get("gates")),
+            "lastTrainingAt": registry.get("lastTrainingAt"),
             "reason": reason, "rollbackVersion": registry.get("rollbackVersion"),
             "lastEvaluatedThrough": registry.get("lastEvaluatedThrough"),
         }
@@ -793,7 +861,20 @@ class SignalLearningService:
                     break
                 pool = ([(score, item) for score, item in group if item["selected"]]
                         if scores is None else group)
-                choices = sorted(pool, key=lambda pair: (pair[0], pair[1]["code"]), reverse=True)[:slots]
+                def selection_order(pair):
+                    score, item = pair
+                    tie = _number(item.get("rankingTieBreakOrder"))
+                    tie = tie if tie is not None else math.inf
+                    if scores is None:
+                        rank = _number(item.get("selectionRank"), positive=True)
+                        if rank is not None:
+                            return (0, rank, tie, item["code"])
+                        recorded = _number(item.get("recordedRankScore"))
+                        return (1, -(recorded if recorded is not None else score), tie, item["code"])
+                    # Calibrated percentiles often tie. Live sorting is stable
+                    # over the original rules/evidence queue, frozen at scanning.
+                    return (0, -score, tie, item["code"])
+                choices = sorted(pool, key=selection_order)[:slots]
                 for _, item in choices:
                     attempts += 1
                     key = (day, item["code"])
@@ -920,20 +1001,26 @@ class SignalLearningService:
             raise ValueError("model_prediction_invalid")
         return candidate, baseline
 
-    def _model_artifact(self, version: str) -> dict[str, Any] | None:
+    def _model_artifact(self, version: str, *, active_only: bool = False) -> dict[str, Any] | None:
         if not version:
             return None
         with self._connect() as db:
-            row = db.execute("SELECT artifact_json FROM model_versions WHERE version=?", (version,)).fetchone()
+            row = db.execute("SELECT artifact_json,stage,gates_json FROM model_versions WHERE version=?", (version,)).fetchone()
         if not row:
             return None
         try:
             artifact = json.loads(row[0])
-            if (not isinstance(artifact, dict) or artifact.get("version") != version
+            from .local_algorithm import algorithm_contract
+            gates = json.loads(row[2])
+            if (row[1] not in ({"active"} if active_only else {"active", "shadow"})
+                    or not isinstance(gates, dict) or gates.get("passed") is not True
+                    or not isinstance(artifact, dict) or artifact.get("version") != version
                     or artifact.get("executionModel") != MODEL_VERSION
+                    or artifact.get("algorithmContractId") != algorithm_contract()["contractId"]
                     or not all(key in artifact for key in (
                         "features", "medians", "netRegressor", "maeRegressor",
-                        "calibrationKnots", "calibrationPercentiles", "riskCoefficient"))):
+                        "calibrationKnots", "calibrationPercentiles", "riskCoefficient",
+                        "logisticMean", "logisticScale", "logisticCoef", "logisticIntercept"))):
                 return None
             return artifact
         except (TypeError, ValueError):
@@ -945,11 +1032,19 @@ class SignalLearningService:
         placeholders = ",".join("?" for _ in days)
         with self._connect() as db:
             rows = db.execute(
-                "SELECT e.signal_id FROM signal_events e JOIN signal_runs r ON r.run_id=e.run_id "
+                "SELECT e.signal_id,e.snapshot_json,r.version FROM signal_events e JOIN signal_runs r ON r.run_id=e.run_id "
                 f"WHERE e.training_eligible=1 AND r.trading_day IN ({placeholders})",
                 tuple(sorted(days)),
             ).fetchall()
-        return bool(rows) and {row[0] for row in rows} == {sample["signalId"] for sample in samples}
+        from .local_algorithm import algorithm_contract
+        expected = set()
+        for row in rows:
+            try:
+                if row[2] == algorithm_contract()["scoreVersion"] and _current_entry_eligible(json.loads(row[1])):
+                    expected.add(row[0])
+            except (TypeError, ValueError):
+                continue
+        return bool(expected) and expected == {sample["signalId"] for sample in samples}
 
     def _forward_scores(self, version: str, samples: list[dict[str, Any]]) -> np.ndarray | None:
         if not samples:
@@ -994,6 +1089,19 @@ class SignalLearningService:
         all_samples = self._dataset(now, dedupe=False)
         days = sorted({sample["day"] for sample in samples})
         registry = self._registry()
+        from .local_algorithm import algorithm_contract
+        current_contract = algorithm_contract()["contractId"]
+        if registry.get("algorithmContractId") != current_contract:
+            # Preserve old audit results, but never relabel their pass/fail or
+            # returns as validation of newly changed rules or entry eligibility.
+            registry["priorValidation"] = {
+                "algorithmContractId": registry.get("algorithmContractId"),
+                "gates": registry.get("gates") or {},
+                "lastTrainingAt": registry.get("lastTrainingAt"),
+            }
+            registry.update(algorithmContractId=current_contract, gates={}, shadowDays=0)
+            registry.pop("lastCandidateTrainThrough", None)
+            registry.pop("lastEvaluatedThrough", None)
         registry["lastTrainingAt"] = now.isoformat()
         if len(days) < MIN_MATURE_DAYS or len(samples) < MIN_VALID_SAMPLES:
             registry["reason"] = "insufficient_independent_mature_days_or_samples"
@@ -1180,6 +1288,8 @@ class SignalLearningService:
             "priceBasis": "unadjusted_minute_bar",
             "executionModel": MODEL_VERSION,
         }
+        from .local_algorithm import algorithm_contract
+        artifact["algorithmContractId"] = algorithm_contract()["contractId"]
         with self._connect() as db:
             db.execute("INSERT INTO model_versions VALUES(?,?,?,?,?)",
                        (version, "shadow", _json(artifact), _json(gates), now.isoformat()))
@@ -1194,20 +1304,26 @@ class SignalLearningService:
                         as_of: datetime | str | None = None) -> list[dict[str, Any]]:
         """Use only an active champion; otherwise keep the transparent V1.1 rule ranking."""
         rows = [dict(candidate) for candidate in candidates]
+        for index, row in enumerate(rows):
+            row["rankingTieBreakOrder"] = index
         registry = self._registry()
+        eligible = [row for row in rows if _current_entry_eligible(row)]
+        excluded = [row for row in rows if not _current_entry_eligible(row)]
         for version in (registry.get("championVersion"), registry.get("rollbackVersion")):
-            artifact = self._model_artifact(version) if version else None
-            if artifact:
-                sample_rows = [{"features": _feature_values(row)} for row in rows]
+            artifact = self._model_artifact(version, active_only=True) if version else None
+            if artifact and eligible:
+                sample_rows = [{"features": _feature_values(row)} for row in eligible]
                 try:
                     scores, _ = self._predict_artifact(artifact, sample_rows)
-                    if len(scores) != len(rows) or not np.all(np.isfinite(scores)):
+                    if len(scores) != len(eligible) or not np.all(np.isfinite(scores)):
                         raise ValueError("model_rank_invalid")
-                    for row, score in zip(rows, scores):
+                    for row, score in zip(eligible, scores):
                         # Calibrated percentile ranking, never a main-rise probability.
                         row["learningRankScore"] = float(score)
                         row["learningRankVersion"] = version
-                    return sorted(rows, key=lambda item: item["learningRankScore"], reverse=True)
+                    for row in excluded:
+                        row["learningRankVersion"] = "rules_v1.1"
+                    return sorted(eligible, key=lambda item: item["learningRankScore"], reverse=True) + excluded
                 except Exception:
                     continue
         for row in rows:

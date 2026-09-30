@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-30T08:26:00.919Z",
+  "frontend": "Current Vue frontend built by Vite; real browser clicks and screenshots",
+  "frontendSourceCommit": "f54a706a2c06224f88d0f4529c4ea10fa7cfa33f",
+  "viewport": {
+    "width": 1280,
+    "height": 780
+  },
+  "fixture": "scripts/workspace-tour-fixture.cjs",
+  "marketSample": "docs/research/stockking-v11-market-sample.json",
+  "marketAsOf": "2026-09-29",
+  "disclosure": "UI demo fixtures plus historical prices; no real recommendation, current quote, executed trade, return, model performance or user data.",
+  "isolatedBrowser": true,
+  "network": "Loopback static assets only; all other requests blocked",
+  "backendStarted": false,
+  "calls": [
+    "GetConfig",
+    "IsTradingTime",
+    "IsHKTradingTime",
+    "IsUSTradingTime",
+    "GetEngineStatus",
+    "GetGroupList",
+    "GetAllGroupStocks",
+    "RefreshStockKingWatchlist",
+    "GetFollowList",
+    "GetStockKingPreference",
+    "SaveStockKingPreference",
+    "GetStockKLineWithFallback",
+    "GetResearchNote",
+    "GetForecast",
+    "GetStockKLinePageWithFallback",
+    "GetStockKingBackgroundLearning",
+    "GetStockKingAutoRecommendations",
+    "GetDisplayedKingPicks",
+    "GetStockKingBackgroundStatus",
+    "GetStockKingRecommendationHistory",
+    "GetStockKingRecordQuotes",
+    "GetStockKingDelayedReviews"
+  ],
+  "errors": [],
+  "blockedRequests": [],
+  "durationMs": 25950,
+  "screenshotCount": 19,
+  "gifFrameCount": 55,
+  "outputDimensions": [
+    1280,
+    958
+  ],
+  "loop": 0,
+  "gifBytes": 566842
+}

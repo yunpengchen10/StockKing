@@ -207,14 +207,20 @@ class DailyOpportunityService:
         if not codes:
             return {}
         if self.batch_quote_fetcher:
-            rows = {}
-            for start in range(0, len(codes), 20):
-                batch_codes = codes[start:start + 20]
+            def batch_quotes(batch_codes):
                 try:
                     batch = self.batch_quote_fetcher(batch_codes)
-                    rows.update({row['code']: clean(adapt_public_quote(batch, row)) for row in batch['quotes']})
+                    return {row['code']: clean(adapt_public_quote(batch, row)) for row in batch['quotes']
+                            if row.get('code') in batch_codes}
                 except Exception:
-                    rows.update({code: {} for code in batch_codes})
+                    return {code: {} for code in batch_codes}
+            # Bound provider load while avoiding a long serial quote tail on a
+            # broad research pool. Each quote retains its provider timestamp.
+            rows = {}
+            batches = [codes[start:start + 20] for start in range(0, len(codes), 20)]
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for batch in pool.map(batch_quotes, batches):
+                    rows.update(batch)
             return rows
         def one(code):
             try:
@@ -239,6 +245,16 @@ class DailyOpportunityService:
             if candidate.get('quote') is None:
                 continue
             state, gaps = validate_candidate(candidate, candidate['quote'], now, run['scanSlot'])
+            if 'minuteSourceTime' in candidate and state == 'conditional':
+                try:
+                    minute_at = datetime.fromisoformat(candidate.get('minuteSourceTime') or '')
+                    minute_fresh = minute_at.tzinfo is not None and 0 <= (now-minute_at).total_seconds() < 300
+                except (ValueError, TypeError):
+                    minute_fresh = False
+                if not minute_fresh:
+                    state = 'data_insufficient'
+                    gaps.append('完成时分钟价格结构已失效，需重新扫描')
+                    candidate['evidenceEligible'] = False
             candidate.update(status=state, stateLabel={'conditional':'条件观察','premarket':'盘前观察','expired':'已过期','windvane':'不可买风向标','data_insufficient':'数据不足'}[state])
             candidate['data_quality'] = {**candidate.get('data_quality', {}), 'gaps': list(dict.fromkeys(gaps + candidate.get('evidenceGaps', [])
                 + candidate.get('precisionDecision', {}).get('sourceContext', {}).get('gaps', [])))}
