@@ -54,6 +54,14 @@ node scripts/capture-workspace-tour.cjs
 
 The script builds the current frontend into the ignored `artifacts/workspace-tour/build` directory. It does not overwrite an installed application. `--skip-build` may be used only when iterating on a tour using an already-current build.
 
+已有截图时，可仅重编码到临时目录，不重录界面或改写来源记录：
+
+```powershell
+node scripts/capture-workspace-tour.cjs --encode-only artifacts/workspace-tour output/validation
+```
+
+Python 在内存中编码并解码验证图片，将字节数、SHA-256 和图片数据交给 Node 写入文件；Node 重读校验 GIF/PNG 文件头、字节数与哈希，防止本机文件过滤器使上传图片损坏。`--encode-only` only re-encodes existing frames; it does not recapture the UI or update provenance.
+
 ## 产物与验收 / Outputs and checks
 
 - [GIF](media/stockking-workspace-tour.gif)：README 自动循环动图。

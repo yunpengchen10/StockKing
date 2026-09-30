@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const http = require('node:http');
+const { createHash } = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const assert = require('node:assert/strict');
 const createFixture = require('./workspace-tour-fixture.cjs');
@@ -11,6 +12,48 @@ const frontend = path.join(root, 'desktop/frontend');
 const out = path.join(root, 'artifacts/workspace-tour');
 const build = path.join(out, 'build');
 const runtime = path.join(os.homedir(), '.cache/codex-runtimes/codex-primary-runtime/dependencies');
+
+function encodeTour(source, destination) {
+  const python = process.env.TOUR_PYTHON || (fs.existsSync(path.join(runtime, 'python/python.exe')) ? path.join(runtime, 'python/python.exe') : 'python');
+  const encoded = spawnSync(python, [path.join(__dirname, 'encode-workspace-tour.py'), source], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  if (encoded.error) throw encoded.error;
+  if (encoded.status !== 0) throw Error(`Tour encoding failed: ${encoded.stderr}`);
+  const { files, ...encoding } = JSON.parse(encoded.stdout.trim());
+  const expectedMedia = new Set(['stockking-workspace-tour.gif', 'stockking-workspace-tour.png']);
+  const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+  for (const file of files) {
+    assert.equal(path.basename(file.name), file.name, 'Encoded filename must be a basename');
+    assert(['media', 'review'].includes(file.target), 'Unknown encoded output target');
+    if (file.target === 'media') assert(expectedMedia.delete(file.name), 'Unexpected or repeated media output');
+    else assert(/^review-[\w.-]+\.png$/.test(file.name), 'Unexpected review output');
+    const bytes = Buffer.from(file.base64, 'base64');
+    const signature = file.name.endsWith('.gif') ? Buffer.from('GIF89a') : Buffer.from('89504e470d0a1a0a', 'hex');
+    assert(bytes.subarray(0, signature.length).equals(signature), `Invalid image signature: ${file.name}`);
+    assert.equal(bytes.length, file.bytes, `Encoded byte count mismatch: ${file.name}`);
+    assert.equal(sha256(bytes), file.sha256, `Encoded hash mismatch: ${file.name}`);
+    if (file.name.endsWith('.gif')) assert(bytes.length <= 5 * 1024 * 1024, 'GIF is larger than 5 MiB');
+    const directory = file.target === 'media' ? destination : source;
+    fs.mkdirSync(directory, { recursive: true });
+    const outputPath = path.join(directory, file.name);
+    fs.writeFileSync(outputPath, bytes);
+    const written = fs.readFileSync(outputPath);
+    assert(written.subarray(0, signature.length).equals(signature), `Written image signature changed: ${file.name}`);
+    assert.equal(written.length, file.bytes, `Written byte count changed: ${file.name}`);
+    assert.equal(sha256(written), file.sha256, `Written hash changed: ${file.name}`);
+  }
+  assert.equal(expectedMedia.size, 0, 'Encoder omitted a required media file');
+  encoding.outputs = files.filter(file => file.target === 'media').map(({ name, bytes, sha256 }) => ({ name, bytes, sha256 }));
+  return encoding;
+}
+
+const encodeOnlyIndex = process.argv.indexOf('--encode-only');
+if (encodeOnlyIndex !== -1) {
+  const source = process.argv[encodeOnlyIndex + 1], destination = process.argv[encodeOnlyIndex + 2];
+  if (!source || !destination) throw Error('Usage: --encode-only <frames-directory> <output-directory>');
+  console.log(JSON.stringify(encodeTour(path.resolve(source), path.resolve(destination)), null, 2));
+  process.exit(0);
+}
+
 let playwright;
 try { playwright = require(process.env.PLAYWRIGHT_MODULE || 'playwright'); }
 catch { playwright = require(path.join(runtime, 'node/node_modules/playwright')); }
@@ -121,14 +164,12 @@ const steps = [
       calls: [...new Set(calls.map(c => c.method))], errors, blockedRequests: blocked,
       durationMs: frames.reduce((sum, frame) => sum + frame.duration, 0), screenshotCount: frames.length,
     };
-    const python = process.env.TOUR_PYTHON || (fs.existsSync(path.join(runtime, 'python/python.exe')) ? path.join(runtime, 'python/python.exe') : 'python');
-    const encoded = spawnSync(python, [path.join(__dirname, 'encode-workspace-tour.py'), out, path.join(root, 'docs/media')], { encoding: 'utf8' });
-    if (encoded.status !== 0) throw Error(encoded.stdout + encoded.stderr);
-    const encoding = JSON.parse(encoded.stdout.trim());
+    const encoding = encodeTour(out, path.join(root, 'docs/media'));
     provenance.gifFrameCount = encoding.frames;
     provenance.outputDimensions = encoding.size;
     provenance.loop = 0;
     provenance.gifBytes = fs.statSync(path.join(root, 'docs/media/stockking-workspace-tour.gif')).size;
+    provenance.media = encoding.outputs;
     assert(provenance.gifBytes <= 5 * 1024 * 1024, 'GIF is larger than 5 MiB');
     fs.writeFileSync(path.join(root, 'docs/media/stockking-workspace-tour.provenance.json'), JSON.stringify(provenance, null, 2) + '\n');
     console.log(JSON.stringify(provenance, null, 2));
