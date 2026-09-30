@@ -7,8 +7,19 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from src.services.akshare_context import number
+from src.services.yao_scout.v11_factors import SCORE_VERSION
 
 VERSION = "king-precision-v1"
+V11_VERSION = "king-precision-v1.1"
+
+
+def v11_entry_ready(candidate):
+    """Canonical V1.1 entry gate shared with signal-time model validation."""
+    return bool(candidate.get('scoreVersion') == SCORE_VERSION
+                and candidate.get('evidenceEligible')
+                and number(candidate.get('finalScore')) is not None
+                and candidate.get('status') == 'conditional'
+                and '盘前' not in str(candidate.get('strategyBranch', '')))
 
 
 @dataclass(frozen=True)
@@ -52,12 +63,11 @@ def evaluate(candidate, context, daily=None):
     unlock = sum(number(r.get("floatRatioPct")) or 0 for r in context.get("unlocks", []))
     event_covered = all(context.get("coverage", {}).get(k) for k in ("forecast", "unlock"))
     premarket = candidate.get("status") == "premarket" or "盘前" in str(candidate.get("strategyBranch", ""))
-    if candidate.get('scoreVersion') == 'stockking-v1.1-rules':
+    if candidate.get('scoreVersion') == SCORE_VERSION:
         # V1.1 treats independently missing research factors as uncertainty.
         # The quote/identity, normal-trade and completed-minute structure gates
         # are already captured by evidenceEligible and candidate.status.
-        ready = bool(candidate.get('evidenceEligible') and candidate.get('finalScore') is not None
-                     and candidate.get('status') == 'conditional' and not premarket)
+        ready = v11_entry_ready(candidate)
         limitations = []
         if bias is None or extension is None:
             limitations.append('日线乖离或ATR缺失，未参与排序')
@@ -75,7 +85,7 @@ def evaluate(candidate, context, daily=None):
                          'entryEligible':ready,'reasons':[reason],
                          'uncertainties':limitations,'thresholds':asdict(rule)}
                     for key,rule in POLICIES.items()}
-        return {'version':'king-precision-v1.1','validationStatus':'uncalibrated_rules',
+        return {'version':V11_VERSION,'validationStatus':'uncalibrated_rules',
                 'probability':None,'metrics':{'biasMa5Pct':bias,'atrExtension':extension,
                     'trendConfirmed':trend,'rewardRisk':rr,
                     'unlock14dPct':unlock if context.get('coverage',{}).get('unlock') else None},

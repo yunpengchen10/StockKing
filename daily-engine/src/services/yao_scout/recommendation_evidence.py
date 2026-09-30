@@ -13,14 +13,27 @@ import pandas as pd
 from .daily_opportunities import finite, quote_check, is_market_open
 
 VERSION = 'king-evidence-20260920'
-RESEARCH_LIMIT = 30
 
 
-def research_queue(frame, limit=RESEARCH_LIMIT):
-    """Union of activity/recovery leaders; no fixed return band or branch quota."""
+def research_queue_limit(universe_size: int) -> int:
+    """Research at least 300 unique stocks, or 10% of a larger universe."""
+    if universe_size < 0:
+        raise ValueError('universe_size must not be negative')
+    return min(universe_size, max(300, (universe_size + 9) // 10))
+
+
+def research_queue(frame, limit=None):
+    """Prioritize activity/recovery leaders within a universe-sized research budget."""
+    if limit is not None and limit < 0:
+        raise ValueError('research limit must not be negative')
     if frame.empty:
         return []
-    data = frame.copy()
+    # Repeated provider rows must not crowd out another stock or inflate the budget.
+    data = frame.drop_duplicates('code').copy()
+    if limit is None:
+        limit = research_queue_limit(len(data))
+    if limit == 0:
+        return []
     ranks = []
     for key in ('amount', 'volume_ratio', 'turnover_rate'):
         values = pd.to_numeric(data.get(key, pd.Series(index=data.index, dtype=float)), errors='coerce')

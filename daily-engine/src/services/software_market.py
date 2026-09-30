@@ -10,12 +10,13 @@ import requests
 
 
 class SoftwareMarketClient:
-    def __init__(self, url='', token=''):
+    def __init__(self, url='', token='', *, read_timeout=110):
         parsed = urlparse(url)
         if url and (parsed.scheme != 'http' or parsed.hostname != '127.0.0.1' or
                     not parsed.port or parsed.username or parsed.password or parsed.path not in ('', '/')):
             raise ValueError('Software market gateway must be an authenticated IPv4 loopback endpoint')
         self.url, self.token = url.rstrip('/'), token
+        self.read_timeout = max(.1, float(read_timeout))
 
     @classmethod
     def from_environment(cls):
@@ -31,7 +32,7 @@ class SoftwareMarketClient:
         with requests.Session() as session:
             session.trust_env = False
             response = session.post(self.url + '/v1/' + path, json=payload,
-                headers={'X-Stock-King-Market-Token': self.token}, timeout=(3, 110), allow_redirects=False)
+                headers={'X-Stock-King-Market-Token': self.token}, timeout=(min(3, self.read_timeout), self.read_timeout), allow_redirects=False)
             if response.status_code != 200:
                 raise RuntimeError(f'Software market gateway returned {response.status_code}')
             return response.json()

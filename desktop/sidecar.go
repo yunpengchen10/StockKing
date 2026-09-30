@@ -305,7 +305,14 @@ func (m *SidecarManager) Request(ctx context.Context, method, path string, input
 		return err
 	}
 	defer resp.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	var responseBody io.Reader = resp.Body
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Keep diagnostics bounded, but never truncate a successful response.
+		// Saved recommendation snapshots can legitimately exceed 16 MiB;
+		// cutting their JSON at that boundary makes intact records unreadable.
+		responseBody = io.LimitReader(resp.Body, 64<<10)
+	}
+	payload, err := io.ReadAll(responseBody)
 	if err != nil {
 		return err
 	}

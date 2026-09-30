@@ -76,6 +76,38 @@ def test_manual_live_refresh_does_not_wait_for_schedule(monkeypatch, tmp_path):
     assert len(events) == 2
 
 
+def test_manual_progress_tracks_evidence_stages_and_usable_minutes(monkeypatch, tmp_path):
+    start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path)
+    progress = []
+    service.progress_callback = lambda value, message: progress.append((value, message))
+    result = service.run('live')
+    assert [value for value, _ in progress] == [12, 20, 32, 48, 60, 72, 80, 88, 94]
+    assert result['dataQuality']['minute_coverage'] == {'requested': 1, 'usable': 1, 'missing': 0}
+    assert 'minute_warmup' not in result['dataQuality']['stageTimingsMs']
+    assert set(result['dataQuality']['stageTimingsMs']) >= {'snapshot', 'daily_history', 'minute_evidence', 'final_quotes', 'evaluation'}
+    from src.services.yao_scout.local_algorithm import algorithm_contract, is_entry_eligible
+    assert result['algorithm'] == algorithm_contract()
+    for candidate in result['candidates']:
+        assert candidate['algorithmContractId'] == result['algorithm']['contractId']
+        assert is_entry_eligible(candidate)
+
+
+def test_total_minute_stage_failure_is_reported_even_with_fresh_quotes(monkeypatch, tmp_path):
+    start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path)
+    original = local.bounded_fetch_map
+    def fail_minutes(fetch, items, **kwargs):
+        return ([], list(items)) if fetch.__name__ == 'minutes_for' else original(fetch, items, **kwargs)
+    monkeypatch.setattr(local, 'bounded_fetch_map', fail_minutes)
+    result = service.run('live')
+    assert result['dataQuality']['quote_coverage']['fresh'] == 1
+    assert result['dataQuality']['minute_coverage'] == {'requested': 1, 'usable': 0, 'missing': 1}
+    assert result['dataQuality']['stageIncompleteCounts']['minute_evidence'] == 1
+    from src.services.stock_king_display import displayable_run
+    assert not displayable_run(result)
+
+
 def test_local_daily_history_reuses_software_chart_provider(monkeypatch, tmp_path):
     from src.services import software_market
     start = datetime(2026, 9, 14, 10, 30, tzinfo=base.TZ)
@@ -167,3 +199,190 @@ def test_daily_review_wires_observations_and_new_ledger(monkeypatch, tmp_path):
     assert result['learningReview']['updated'] == 0
     assert events == [('snapshot',start)] and result['llmUsed'] is False
     assert captured==['600001'] and result['minuteArchiveMaintenance']['updated']==1
+
+
+def test_expanded_prescreen_researches_every_stock_in_a_small_universe(monkeypatch, tmp_path):
+    from src.services import software_market
+    start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path)
+    codes = [f'{600001 + i:06d}' for i in range(45)]
+    frame = pd.DataFrame({'code': codes, 'name': ['测试股'] * len(codes),
+                          'price': [10] * len(codes), 'amount': list(range(45, 0, -1))})
+    service.yao._fetch_snapshot = lambda: frame
+    monkeypatch.setattr(software_market.SoftwareMarketClient, 'from_environment',
+                        lambda: SimpleNamespace(available=False))
+    history_codes, minute_codes = [], []
+    original_history, original_minutes = service.yao.history_fetcher, service.minute_fetcher
+    def history(code, **kwargs):
+        history_codes.append(code)
+        return original_history(code, **kwargs)
+    def minutes(code, *args, **kwargs):
+        minute_codes.append(code)
+        return original_minutes(code, *args, **kwargs)
+    service.yao.history_fetcher, service.minute_fetcher = history, minutes
+    result = service.run('live')
+    assert set(history_codes) == set(minute_codes) == set(codes)
+    assert result['dataQuality']['research_universe_count'] == 45
+    assert result['dataQuality']['research_count'] == 45
+    assert result['dataQuality']['research_limit'] == 45
+    assert result['dataQuality']['research_policy'] == 'mainboard_10pct_min300_v1'
+    assert result['dataQuality']['deep_research_count'] == 45
+    budgets = result['dataQuality']['stageBudgetsSeconds']
+    assert budgets['daily_history'] == 50
+    assert budgets['minute_evidence'] == 70
+    assert budgets['fund_evidence'] == 24
+    assert result['dataQuality']['minute_coverage'] == {'requested': 45, 'usable': 45, 'missing': 0}
+    assert result['learningLedger']['researchCount'] == 45
+    assert all(len(rows) <= 5 for rows in result['profileCandidates'].values())
+
+
+def test_quote_batches_run_concurrently_and_one_failure_preserves_other_batches(monkeypatch):
+    from threading import Barrier, Lock
+    codes = [f'{600001 + i:06d}' for i in range(45)]
+    barrier, lock = Barrier(3, timeout=3), Lock()
+    entered, passed = [], []
+    def fetch_batch(batch_codes):
+        with lock:
+            entered.append(tuple(batch_codes))
+        barrier.wait()
+        with lock:
+            passed.append(tuple(batch_codes))
+        if codes[20] in batch_codes:
+            raise ValueError('fixture provider batch failure')
+        return {'quotes': [{'code': code, 'quote': {'code': code, 'price': 10}}
+                           for code in [*batch_codes, '601999']]}
+    monkeypatch.setattr(base, 'adapt_public_quote', lambda batch, row: row['quote'])
+    service = base.DailyOpportunityService(SimpleNamespace(db=None), batch_quote_fetcher=fetch_batch)
+    quotes = service._quotes(codes)
+    assert len(entered) == len(passed) == 3
+    assert sorted(len(batch) for batch in entered) == [5, 20, 20]
+    assert set(quotes) == set(codes)
+    assert all(quotes[code] == {} for code in codes[20:40])
+    assert all(quotes[code] == {'code': code, 'price': 10} for code in codes[:20] + codes[40:])
+
+
+def test_slow_optional_evidence_refreshes_minutes_before_final_quotes(monkeypatch, tmp_path):
+    start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
+    service, tick, events, _ = make_service(monkeypatch, start, tmp_path)
+    original_minutes, original_funds = service.minute_fetcher, service.fund_fetcher
+    original_sectors = service.sector_fetcher
+    service.sector_fetcher = lambda *args: {
+        code: {**packet, 'confirmed': True} for code, packet in original_sectors(*args).items()}
+    fetched_minutes = []
+    def minutes(*args):
+        fetched_minutes.append(tick[0])
+        return original_minutes(*args)
+    def slow_funds(*args):
+        packet = original_funds(*args)
+        tick[0] += timedelta(seconds=241)
+        return packet
+    service.minute_fetcher, service.fund_fetcher = minutes, slow_funds
+    result = service.run('live')
+    assert fetched_minutes == [start, start + timedelta(seconds=241)]
+    assert result['dataQuality']['minute_refresh_count'] == 1
+    assert result['dataQuality']['minute_coverage']['usable'] == 1
+    assert result['dataQuality']['quote_coverage']['fresh'] == 1
+    assert result['dataQuality']['independent_evidence']['sector_confirmed'] == 0
+    assert result['dataQuality']['independent_evidence']['fund_source_available'] == 0
+    assert events[-1] == ('quote', tick[0])
+    assert result['candidates']
+    candidate = result['candidates'][0]
+    assert candidate['minuteSourceTime'] == (tick[0] - timedelta(minutes=1)).isoformat()
+    evidence = {row['key']: row for row in candidate['indicatorEvidence']}
+    assert evidence['main_net_flow_3m']['value'] is None
+    assert evidence['sector_relative_5m_pct']['value'] is None
+
+
+@pytest.mark.parametrize('minute_age, eligible', [(299, True), (300, False)])
+def test_completion_requires_fresh_minutes_even_when_quotes_are_fresh(monkeypatch, tmp_path, minute_age, eligible):
+    start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path)
+    result = service.run('live')
+    assert result['candidates']
+    collections = [result.get(key, []) for key in
+                   ('candidates', 'controls', 'precisionResearch', 'precisionWatchlist', 'windvanes', 'evidenceInsufficient')]
+    collections.extend(result['profileCandidates'].values())
+    for rows in collections:
+        for candidate in rows:
+            candidate['minuteSourceTime'] = (start - timedelta(seconds=minute_age)).isoformat()
+    service._finish_quotes(result, result['dataQuality'])
+    assert bool(result['candidates']) is eligible
+    assert result['dataQuality']['quote_coverage']['fresh'] == 1
+    if not eligible:
+        assert not any(result['profileCandidates'].values())
+        candidate = result['precisionWatchlist'][0]
+        assert candidate['evidenceEligible'] is False
+        assert any('分钟价格结构已失效' in gap for gap in candidate['data_quality']['gaps'])
+
+
+def test_official_expanded_stage_budgets_stay_inside_delivery_deadline(monkeypatch, tmp_path):
+    from src.services import software_market
+    target = datetime(2026, 9, 14, 10, 30, tzinfo=base.TZ)
+    service, tick, _, _ = make_service(monkeypatch, target + timedelta(seconds=60), tmp_path)
+    frame = pd.DataFrame({'code': [f'{600001 + i:06d}' for i in range(45)],
+                          'name': ['测试股'] * 45, 'price': [10] * 45})
+    service.yao._fetch_snapshot = lambda: frame
+    monkeypatch.setattr(software_market.SoftwareMarketClient, 'from_environment',
+                        lambda: SimpleNamespace(available=False))
+    original_collect = service.context_provider.collect
+    def collect(now):
+        tick[0] += timedelta(seconds=15)
+        return original_collect(now)
+    service.context_provider.collect = collect
+    original_sectors = service.sector_fetcher
+    def sectors(*args, **kwargs):
+        packet = original_sectors(*args, **kwargs)
+        tick[0] += timedelta(seconds=30)
+        return packet
+    service.sector_fetcher = sectors
+    original_map, observed_budgets = local.bounded_fetch_map, []
+    def fetch_map(fetch, items, **kwargs):
+        observed_budgets.append((kwargs['timeout'], (target + timedelta(seconds=120) - tick[0]).total_seconds()))
+        return original_map(fetch, items, **kwargs)
+    monkeypatch.setattr(local, 'bounded_fetch_map', fetch_map)
+    service.sleeper = lambda seconds: pytest.fail('a late official scan must not wait for its target')
+    result = service.run('1030', official=True)
+    assert result['official'] is True
+    assert result['delivery']['late_seconds'] == 105
+    assert observed_budgets and all(0 <= budget <= remaining for budget, remaining in observed_budgets)
+    budgets = result['dataQuality']['stageBudgetsSeconds']
+    assert budgets['daily_history'] == 50
+    assert budgets['minute_evidence'] == 45
+    assert budgets['fund_evidence'] == 15
+    assert budgets['final_quotes'] == 15
+
+
+def test_timed_out_quote_group_keeps_already_completed_groups(monkeypatch, tmp_path):
+    from threading import Event
+    from src.services import software_market
+    start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path)
+    codes = [f'{600001 + i:06d}' for i in range(45)]
+    frame = pd.DataFrame({'code': codes, 'name': ['测试股'] * 45, 'price': [10] * 45})
+    service.yao._fetch_snapshot = lambda: frame
+    monkeypatch.setattr(software_market.SoftwareMarketClient, 'from_environment',
+                        lambda: SimpleNamespace(available=False))
+    release, slow_started = Event(), Event()
+    def grouped_quotes(group):
+        if codes[20] in group:
+            slow_started.set()
+            release.wait(timeout=1)
+        return {code: service.quote_fetcher(code) for code in group}
+    service._quotes = grouped_quotes
+    original_map = local.bounded_fetch_map
+    def fetch_map(fetch, items, **kwargs):
+        if fetch is grouped_quotes:
+            kwargs['timeout'] = .05
+        return original_map(fetch, items, **kwargs)
+    monkeypatch.setattr(local, 'bounded_fetch_map', fetch_map)
+    try:
+        result = service.run('live')
+        assert slow_started.is_set()
+        assert result['dataQuality']['stageIncompleteCounts']['final_quotes'] == 1
+        assert result['dataQuality']['quote_coverage']['requested'] == 45
+        assert result['dataQuality']['quote_coverage']['fresh'] == 25
+        assert result['dataQuality']['quote_coverage']['missing'] == 20
+        assert result['candidates']
+        assert not ({row['code'] for row in result['candidates']} & set(codes[20:40]))
+    finally:
+        release.set()

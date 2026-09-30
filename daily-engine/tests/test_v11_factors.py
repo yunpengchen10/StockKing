@@ -68,6 +68,11 @@ def test_v11_weights_final_risk_and_uncalibrated_outputs():
     assert score['dataConfidence'] < 1
     assert score['confidenceStatus']=='complete'
     assert score['observableStructure']=='分钟局部突破观察'
+    from src.services.yao_scout.local_algorithm import algorithm_contract
+    contract = algorithm_contract()
+    assert score['scoreVersion'] == contract['scoreVersion']
+    assert score['riskPenaltyCoefficient'] == contract['riskPenaltyCoefficient']
+    assert score['factorWeightsApplied']['early']['M'] == pytest.approx(contract['weights']['early']['M']/.8, abs=1e-6)
 
 
 def test_v11_under_five_days_only_nulls_historical_factors():

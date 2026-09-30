@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 import numpy as np
 
 from src.services.yao_scout.signal_learning import SignalLearningService, TZ
+from src.services.yao_scout.local_algorithm import algorithm_contract
 
 
 def _clock(day: date, hour: int = 9, minute: int = 40, second: int = 35) -> datetime:
@@ -11,7 +12,12 @@ def _clock(day: date, hour: int = 9, minute: int = 40, second: int = 35) -> date
 
 
 def _candidate(code: str, day: date, *, price: float = 10.0) -> dict:
+    contract = algorithm_contract()
     return {
+        "algorithmContractId": contract["contractId"], "scoreVersion": contract["scoreVersion"],
+        "status": "conditional", "evidenceEligible": True,
+        "precisionDecision": {"version": contract["entryPolicyVersion"],
+                              "profiles": {"regular": {"entryEligible": True}}},
         "code": code, "name": "样本", "decision_at": _clock(day, second=30).isoformat(),
         "signalPrice": price, "referencePrice": price, "baselineHistoryDays": 5,
         "quote": {"price": price, "pre_close": price, "limit_up": 11.0,
@@ -51,7 +57,7 @@ def test_persist_first_official_run_and_pending_reviews(tmp_path):
     service = SignalLearningService(tmp_path, calendar_provider=lambda a, b: [d for d in days if a <= d <= b],
                                     clock=lambda: _clock(days[0]))
     first = {"status": "completed_observations", "candidates": [_candidate("000001", days[0])],
-             "controls": [_candidate("000002", days[0])], "modelVersion": "king-v1.1-rules"}
+             "controls": [_candidate("000002", days[0])], "modelVersion": algorithm_contract()["scoreVersion"]}
     saved = service.persist_scan(first, "0940", _clock(days[0]), True)
     replay = service.persist_scan({"status": "completed_observations", "candidates": []},
                                   "0940", _clock(days[0]), True)
@@ -60,11 +66,11 @@ def test_persist_first_official_run_and_pending_reviews(tmp_path):
     assert len(replay["candidates"]) == 1
     history = service.history({"date": days[0].isoformat(), "symbol": "000001"})
     assert len(history["items"]) == 1
-    assert history["items"][0]["modelVersion"] == "king-v1.1-rules"
-    assert len(service.history({"version": "king-v1.1-rules"})["items"]) == 1
+    assert history["items"][0]["modelVersion"] == algorithm_contract()["scoreVersion"]
+    assert len(service.history({"version": algorithm_contract()["scoreVersion"]})["items"]) == 1
     assert len(history["items"][0]["signals"]) == 1
     assert len(service.reviews({"date": days[0].isoformat()})["items"]) == 6
-    assert len(service.reviews({"version": "king-v1.1-rules"})["items"]) == 6
+    assert len(service.reviews({"version": algorithm_contract()["scoreVersion"]})["items"]) == 6
     assert {item["status"] for item in service.reviews()["items"]} == {"pending"}
     service.persist_scan({"status": "missed_slot", "candidates": [], "controls": [_candidate("000003", days[0])]},
                          "0955", _clock(days[0], 9, 55), True)
@@ -103,7 +109,8 @@ def test_first_minute_limit_up_stays_cash_and_missing_source_limit_unverified(tm
     service = SignalLearningService(tmp_path, bar_fetcher=lambda code, cutoff: bars,
                                     calendar_provider=lambda a, b: [d for d in days if a <= d <= b],
                                     clock=lambda: _clock(days[0]))
-    service.persist_scan({"status": "completed_observations", "candidates": [_candidate("000001", days[0])]},
+    service.persist_scan({"status": "completed_observations", "modelVersion": algorithm_contract()["scoreVersion"],
+                          "candidates": [_candidate("000001", days[0])]},
                          "0940", _clock(days[0]), True)
     result = service.review_due(_clock(days[5], 15, 30))
     assert {item["status"] for item in result["items"]} == {"no_fill"}
@@ -192,7 +199,7 @@ def test_corrupt_or_nonfinite_champion_falls_back_to_rule_rank(tmp_path, monkeyp
     ranked = service.rank_candidates(candidates)
     assert [row["code"] for row in ranked] == ["000002", "000001"]
     assert all(row["learningRankVersion"] == "rules_v1.1" for row in ranked)
-    monkeypatch.setattr(service, "_model_artifact", lambda version: {"version": "corrupt"})
+    monkeypatch.setattr(service, "_model_artifact", lambda version, **_: {"version": "corrupt"})
     monkeypatch.setattr(service, "_predict_artifact", lambda artifact, rows: (
         np.array([np.nan, 80.0]), np.array([0.5, 0.5])))
     assert [row["code"] for row in service.rank_candidates(candidates)] == ["000002", "000001"]

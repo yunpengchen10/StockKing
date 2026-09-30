@@ -3,6 +3,7 @@ package data
 // The desktop chart and the loopback research gateway use this one cache.
 // Cached timestamps describe receipt, never the exchange quote time.
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
@@ -139,6 +140,15 @@ var sharedRawQuotes = struct {
 }{entries: make(map[string]rawQuoteCacheItem)}
 
 func FetchSharedQuotePayload(source string, symbols []string) (string, string, error) {
+	return FetchSharedQuotePayloadContext(context.Background(), source, symbols)
+}
+
+// FetchSharedQuotePayloadContext keeps interactive quote requests cancellable
+// without changing the timeout used by the application's other market requests.
+func FetchSharedQuotePayloadContext(ctx context.Context, source string, symbols []string) (string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
 	codes := strings.Join(symbols, ",")
 	key := source + ":" + codes
 	sharedRawQuotes.Lock()
@@ -151,7 +161,7 @@ func FetchSharedQuotePayload(source string, symbols []string) (string, string, e
 	if source == "sina" {
 		address, referer = "https://hq.sinajs.cn/list="+codes, "https://finance.sina.com.cn/"
 	}
-	response, err := SharedHTTPClient.R().SetHeader("Referer", referer).SetHeader("User-Agent", "Mozilla/5.0").Get(address)
+	response, err := SharedHTTPClient.R().SetContext(ctx).SetHeader("Referer", referer).SetHeader("User-Agent", "Mozilla/5.0").Get(address)
 	if err != nil {
 		return "", "", err
 	}

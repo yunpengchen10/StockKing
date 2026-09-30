@@ -5,7 +5,7 @@ SetCompressor /SOLID lzma
 !define INFO_COMPANYNAME "Stock King"
 !define INFO_PRODUCTNAME "Stock King"
 !ifndef INFO_PRODUCTVERSION
-    !define INFO_PRODUCTVERSION "2.6.1"
+    !define INFO_PRODUCTVERSION "2.6.2"
 !endif
 !define PRODUCT_EXECUTABLE "Stock King.exe"
 !define REQUEST_EXECUTION_LEVEL "user"

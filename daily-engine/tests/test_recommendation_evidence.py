@@ -4,7 +4,9 @@ import pandas as pd
 import pytest
 
 from src.services.yao_scout.daily_opportunities import TZ
-from src.services.yao_scout.recommendation_evidence import daily_evidence, explain_candidate, research_queue
+from src.services.yao_scout.recommendation_evidence import (
+    daily_evidence, explain_candidate, research_queue, research_queue_limit,
+)
 
 NOW = datetime(2026, 9, 15, 10, 30, tzinfo=TZ)
 
@@ -103,6 +105,64 @@ def test_research_queue_has_no_gain_filter_and_does_not_reward_gain_alone():
                          {'code':'600002','change_pct':-5,'amount':1000,'volume_ratio':3,'turnover_rate':10}])
     assert research_queue(rows, 1)[0]['code'] == '600002'
     assert len(research_queue(rows)) == 2
+
+
+@pytest.mark.parametrize('size, expected', [
+    (0, 0), (30, 30), (80, 80), (300, 300), (301, 300),
+    (3000, 300), (3052, 306), (5000, 500),
+])
+def test_research_queue_budget_scales_with_unique_universe(size, expected):
+    rows = pd.DataFrame({'code': [f'{600000 + i:06d}' for i in range(size)],
+                         'amount': list(range(size, 0, -1))})
+    assert research_queue_limit(size) == expected
+    queued = research_queue(rows)
+    assert len(queued) == expected
+    assert [row['code'] for row in queued] == rows.code.head(expected).tolist()
+
+
+def test_research_queue_explicit_budget_can_be_small_zero_or_larger_than_universe():
+    rows = pd.DataFrame({'code': ['600001', '600002', '600003'], 'amount': [1, 3, 2]})
+    assert [row['code'] for row in research_queue(rows, 1)] == ['600002']
+    assert research_queue(rows, 0) == []
+    assert len(research_queue(rows, 1000)) == 3
+    with pytest.raises(ValueError, match='negative'):
+        research_queue(rows, -1)
+    with pytest.raises(ValueError, match='negative'):
+        research_queue(pd.DataFrame(), -1)
+    with pytest.raises(ValueError, match='negative'):
+        research_queue_limit(-1)
+
+
+def test_research_queue_keeps_missing_activity_and_negative_returns_in_coverage():
+    rows = pd.DataFrame([
+        {'code': '600001', 'amount': 100, 'change_pct': -9.5},
+        {'code': '600002', 'change_pct': -4},
+        {'code': '600003'},
+    ])
+    queued = research_queue(rows)
+    assert [row['code'] for row in queued] == ['600001', '600002', '600003']
+    assert pd.isna(queued[1]['amount']) and pd.isna(queued[2]['amount'])
+
+
+def test_research_queue_remains_a_union_of_independent_activity_leaders():
+    rows = pd.DataFrame([
+        {'code': '600001', 'amount': 1000, 'volume_ratio': 1, 'turnover_rate': 1, 'open': 10, 'price': 10},
+        {'code': '600002', 'amount': 1, 'volume_ratio': 10, 'turnover_rate': 1, 'open': 10, 'price': 10},
+        {'code': '600003', 'amount': 1, 'volume_ratio': 1, 'turnover_rate': 10, 'open': 10, 'price': 10},
+        {'code': '600004', 'amount': 1, 'volume_ratio': 1, 'turnover_rate': 1, 'open': 10, 'price': 11},
+        {'code': '600000', 'amount': 2, 'volume_ratio': 2, 'turnover_rate': 2, 'open': 10, 'price': 10.5},
+    ])
+    assert [row['code'] for row in research_queue(rows, 4)] == ['600001', '600002', '600003', '600004']
+
+
+def test_research_queue_duplicates_cannot_consume_slots_or_expand_default_budget():
+    unique = pd.DataFrame({'code': [f'{600000 + i:06d}' for i in range(3052)],
+                          'amount': list(range(3052, 0, -1))})
+    rows = pd.concat([unique.iloc[:1]] * 3000 + [unique], ignore_index=True)
+    queued = research_queue(rows)
+    assert len(queued) == research_queue_limit(3052) == 306
+    assert len({row['code'] for row in queued}) == 306
+    assert [row['code'] for row in research_queue(rows, 2)] == ['600000', '600001']
 
 
 def test_fallback_score_label_does_not_claim_a_qualified_model(tmp_path):

@@ -17,6 +17,7 @@ RISK_WEIGHTS = {'volumeExhaustion': .20, 'priceInefficiency': .20,
                 'vwapBreak': .15, 'lowerHigh': .15, 'sectorDivergence': .10,
                 'activeSell': .10, 'failedBreakout': .10}
 SCORE_VERSION = 'stockking-v1.1-rules'
+RISK_PENALTY_COEFFICIENT = .2
 
 
 def _number(value):
@@ -61,7 +62,7 @@ def score_v11(candidate, minute, *, now=None):
               'low' if max(days,price_days) >= 5 else 'insufficient')
     base = {'scoreVersion': SCORE_VERSION, 'scoreMeaning':
             'V1.1可观察因子启发式排序；非概率、收益预测或已成交绩效',
-            'riskPenaltyCoefficient': .2, 'riskPenaltyCoefficientStatus': 'unvalidated_initial',
+            'riskPenaltyCoefficient': RISK_PENALTY_COEFFICIENT, 'riskPenaltyCoefficientStatus': 'unvalidated_initial',
             'historicalCoverageDays': days, 'baselineHistoryDays': days,
             'priceHistoricalCoverageDays': price_days,
             'confidenceStatus': status, 'probabilityStatus': 'withheld_until_calibrated',
@@ -201,7 +202,7 @@ def score_v11(candidate, minute, *, now=None):
     base.update(factorScores={key:round(value,4) if value is not None else None for key,value in {**factors,'T':turnover_score}.items()},
                 earlyScore=round(early,4) if early is not None else None,
                 mainRiseScore=round(main,4) if main is not None else None,
-                finalScore=round(_clamp(max(early,main)-.2*distribution),4) if early is not None and main is not None and distribution is not None and freshness else None,
+                finalScore=round(_clamp(max(early,main)-RISK_PENALTY_COEFFICIENT*distribution),4) if early is not None and main is not None and distribution is not None and freshness else None,
                 distributionRisk=round(distribution,4) if distribution is not None else None,
                 turnoverScore=round(turnover_score,4) if turnover_score is not None else None,
                 tradabilityScore=round(tradability_score,4) if tradability_score is not None else None,

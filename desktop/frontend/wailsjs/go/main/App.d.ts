@@ -264,6 +264,12 @@ export function GetKingPicks(arg1:number,arg2:boolean):Promise<Record<string, an
 
 export function GetKingPicksHistory(arg1:number):Promise<Record<string, any>>;
 
+export function StartKingPicksRefresh(arg1:number):Promise<Record<string, any>>;
+
+export function GetKingPicksRefreshTask(arg1:string):Promise<Record<string, any>>;
+
+export function GetDisplayedKingPicks():Promise<Record<string, any>>;
+
 export function GetLatestKingPicks(arg1:string):Promise<Record<string, any>>;
 
 export function GetLatestTradingDay():Promise<string>;
@@ -345,6 +351,8 @@ export function GetStockKingLearningState():Promise<Record<string, any>>;
 export function GetStockKingPreference(arg1:string):Promise<string>;
 
 export function GetStockKingRecommendationHistory(arg1:string,arg2:string,arg3:string):Promise<Record<string, any>>;
+
+export function GetStockKingRecordQuotes(arg1:Array<string>):Promise<Record<string, any>>;
 
 export function GetStockKingResearchEvidence(arg1:string):Promise<Record<string, any>>;
 

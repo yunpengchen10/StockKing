@@ -270,6 +270,51 @@ func (a *App) GetKingPicks(maxPerBoard int, force bool) (map[string]any, error) 
 	return result, nil
 }
 
+// StartKingPicksRefresh starts only the local picks scan. The short request
+// returns a task ID; polling never holds a Wails call open for the full scan.
+func (a *App) StartKingPicksRefresh(maxPerBoard int) (map[string]any, error) {
+	if maxPerBoard < 5 {
+		maxPerBoard = 5
+	}
+	if maxPerBoard > 50 {
+		maxPerBoard = 50
+	}
+	return a.kingPicksControl(http.MethodPost, "/api/v1/stock-king/picks/refresh", map[string]any{
+		"max_per_board": maxPerBoard, "force": true, "scan_slot": "live", "top_n": 5, "official": false,
+	})
+}
+
+func (a *App) GetKingPicksRefreshTask(taskID string) (map[string]any, error) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return nil, fmt.Errorf("本地精选刷新任务编号为空")
+	}
+	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/refresh/tasks/"+url.PathEscape(taskID), nil)
+}
+
+// GetDisplayedKingPicks reads the durable display snapshot. Scheduled scans
+// cannot overwrite it, and this read never starts a new scan.
+func (a *App) GetDisplayedKingPicks() (map[string]any, error) {
+	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/display", nil)
+}
+
+func (a *App) kingPicksControl(method, path string, input any) (map[string]any, error) {
+	if a.sidecar == nil {
+		return nil, fmt.Errorf("Daily engine manager is unavailable")
+	}
+	parent := a.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+	defer cancel()
+	var output map[string]any
+	if err := a.sidecar.Request(ctx, method, path, input, &output); err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
 // GetLatestKingPicks returns the last persisted adaptive result without starting
 // another market scan. It is used when the user comes back to the page so the
 // previous recommendation remains visible immediately.
