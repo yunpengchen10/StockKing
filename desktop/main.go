@@ -167,7 +167,7 @@ func main() {
 		WindowStartState:         options.Normal,
 		SingleInstanceLock: &options.SingleInstanceLock{
 			UniqueId:               "stock-king",
-			OnSecondInstanceLaunch: OnSecondInstanceLaunch,
+			OnSecondInstanceLaunch: app.onSecondInstanceLaunch,
 		},
 		Bind: []interface{}{
 			app,

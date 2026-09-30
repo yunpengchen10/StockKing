@@ -261,11 +261,18 @@ print(json.dumps(records, ensure_ascii=True))
 
     # After launching, database migrations may occur. Keep backups and never
     # automatically restore old databases over newly written user state.
-    $started = Start-Process -FilePath $installedExe -WorkingDirectory $installRoot -WindowStyle Hidden -PassThru
+    # This is the user's desktop window, not a background helper. A hidden
+    # launch holds the single-instance lock while making the app inaccessible.
+    $started = Start-Process -FilePath $installedExe -WorkingDirectory $installRoot -WindowStyle Normal -PassThru
     $newAppStarted = $true
-    Start-Sleep -Seconds 3
-    $started.Refresh()
-    if ($started.HasExited) { throw 'The new desktop process exited during startup; see application logs and the retained backups.' }
+    $windowDeadline = (Get-Date).AddSeconds(30)
+    do {
+        Start-Sleep -Milliseconds 500
+        $started.Refresh()
+        if ($started.HasExited) { throw 'The new desktop process exited during startup; see application logs and the retained backups.' }
+    } while ($started.MainWindowHandle -eq 0 -and (Get-Date) -lt $windowDeadline)
+    if ($started.MainWindowHandle -eq 0) { throw 'The desktop process has no visible window; see application logs and the retained backups.' }
+    $manifest['desktopWindowVerified'] = $true
     $manifest.phase = 'completed'
     $manifest['completedAtUtc'] = [DateTime]::UtcNow.ToString('o')
     Save-Manifest

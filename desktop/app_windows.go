@@ -5,13 +5,8 @@ package main
 
 import (
 	"fmt"
-	"go-stock/backend/logger"
 	"syscall"
-	"time"
 	"unsafe"
-
-	"github.com/wailsapp/wails/v2/pkg/options"
-	"go-stock/internal/windowstoast"
 )
 
 const (
@@ -19,22 +14,6 @@ const (
 	mdtEffectiveDpi         = 0
 	logicalDpi              = 96
 )
-
-func OnSecondInstanceLaunch(secondInstanceData options.SecondInstanceData) {
-	notification := toast.Notification{
-		AppID:    "Stock King",
-		Title:    "Stock King",
-		Message:  "程序已经在运行了",
-		Icon:     "",
-		Duration: "short",
-		Audio:    toast.Default,
-	}
-	err := notification.Push()
-	if err != nil {
-		logger.SugaredLogger.Error(err)
-	}
-	time.Sleep(time.Second * 3)
-}
 
 func getFrameless() bool {
 	return true

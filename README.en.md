@@ -22,7 +22,9 @@ AI tools can reuse the same quotes through the [read-only MCP quote service](quo
 
 ## Quick start
 
-1. If you have the Mac package, extract `Stock-King-macos-arm64.zip`, copy `Stock King.app` to `/Applications`, open it, and confirm the interface says “已连接” (Connected). This does not require installing Python, Go or Node.js. Windows uses a platform-native wheel. You can also obtain the source from this public repository and follow [local building and distribution](docs/LOCAL_BUILD.en.md); no Actions, paid build platform or cloud server is required.
+Windows v2.6.1 includes a one-click `Stock-King-Setup-x64-v2.6.1.exe` installer with the local engine and offline WebView2. No Python, Go or Node.js installation is needed. It fixes hidden windows after updates and restores the existing window on repeated launches. See [installation and launch-fix instructions](docs/WINDOWS_INSTALL.en.md). The wheel below is an optional installation method.
+
+1. If you have the Mac package, extract `Stock-King-macos-arm64.zip`, copy `Stock King.app` to `/Applications`, open it, and confirm the interface says “已连接” (Connected). This does not require installing Python, Go or Node.js. Windows users may alternatively use a platform-native wheel. You can also obtain the source from this public repository and follow [local building and distribution](docs/LOCAL_BUILD.en.md); no Actions, paid build platform or cloud server is required.
 2. For native wheels, use Python 3.11+ (3.12 recommended), with a native 64-bit interpreter matching your platform. From the wheel directory, run the following command, substituting the actual filename if its version differs:
 
    ```text
@@ -42,7 +44,7 @@ python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/S
 stock-king doctor
 ```
 
-Source installation provides the research CLI; use a platform-native wheel or the macOS `.app` archive for the complete desktop. The display name is **Stock King**, and the GitHub repository is **StockKing**. The command remains `stock-king` for compatibility with existing installations. See [local building and distribution](docs/LOCAL_BUILD.en.md).
+Source installation provides the research CLI; use the Windows installer, a platform-native wheel or the macOS `.app` archive for the complete desktop. The display name is **Stock King**, and the GitHub repository is **StockKing**. The command remains `stock-king` for compatibility with existing installations. See [local building and distribution](docs/LOCAL_BUILD.en.md).
 
 ## Pages and workflow
 

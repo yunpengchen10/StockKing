@@ -9,13 +9,10 @@ package main
 import "C"
 
 import (
-	"github.com/wailsapp/wails/v2/pkg/options"
 	"os/exec"
 )
 
 func hideSidecarWindow(cmd *exec.Cmd) {}
-
-func OnSecondInstanceLaunch(_ options.SecondInstanceData) {}
 
 func getScreenResolution() (int, int, int, int, error) {
 	bounds := C.CGDisplayBounds(C.CGMainDisplayID())

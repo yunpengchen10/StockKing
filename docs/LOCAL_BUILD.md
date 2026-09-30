@@ -6,6 +6,8 @@ Stock King 在自己的电脑构建，不使用 GitHub Actions、云服务器或
 
 ## 1. 普通用户安装
 
+Windows 可直接双击 `Stock-King-Setup-x64-v2.6.1.exe`，无需 Python、Go 或 Node.js；包含本地引擎和离线 WebView2。安装和生成该安装包的方法见 [Windows 安装说明](WINDOWS_INSTALL.md)。下面的原生 wheel 是可选方式。
+
 Mac 用户可直接解压维护者提供的 `Stock-King-macos-arm64.zip`，将 `Stock King.app` 移入“应用程序”并打开。界面左下角显示“已连接”表示桌面已连接到包内研究引擎；此安装方式无需 Python、Go、Node.js 或 Wails。
 
 Windows 用户安装维护者提供的原生 wheel；它包含桌面程序和冻结后的研究引擎。安装 64 位 Python 3.11+（建议 3.12）后，在包所在目录运行：
@@ -17,11 +19,11 @@ stock-king
 
 Apple Silicon 也可安装 `stock_king-2.6.0-py3-none-macosx_15_0_arm64.whl`，此时须使用原生 ARM64 Python 3.11+。Windows 需要微软 WebView2 Runtime。安装包版本号变化时使用实际文件名。
 
-当前仓库仍是私有内测，尚未发布 PyPI 或公开下载页。源码读取需要仓库权限；已有包可以在自己的电脑安装。软件显示名为 **Stock King**，仓库名为 **StockKing**；`stock-king` 命令和 Python 的 `stock_king` 模块名保持兼容。
+当前源码仓库公开，尚未发布 PyPI 或公开安装包下载页；已有包可以在自己的电脑安装。软件显示名为 **Stock King**，仓库名为 **StockKing**；`stock-king` 命令和 Python 的 `stock_king` 模块名保持兼容。
 
 ## 2. 源码研究工具
 
-需要 Git、Python 3.11+（建议 3.12）以及当前私有仓库读取权限。先通过正常 GitHub 登录配置 Git 访问，不要把令牌写入安装命令。
+需要 Git、Python 3.11+（建议 3.12）。可直接克隆公开仓库，不要把令牌写入安装命令。
 
 ```text
 python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing.git@main"
@@ -71,7 +73,7 @@ python3 scripts/install-macos-schedule.py
 # 以后停用：python3 scripts/install-macos-schedule.py --remove
 ```
 
-此脚本注册五个当前用户的 `launchd` 任务。保持电脑开机、唤醒并登录；工作日 09:10、10:20、14:45 是准备时间，分别在北京时间 09:20、10:30、14:55 复核并刷新。安装后可检查 `launchctl print "gui/$(id -u)/com.stockking.research.0920"`，任务日志在 `~/Library/Logs/Stock King/`。非计划时段显示未运行是正常的。
+此脚本注册七个当前用户的 `launchd` 任务。保持电脑开机、唤醒并登录；盘前观察在北京时间 09:20，独立扫描在 09:40、09:55、10:30、14:55，复盘在 15:30，学习在周五 15:45。扫描任务提前准备，错过时点不补造推荐。安装后可检查 `launchctl print "gui/$(id -u)/com.stockking.research.0920"`，任务日志在 `~/Library/Logs/Stock King/`。非计划时段显示未运行是正常的。
 
 ### 本机已遇到的构建问题
 
@@ -101,4 +103,4 @@ python scripts/smoke-wheel.py
 
 发行包只包含程序、依赖与许可证，不包含个人数据库、API Key、行情归档、训练权重或通知收件人。保留 GPL-3.0 及第三方声明。给新用户的默认流程是免费行情 → 自选 → 本地精选 → 图表核验；AI 可选本地 Ollama 或导入报告，无需付费 API。
 
-私有阶段只有获得授权的用户可以访问源码；面向所有用户的公开推广需要另行准备可公开访问的源码与发行入口。
+源码已公开；构建产物仍需单独分发，提供源码不等于已经发布各平台安装包。

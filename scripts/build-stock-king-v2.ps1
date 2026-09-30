@@ -12,7 +12,8 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $desktopRoot = Join-Path $repoRoot 'desktop'
 $dailyRoot = Join-Path $repoRoot 'daily-engine'
 $pythonBin = Join-Path $repoRoot '.venv\Scripts\python.exe'
-$artifactRoot = Join-Path $repoRoot 'artifacts\v2.5.0'
+$version = (Get-Content -LiteralPath (Join-Path $desktopRoot 'wails.json') -Raw -Encoding UTF8 | ConvertFrom-Json).info.productVersion
+$artifactRoot = Join-Path $repoRoot "artifacts\v$version"
 $sourceFolderName = "$([char]0x6E90)$([char]0x4EE3)$([char]0x7801)"
 $webViewInstaller = Join-Path $desktopRoot 'build\windows\installer\tmp\MicrosoftEdgeWebView2RuntimeInstallerX64.exe'
 
@@ -124,8 +125,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Wails production build failed.' }
   } else {
     $existingDesktopBinary = Join-Path $desktopRoot 'build\bin\Stock King.exe'
-    if (-not (Test-Path -LiteralPath $existingDesktopBinary) -or (Get-Item -LiteralPath $existingDesktopBinary).VersionInfo.ProductVersion -notmatch '^2\.5\.0(?:\.|$)') {
-      throw 'Skipping desktop build requires an already validated v2.5.0 executable.'
+    if (-not (Test-Path -LiteralPath $existingDesktopBinary) -or (Get-Item -LiteralPath $existingDesktopBinary).VersionInfo.ProductVersion -ne $version) {
+      throw "Skipping desktop build requires an already validated v$version executable."
     }
   }
 } finally { Pop-Location }
@@ -159,14 +160,14 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Could not map $mappedDrive to the sidecar staging directory." }
     Push-Location $installerScriptRoot
     try {
-        & $makeNsis "/DARG_WAILS_AMD64_BINARY=$desktopExe" "/DARG_STOCKKING_SIDECAR_ROOT=$mappedDrive" 'project.nsi'
+        & $makeNsis "/DINFO_PRODUCTVERSION=$version" "/DARG_WAILS_AMD64_BINARY=$desktopExe" "/DARG_STOCKKING_SIDECAR_ROOT=$mappedDrive" 'project.nsi'
         if ($LASTEXITCODE -ne 0) { throw 'NSIS installer creation failed.' }
     } finally { Pop-Location }
 } finally {
     & subst.exe $mappedDrive /D 2>$null
 }
 
-$installer = Join-Path $desktopRoot 'build\bin\Stock-King-Setup-x64-v2.5.0.exe'
+$installer = Join-Path $desktopRoot "build\bin\Stock-King-Setup-x64-v$version.exe"
 if (-not (Test-Path -LiteralPath $installer)) {
     throw "Installer was not generated: $installer"
 }
@@ -189,7 +190,7 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'README.en.md') -Destination $artifa
 if (-not $SkipSourceArchive) {
     $sourceDirectory = Join-Path $artifactRoot $sourceFolderName
     & (Join-Path $PSScriptRoot 'export-source.ps1') -Destination $sourceDirectory
-    $sourceArchive = Join-Path $artifactRoot 'Stock-King-v2.5.0-source.zip'
+    $sourceArchive = Join-Path $artifactRoot "Stock-King-v$version-source.zip"
     if (Test-Path -LiteralPath $sourceArchive) { Remove-Item -LiteralPath $sourceArchive -Force }
     Push-Location $artifactRoot
     try {
@@ -206,5 +207,5 @@ $hashLines = foreach ($file in $hashTargets) {
 }
 $hashLines | Set-Content -LiteralPath (Join-Path $artifactRoot 'SHA256SUMS.txt') -Encoding ascii
 
-Write-Host "Stock King v2.5.0 artifacts: $artifactRoot"
+Write-Host "Stock King v$version artifacts: $artifactRoot"
 Get-ChildItem -LiteralPath $artifactRoot -File | Select-Object Name, Length, LastWriteTime
