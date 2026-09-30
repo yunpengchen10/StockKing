@@ -8,9 +8,11 @@
 
 ## 看看软件怎么用
 
-![Stock King 操作演示：自选、K 线图表、精选与复盘](docs/media/stockking-workspace-tour.gif)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/yunpengchen10/StockKing/main/docs/media/stockking-workspace-tour.gif" alt="Stock King 操作演示：自选、K 线图表、精选与复盘" width="1000" />
+</p>
 
-**当前 Vue 前端的实际界面，使用隔离的演示数据。** 动图展示软件操作，不代表实时行情、真实推荐或实际收益。[查看大图](docs/media/stockking-workspace-tour.gif) · [静态预览](docs/media/stockking-workspace-tour.png) · [演示数据与复现方法](docs/WORKSPACE_TOUR.md)
+**当前 Vue 前端的实际界面，使用隔离的演示数据。** 动图展示软件操作，不代表实时行情、真实推荐或实际收益。[静态预览](docs/media/stockking-workspace-tour.png) · [演示数据与复现方法](docs/WORKSPACE_TOUR.md)
 
 [快速开始](#快速开始) · [Windows 安装](docs/WINDOWS_INSTALL.md) · [本地构建](docs/LOCAL_BUILD.md) · [AI 配置](docs/AI_CONFIGURATION.md) · [MCP 行情服务](quote-service/README.md)
 
