@@ -9,7 +9,7 @@
 ## 看看软件怎么用
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/yunpengchen10/StockKing/main/docs/media/stockking-workspace-tour.gif" alt="Stock King 操作演示：自选、K 线图表、精选与复盘" width="1000" />
+  <img src="https://raw.githubusercontent.com/yunpengchen10/StockKing/main/docs/media/stockking-workspace-tour.gif?v=1ca08eb70729" alt="Stock King 操作演示：自选、K 线图表、精选与复盘" width="1000" />
 </p>
 
 **当前 Vue 前端的实际界面，使用隔离的演示数据。** 动图展示软件操作，不代表实时行情、真实推荐或实际收益。[静态预览](docs/media/stockking-workspace-tour.png) · [演示数据与复现方法](docs/WORKSPACE_TOUR.md)

@@ -9,7 +9,7 @@ A local desktop for stock quantitative research and China A-share research: quot
 ## See the workspace in action
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/yunpengchen10/StockKing/main/docs/media/stockking-workspace-tour.gif" alt="Stock King workflow: watchlists, candlestick charts, local picks and review" width="1000" />
+  <img src="https://raw.githubusercontent.com/yunpengchen10/StockKing/main/docs/media/stockking-workspace-tour.gif?v=1ca08eb70729" alt="Stock King workflow: watchlists, candlestick charts, local picks and review" width="1000" />
 </p>
 
 **The actual current Vue interface, using isolated demonstration data.** This animation illustrates software operation, not live quotes, actual recommendations or realized returns. [Still preview](docs/media/stockking-workspace-tour.png) · [Data and reproduction](docs/WORKSPACE_TOUR.md)
