@@ -1,5 +1,5 @@
 <script setup>
-import {computed, nextTick, onBeforeUnmount, onMounted, ref} from 'vue'
+import {computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref} from 'vue'
 import {useMessage} from 'naive-ui'
 import * as echarts from 'echarts'
 import {GetEngineStatus, GetModelMetrics, ListQuantTasks, PauseQuantTask, ResumeQuantTask,
@@ -220,7 +220,10 @@ function tabChanged(value) {
   if (value === 'account') void refreshReports()
   void nextTick(() => chart?.resize())
 }
-onMounted(() => { void refresh(); timer = setInterval(refresh, 5000) })
+function startRefreshTimer() { clearInterval(timer); timer = setInterval(refresh, 5000) }
+onMounted(() => { void refresh(); startRefreshTimer() })
+onActivated(() => { startRefreshTimer(); void nextTick(() => chart?.resize()) })
+onDeactivated(() => { clearInterval(timer) })
 onBeforeUnmount(() => { clearInterval(timer); observer?.disconnect(); chart?.dispose() })
 </script>
 

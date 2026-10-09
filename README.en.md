@@ -44,7 +44,7 @@ This is a recorded-data walkthrough, not a desktop screen recording. Demonstrati
 
 ## Quick start
 
-Windows v2.6.2 includes a one-click `Stock-King-Setup-x64-v2.6.2.exe` installer with the local engine and offline WebView2. No Python, Go or Node.js installation is needed. It fixes recommendation records failing to display when responses exceed 16 MiB, and includes the window-launch fixes from v2.6.1. See [installation and fix instructions](docs/WINDOWS_INSTALL.en.md). The wheel below is an optional installation method.
+Windows v2.6.3 includes a one-click `Stock-King-Setup-x64-v2.6.3.exe` installer with the local engine and offline WebView2. No Python, Go or Node.js installation is needed. It fixes minute-history pagination, critical quote-field merging, financial and sector evidence ingestion, and delayed reviews, while retaining earlier record-display and window-launch fixes. See [installation and fix instructions](docs/WINDOWS_INSTALL.en.md). The wheel below is an optional installation method.
 
 1. If you have the Mac package, extract `Stock-King-macos-arm64.zip`, copy `Stock King.app` to `/Applications`, open it, and confirm the interface says “已连接” (Connected). This does not require installing Python, Go or Node.js. Windows users may alternatively use a platform-native wheel. You can also obtain the source from this public repository and follow [local building and distribution](docs/LOCAL_BUILD.en.md); no Actions, paid build platform or cloud server is required.
 2. For native wheels, use Python 3.11+ (3.12 recommended), with a native 64-bit interpreter matching your platform. From the wheel directory, run the following command, substituting the actual filename if its version differs:

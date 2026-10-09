@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go-stock/backend/db"
 	"go-stock/backend/logger"
+	"go-stock/backend/marketminute"
 	"go-stock/backend/models"
 	"strings"
 	"sync"
@@ -538,6 +539,18 @@ func (t *TdxKLineApi) GetMACKLineData(stockCode string, klt string, limit int, a
 
 // getMACMainKLineDataEx A股走 MAC 主客户端，adjust 指定复权类型（默认前复权 AdjustQFQ）
 func (t *TdxKLineApi) getMACMainKLineDataEx(stockCode string, klt string, limit int, adjust uint16) *[]KLineData {
+	return t.getMACMainKLineDataBefore(stockCode, klt, limit, adjust, "")
+}
+
+// GetMACMinuteKLineBefore serves real historical A-share minutes through offsets.
+func (t *TdxKLineApi) GetMACMinuteKLineBefore(stockCode string, limit int, end string) *[]KLineData {
+	if IsHKStockCode(stockCode) || IsUSStockCode(stockCode) || IsCSIIndexCode(stockCode) || IsGlobalIndexCode(stockCode) {
+		return &[]KLineData{}
+	}
+	return t.getMACMainKLineDataBefore(stockCode, "1", limit, types.AdjustNone, end)
+}
+
+func (t *TdxKLineApi) getMACMainKLineDataBefore(stockCode string, klt string, limit int, adjust uint16, end string) *[]KLineData {
 	result := &[]KLineData{}
 	if err := t.ensureMACClient(); err != nil {
 		logger.SugaredLogger.Errorf("TdxKLine ensureMACClient error: %v", err)
@@ -566,7 +579,7 @@ func (t *TdxKLineApi) getMACMainKLineDataEx(stockCode string, klt string, limit 
 	}
 
 	t.macMu.Lock()
-	bars, err := t.macClient.MACSymbolBars(market, code, uint16(klineType), 1, 0, fetchCount, adjust)
+	bars, err := marketminute.Fetch(t.macClient, market, code, uint16(klineType), int(fetchCount), adjust, end)
 	t.macMu.Unlock()
 
 	if err != nil {
@@ -576,7 +589,7 @@ func (t *TdxKLineApi) getMACMainKLineDataEx(stockCode string, klt string, limit 
 			return result
 		}
 		t.macMu.Lock()
-		bars, err = t.macClient.MACSymbolBars(market, code, uint16(klineType), 1, 0, fetchCount, adjust)
+		bars, err = marketminute.Fetch(t.macClient, market, code, uint16(klineType), int(fetchCount), adjust, end)
 		t.macMu.Unlock()
 		if err != nil {
 			logger.SugaredLogger.Errorf("TdxKLine MACSymbolBars retry error: %v", err)

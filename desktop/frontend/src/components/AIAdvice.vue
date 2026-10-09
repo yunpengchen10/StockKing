@@ -4,12 +4,14 @@ import { useRoute, useRouter } from 'vue-router'
 import { useMessage } from 'naive-ui'
 import { GetStockKingAIProviders, GetStockKingResearchEvidence, RunStockKingAIResearch, CancelStockKingAIResearch, GetResearchNote, GetStockKingAIAdviceHistory, GetStockKingPreference, GetStockList, SaveStockKingAIAdvice, SaveStockKingPreference } from '../../wailsjs/go/main/App'
 import { stockOption } from '../utils/symbol'
+import { usePageActive } from '../utils/pageSession.mjs'
 import { BUILTIN_TEMPLATES, TEMPLATE_LIBRARY_KEY, LEGACY_TEMPLATE_KEY, freshTemplateLibrary, loadTemplateLibrary, deleteTemplate, restoreMissingTemplates } from '../utils/researchTemplates.mjs'
 import { DEFAULT_PROMPT, MAX_IMPORT_BYTES, MAX_PROMPT_BYTES, WORKSPACE_SCHEMA, utf8Bytes, validateFile, validatePrompt, parsePrompt, parseAIText, buildImportedRecord, decodeHistoryRecord, renderSafeMarkdown, normalizeReportMarkdown, normalizeResearchSymbol, evidenceSources, buildResearchPackage, comparisonRows } from '../utils/aiResearch.mjs'
 
 import EconomyBudget from './EconomyBudget.vue'
 
 const router = useRouter(), route = useRoute(), message = useMessage()
+const pageActive = usePageActive()
 const budgetPanel=ref(null)
 const SESSION_KEY = 'aiAdvice.workspaceSession.v1'
 const code = ref(''), name = ref(''), query = ref(''), stockOptions = ref([]), stockRows = ref([])
@@ -111,7 +113,7 @@ async function choose(value, explicitName = '', sync = true) {
   note.value = foundNote || {}; await loadHistory(symbol)
   if (version !== selectionVersion || !alive) return
   await persistQuietly()
-  if (sync && (route.query.code !== symbol || route.query.name !== name.value)) await router.replace({ name: 'aiAdvice', query: { code: symbol, name: name.value } })
+  if (sync && pageActive.value && router.currentRoute.value.name === 'aiAdvice' && (route.query.code !== symbol || route.query.name !== name.value)) await router.replace({ name: 'aiAdvice', query: { code: symbol, name: name.value } })
 }
 function submitTyped() { const typed = String(query.value || '').split('·').pop().trim(), item = stockRows.value.find(row => row.ts_code === typed || row.name === typed || row.fullname === typed); void choose(item?.ts_code || typed, item?.name || '') }
 function changePlatform() { configId.value = ''; void persistQuietly() }
@@ -207,7 +209,23 @@ onBeforeMount(async () => {
   restoring = false; await persistQuietly()
 })
 onBeforeUnmount(() => { alive = false; clearTimeout(searchTimer); ++requestVersion; if (currentRequest.value) void CancelStockKingAIResearch(currentRequest.value).catch(() => {}) })
-watch(() => route.query.code, value => { if (value && value !== code.value) void choose(value, route.query.name || '', false) })
+watch(() => [route.query.code, route.query.pick, route.query.template], async ([value, pick, template]) => {
+  if (restoring) return
+  if (value && normalizeResearchSymbol(value) !== code.value) await choose(value, route.query.name || '', false)
+  if (value && normalizeResearchSymbol(value) !== code.value) return
+  if (templates.value.some(item => item.id === template) && templateId.value !== template) {
+    templateId.value = template; chooseTemplate()
+  }
+  if (pick === '1') {
+    try {
+      const selected = JSON.parse(sessionStorage.getItem('stock-king:ai-pick:' + code.value) || 'null')
+      if (!selected?.candidate || normalizeResearchSymbol(selected.candidate.code) !== code.value) throw new Error('精选快照缺失，请从精选重新打开')
+      pickContext.value = selected
+      if (evidence.value) evidence.value = attachPickEvidence(evidence.value)
+      packageText.value = ''; await persistQuietly()
+    } catch (error) { requestError.value = error.message }
+  }
+})
 watch([configId, mode], () => { void persistQuietly() })
 </script>
 

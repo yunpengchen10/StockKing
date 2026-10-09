@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import {onBeforeMount, onBeforeUnmount, ref} from 'vue'
+import {usePageActive} from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 import {HotStock, IsTradingTime} from "../../wailsjs/go/main/App";
 import KLineChart from "./KLineChart.vue";
 import {ArrowDown, ArrowUp} from "@vicons/ionicons5";
@@ -22,6 +24,7 @@ const errorMsg = ref('')
 const router = useRouter()
 
 async function fetchHotStock() {
+  if (!pageActive.value) return
   try {
     loading.value = true
     errorMsg.value = ''
@@ -43,6 +46,7 @@ function startRefresh() {
   fetchHotStock()
   task.value = setInterval(fetchHotStock, 5000)
   checkTask.value = setInterval(() => {
+    if (!pageActive.value) return
     IsTradingTime().then(trading => {
       if (!trading) {
         stopRefresh()
@@ -55,6 +59,7 @@ function startRefresh() {
 function startCheckLoop() {
   stopCheck()
   checkTask.value = setInterval(() => {
+    if (!pageActive.value) return
     IsTradingTime().then(trading => {
       if (trading) {
         stopCheck()

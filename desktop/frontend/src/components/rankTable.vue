@@ -3,6 +3,8 @@
 import {CaretDown, CaretUp, RefreshCircleOutline} from "@vicons/ionicons5";
 import {NText,useMessage} from "naive-ui";
 import {onBeforeUnmount, onMounted, onUnmounted, ref} from "vue";
+import {usePageActive} from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 import {GetMoneyRankSina} from "../../wailsjs/go/main/App";
 import KLineChart from "./KLineChart.vue";
 
@@ -24,6 +26,7 @@ onMounted(()=>{
   sort.value=props.sort
   GetMoneyRankSinaData()
   interval.value=setInterval(()=>{
+    if (!pageActive.value) return
     GetMoneyRankSinaData()
   },1000*60)
 })

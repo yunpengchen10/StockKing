@@ -2,26 +2,32 @@
 
 All timestamps are bar END times; amounts are CNY and volumes are shares.
 Never splice cumulative Tencent snapshots into interval bars. Public Sina
-backfills about eight sessions; a configured Tushare minute entitlement can
-backfill the full preceding twenty. Missing sessions remain explicitly missing.
+backfills about eight sessions; the software MAC source pages older history,
+with optional Tushare access as a further source. Missing sessions stay missing.
 """
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 import json
 import math
 import os
 from pathlib import Path
 import re
 import sqlite3
-from time import monotonic
+from time import monotonic, time as wall_time
 import zlib
 from statistics import median
 
 import requests
 
 from .intraday_evidence import SHANGHAI, _datetime, _prior_sessions, METRIC_DEFINITIONS
+from .research_policy import DEFAULT_PARAMETERS
+
+FORMAL_HISTORY_DAYS = DEFAULT_PARAMETERS['history']['formalDays']
+MINIMUM_HISTORY_DAYS = DEFAULT_PARAMETERS['history']['minimumScoreDays']
+MINUTE_MAX_AGE = DEFAULT_PARAMETERS['freshness']['minuteSeconds']
+MINUTE_PARAMS = DEFAULT_PARAMETERS['minute']
 
 SINA_URL = 'https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData'
 HEADERS = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://finance.sina.com.cn/'}
@@ -88,10 +94,19 @@ def bar_session(at):
     return 'am' if 570 < minute <= 690 else 'pm' if 780 < minute <= 900 else None
 
 
-def normalize_bars(rows, cutoff):
+def _retain_special_session_flags(target, *sources):
+    """Never erase a known exceptional trading regime during bar normalization."""
+    for key in ('corporate_action', 'no_price_limit', 'suspended'):
+        values = [source.get(key) for source in (target, *sources) if isinstance(source.get(key), bool)]
+        if values:
+            target[key] = any(values)  # A reported exception wins over missing/false metadata.
+    return target
+
+
+def normalize_bars(rows, cutoff, *, conflicts=None):
     """Reject conflicting duplicates, malformed bars and future/partial minutes."""
     cutoff = _datetime(cutoff)
-    result, conflicts = {}, set()
+    result, conflicted = {}, set()
     for row in rows:
         try:
             at = _datetime(row['end'])
@@ -118,19 +133,92 @@ def normalize_bars(rows, cutoff):
                 continue
             cleaned = {'end':at.isoformat(), **values, 'source':row.get('source','unknown'),
                        'fetched_at':row.get('fetched_at') or row.get('fetchedAt')}
+            if isinstance(row.get('sources'), list):
+                cleaned['sources'] = sorted({str(source) for source in row['sources']})
+            _retain_special_session_flags(cleaned, row)
             if at in result:
-                economic = ('open','high','low','close','amount_cny','volume_shares','source')
-                if any(result[at].get(key) != cleaned.get(key) for key in economic):
-                    conflicts.add(at)
-                elif result[at].get('fetched_at') is None and cleaned['fetched_at'] is not None:
-                    result[at] = cleaned
+                economic = ('open','high','low','close','amount_cny','volume_shares')
+                if any(result[at].get(key) is not None and cleaned.get(key) is not None
+                       and result[at][key] != cleaned[key] for key in economic):
+                    conflicted.add(at)
+                else:
+                    # A second source can fill an absent field only when every
+                    # jointly available economic value agrees. Source labels and
+                    # fetch times are provenance, not price disagreements.
+                    original = result[at]
+                    for key in economic:
+                        if original.get(key) is None:
+                            original[key] = cleaned.get(key)
+                    sources = set(original.get('sources') or [original['source']])
+                    sources.update(cleaned.get('sources') or [cleaned['source']])
+                    if len(sources) > 1:
+                        original['sources'] = sorted(sources)
+                    _retain_special_session_flags(cleaned, result[at])
+                    _retain_special_session_flags(result[at], cleaned)
+                    if result[at].get('fetched_at') is None and cleaned['fetched_at'] is not None:
+                        result[at]['fetched_at'] = cleaned['fetched_at']
             else:
                 result[at] = cleaned
         except (KeyError, TypeError, ValueError):
             continue
-    for at in conflicts:
+    for at in conflicted:
         result.pop(at, None)
+    if conflicts is not None:
+        conflicts.update(conflicted)
     return result
+
+
+def minute_coverage(rows, cutoff, required_days):
+    """Inspect actual exchange-session dates; never invent a missing minute."""
+    cutoff = _datetime(cutoff)
+    normalized = normalize_bars(rows, cutoff)
+    days = sorted({value.isoformat() if isinstance(value, date) else str(value)[:10]
+                   for value in required_days})
+    missing = {}
+    missing_fields = {'amount_cny': 0, 'volume_shares': 0}
+    expected = 0
+    for day in days:
+        session = date.fromisoformat(day)
+        stamps = [datetime.combine(session, time(9, 31), SHANGHAI) + timedelta(minutes=i) for i in range(120)]
+        stamps += [datetime.combine(session, time(13, 1), SHANGHAI) + timedelta(minutes=i) for i in range(120)]
+        stamps = [at for at in stamps if at <= cutoff]
+        expected += len(stamps)
+        absent = [at.isoformat() for at in stamps if at not in normalized]
+        if absent:
+            missing[day] = absent
+        for at in stamps:
+            if at in normalized:
+                for field in missing_fields:
+                    missing_fields[field] += normalized[at].get(field) is None
+    return {'requiredDays': days, 'expectedMinutes': expected,
+            'missingDays': list(missing), 'missingMinutes': sum(map(len, missing.values())),
+            'missingMinuteTimes': missing, 'missingFields': missing_fields,
+            'pricePathComplete': expected > 0 and not missing}
+
+
+def supplement_bars(primary, extra, cutoff, *, diagnostics=None):
+    """Keep established bars; fill gaps/compatible fields with an audited source."""
+    result = normalize_bars(primary, cutoff)
+    added = enriched = disagreements = 0
+    for at, row in normalize_bars(extra, cutoff).items():
+        previous = result.get(at)
+        if previous is None:
+            result[at] = row
+            added += 1
+            continue
+        compatible = normalize_bars([previous, row], cutoff)
+        if at not in compatible:
+            disagreements += 1  # Never overwrite a stored source with this disagreement.
+            _retain_special_session_flags(previous, row)
+            continue
+        merged = compatible[at]
+        enriched += any(previous.get(key) is None and merged.get(key) is not None
+                        for key in ('amount_cny', 'volume_shares'))
+        result[at] = merged
+    if diagnostics is not None:
+        diagnostics.update(addedMinutes=added, enrichedMinutes=enriched,
+                           conflictingOverlapMinutes=disagreements)
+    return list(result.values())
 
 
 class MinuteArchive:
@@ -140,6 +228,7 @@ class MinuteArchive:
         with self.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS sessions(code TEXT, day TEXT, payload BLOB, PRIMARY KEY(code,day))')
             db.execute('CREATE TABLE IF NOT EXISTS attempts(code TEXT, day TEXT, source TEXT, status TEXT, PRIMARY KEY(code,day,source))')
+            db.execute('CREATE TABLE IF NOT EXISTS attempt_times(code TEXT, day TEXT, source TEXT, attempted_at REAL, PRIMARY KEY(code,day,source))')
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=30)
@@ -158,6 +247,7 @@ class MinuteArchive:
         days = {}
         for at,row in rows.items():
             days.setdefault(at.date().isoformat(),{})[row['end']] = row
+        added = enriched = conflicts = 0
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             for day,fresh in days.items():
@@ -165,32 +255,53 @@ class MinuteArchive:
                 merged = {row['end']:row for row in json.loads(zlib.decompress(old[0]))} if old else {}
                 for stamp, row in fresh.items():
                     previous = merged.get(stamp)
-                    # Do not erase a previously observed real amount with a
-                    # chart adapter's missing-amount sentinel for the same bar.
-                    if (previous and previous.get('amount_cny') is not None
-                            and row.get('amount_cny') is None
-                            and all(abs((number(previous.get(key)) or 0)-(number(row.get(key)) or 0)) <= .011
-                                    for key in ('open','high','low','close'))):
-                        continue
-                    merged[stamp] = row
+                    if previous:
+                        audit = {}
+                        resolved = supplement_bars([previous], [row], cutoff, diagnostics=audit)
+                        conflicts += audit['conflictingOverlapMinutes']
+                        enriched += audit['enrichedMinutes']
+                        if resolved:
+                            merged[stamp] = resolved[0]
+                    else:
+                        merged[stamp] = row
+                        added += 1
                 payload = zlib.compress(json.dumps([merged[k] for k in sorted(merged)],separators=(',',':')).encode('utf-8'))
                 db.execute('INSERT OR REPLACE INTO sessions VALUES(?,?,?)',(code,day,payload))
             db.execute('DELETE FROM sessions WHERE code=? AND day<?', (code, (_datetime(cutoff)-timedelta(days=65)).date().isoformat()))
+        return {'addedMinutes': added, 'enrichedMinutes': enriched, 'conflictingOverlapMinutes': conflicts}
 
     def attempted(self, code, day, source):
         with self.connect() as db:
             return db.execute('SELECT status FROM attempts WHERE code=? AND day=? AND source=?', (code,day,source)).fetchone()
 
-    def claim_attempt(self, code, day, source):
-        """Claim one historical request per stock/day across local processes."""
+    def claim_attempt(self, code, day, source, *, retry_incomplete=False):
+        """Claim historical work across processes; failed/partial work can retry."""
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            now = wall_time()
             cursor = db.execute('INSERT OR IGNORE INTO attempts VALUES(?,?,?,?)',
                                 (code,day,source,'started'))
-            return cursor.rowcount == 1
+            if cursor.rowcount == 1:
+                db.execute('INSERT OR REPLACE INTO attempt_times VALUES(?,?,?,?)', (code,day,source,now))
+                return True
+            # A transient provider failure must not lock historical repair for
+            # the rest of the trading day. The atomic update still has one owner.
+            cursor = db.execute("UPDATE attempts SET status='started' WHERE code=? AND day=? AND source=? AND status IN ('failed','partial')",
+                                (code,day,source))
+            claimed = cursor.rowcount == 1
+            if not claimed and retry_incomplete:
+                stamp = db.execute('SELECT attempted_at FROM attempt_times WHERE code=? AND day=? AND source=?', (code,day,source)).fetchone()
+                if stamp is None or now-stamp[0] >= 300:
+                    cursor = db.execute("UPDATE attempts SET status='started' WHERE code=? AND day=? AND source=? AND status IN ('empty','fetched','started')", (code,day,source))
+                    claimed = cursor.rowcount == 1
+            if claimed:
+                db.execute('INSERT OR REPLACE INTO attempt_times VALUES(?,?,?,?)', (code,day,source,now))
+            return claimed
 
     def record(self, code, day, source, status):
         with self.connect() as db:
             db.execute('INSERT OR REPLACE INTO attempts VALUES(?,?,?,?)',(code,day,source,status))
+            db.execute('INSERT OR REPLACE INTO attempt_times VALUES(?,?,?,?)',(code,day,source,wall_time()))
 
 
 def fetch_sina_bars(code, *, count=1970, timeout=5, getter=None):
@@ -201,8 +312,10 @@ def fetch_sina_bars(code, *, count=1970, timeout=5, getter=None):
     raw = json.loads(match.group(1)) if match else None
     if not isinstance(raw, list) or not raw:
         raise ValueError('Sina returned no minute bars')
+    fetched_at = datetime.now(SHANGHAI).isoformat()
     return [{'end':row.get('day'), **{key:row.get(key) for key in ('open','high','low','close')},
-             'amount_cny':row.get('amount'), 'volume_shares':row.get('volume'), 'source':'Sina 1min unadjusted'} for row in raw]
+             'amount_cny':row.get('amount'), 'volume_shares':row.get('volume'), 'source':'Sina 1min unadjusted',
+             'fetched_at': fetched_at} for row in raw]
 
 
 def fetch_software_bars(code, *, count=8000, client=None, end=None, timeout=12):
@@ -223,12 +336,34 @@ def fetch_software_bars(code, *, count=8000, client=None, end=None, timeout=12):
     return bars
 
 
-def fetch_recent_bars(code, *, count=240):
-    """Prefer software bars; use the existing public feed if desktop is absent."""
+def fetch_recent_bars(code, *, count=240, cutoff=None, required_days=None, diagnostics=None):
+    """Supplement a short/incomplete software response without replacing its bars."""
+    cutoff = _datetime(cutoff or datetime.now(SHANGHAI))
+    audit = diagnostics if diagnostics is not None else {}
+    audit.update(sourceFailures=[], sources=[])
+    primary = []
     try:
-        return fetch_software_bars(code,count=count,timeout=4)
-    except (requests.RequestException,RuntimeError,ValueError,TypeError,KeyError):
-        return fetch_sina_bars(code,count=count)
+        primary = list(normalize_bars(fetch_software_bars(code,count=count,timeout=4), cutoff).values())
+        if not primary:
+            raise ValueError('software returned no usable complete minutes')
+        audit['sources'].append('software')
+    except (requests.RequestException,RuntimeError,ValueError,TypeError,KeyError) as error:
+        audit['sourceFailures'].append({'source': 'software', 'error': type(error).__name__})
+    coverage = minute_coverage(primary, cutoff, required_days) if required_days else None
+    needs_more = (len(primary) < count or coverage is not None and
+                  (not coverage['pricePathComplete'] or any(coverage['missingFields'].values())))
+    if needs_more:
+        try:
+            public = fetch_sina_bars(code,count=max(count, 1970 if required_days else count))
+            if not normalize_bars(public, cutoff):
+                raise ValueError('Sina returned no usable complete minutes')
+            primary = supplement_bars(primary, public, cutoff, diagnostics=audit)
+            audit['sources'].append('sina')
+        except (requests.RequestException,RuntimeError,ValueError,TypeError,KeyError) as error:
+            audit['sourceFailures'].append({'source': 'sina', 'error': type(error).__name__})
+    if not primary:
+        raise ValueError('No source returned usable complete minute bars')
+    return primary
 
 
 def fetch_tushare_bars(code, cutoff, *, timeout=8, poster=None):
@@ -236,7 +371,7 @@ def fetch_tushare_bars(code, cutoff, *, timeout=8, poster=None):
     if not token:
         raise ValueError('Tushare minute token not configured')
     dates = _prior_sessions(_datetime(cutoff).date())
-    if len(dates) != 20:
+    if len(dates) != FORMAL_HISTORY_DAYS:
         raise ValueError('Exchange calendar unavailable')
     # 20 previous sessions = 4800 rows, below the documented 8000-row limit.
     url = os.getenv('TUSHARE_API_URL','').strip() or os.getenv('TUSHARE_HTTP_URL','').strip() or 'https://api.tushare.pro'
@@ -288,12 +423,12 @@ def _window_features(rows, end):
 
 def _robust_z(current, history, *, floor):
     """Median/MAD with a unit-aware floor; zero dispersion never explodes a score."""
-    if current is None or len(history) < 5:
+    if current is None or len(history) < MINIMUM_HISTORY_DAYS:
         return None
     centre = median(history)
-    scale = max(1.4826 * median(abs(value-centre) for value in history),
-                abs(centre) * .05, floor)
-    return max(-6.0, min(6.0, (current-centre)/scale))
+    scale = max(MINUTE_PARAMS['madConsistency'] * median(abs(value-centre) for value in history),
+                abs(centre) * MINUTE_PARAMS['relativeMadFloor'], floor)
+    return max(-MINUTE_PARAMS['zClip'], min(MINUTE_PARAMS['zClip'], (current-centre)/scale))
 
 
 def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
@@ -304,7 +439,7 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
               'gaps':[], 'historyDays':0, 'priceHistoryDays':0, 'featureHistoryDays':{},
               'baselineReady':False, 'baselineDates':[], 'missingHistoryDates':[],
               'sourceTimePrecision':'bar_end', 'metricDefinitions':METRIC_DEFINITIONS.copy(),
-              'v11Inputs':{}, 'v11Coverage':{'status':'insufficient','days':0,'requiredDays':20}}
+              'v11Inputs':{}, 'v11Coverage':{'status':'insufficient','days':0,'requiredDays':FORMAL_HISTORY_DAYS}}
     result['metricDefinitions'].update(amount_3m='截至该分钟结束时间的连续3根1分钟K线成交额之和（元）',
         local_high_5m='此前5根完整1分钟K线最高价，不含当前根（元）',
         local_low_5m='此前5根完整1分钟K线最低价，不含当前根（元）')
@@ -316,7 +451,7 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
     result.update(asOf=end.isoformat(), source=current[end]['source'], currentPrice=current[end]['close'],
                   sourceFetchedAt=current[end].get('fetched_at'),
                   sourceAgeSeconds=(cutoff-end).total_seconds())
-    if (cutoff-end).total_seconds() >= 300:
+    if (cutoff-end).total_seconds() >= MINUTE_MAX_AGE:
         gaps.append('分钟行情已陈旧，未用于入选')
         return result
     for n in (1,3,5):
@@ -345,10 +480,10 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
             if cumulative_volume > 0:
                 vwap_series[at] = cumulative_amount/cumulative_volume
     dates = list(expected_dates) if expected_dates is not None else list(_prior_sessions(end.date()))
-    dates = sorted({datetime.fromisoformat(str(d)).date() for d in dates if str(d) < end.date().isoformat()})[-20:]
+    dates = sorted({datetime.fromisoformat(str(d)).date() for d in dates if str(d) < end.date().isoformat()})[-FORMAL_HISTORY_DAYS:]
     samples = []
     feature_history = {key: [] for key in current_features}
-    if len(dates) == 20:
+    if len(dates) == FORMAL_HISTORY_DAYS:
         for day in dates:
             previous = end.replace(year=day.year,month=day.month,day=day.day)
             part = window(rows,previous,3)
@@ -364,10 +499,10 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
     result['historyDays'] = len(samples)
     result['priceHistoryDays'] = len(feature_history['r3_pct'])
     result['featureHistoryDays'] = {key:len(values) for key,values in feature_history.items()}
-    coverage = 'complete' if len(samples) == 20 else 'low' if len(samples) >= 5 else 'insufficient'
+    coverage = 'complete' if len(samples) == FORMAL_HISTORY_DAYS else 'low' if len(samples) >= MINIMUM_HISTORY_DAYS else 'insufficient'
     result['v11Coverage'] = {'status':coverage, 'days':len(samples),
                              'priceDays':result['priceHistoryDays'],
-                             'factorDays':result['featureHistoryDays'],'requiredDays':20}
+                             'factorDays':result['featureHistoryDays'],'requiredDays':FORMAL_HISTORY_DAYS}
     v11 = {'history_days':len(samples),'price_history_days':result['priceHistoryDays'], **current_features}
     if end in vwap_series:
         previous_at = end-timedelta(minutes=1)
@@ -381,7 +516,7 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
         recent = window(current,end,5)
         if recent and all(datetime.fromisoformat(row['end']) in vwap_series for row in recent):
             v11['vwap_retest_success'] = 1. if any(
-                row['low'] <= vwap_series[datetime.fromisoformat(row['end'])]*1.002
+                row['low'] <= vwap_series[datetime.fromisoformat(row['end'])]*(1+MINUTE_PARAMS['vwapRetestTolerance'])
                 and row['close'] > vwap_series[datetime.fromisoformat(row['end'])]
                 for row in recent) else 0.
     previous_five = window(current,end-timedelta(minutes=1),5)
@@ -392,27 +527,27 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
         recent_highs = [row['high'] for row in previous_five[-2:]] + [current[end]['high']]
         v11['lower_high_risk'] = (100. if recent_highs[0] > recent_highs[1] > recent_highs[2] else 0.)
     for key in ('r1_pct','r3_pct','r5_pct','r15_pct','a1_pct_per_min','a3_pct_per_min'):
-        v11['z_'+key] = _robust_z(current_features[key],feature_history[key],floor=.05)
+        v11['z_'+key] = _robust_z(current_features[key],feature_history[key],floor=MINUTE_PARAMS['priceMadFloor'])
     for minutes in (3,5,15):
         key = f'amount_{minutes}m'
         baseline = feature_history[key]
-        centre = median(baseline) if len(baseline) >= 5 else None
+        centre = median(baseline) if len(baseline) >= MINIMUM_HISTORY_DAYS else None
         v11[f'baseline_{key}'] = centre
         v11[f'v{minutes}_ratio'] = (current_features[key]/centre
             if current_features[key] is not None and centre is not None and centre > 0 else None)
-        v11[f'z_{key}'] = _robust_z(current_features[key],baseline,floor=1.0)
+        v11[f'z_{key}'] = _robust_z(current_features[key],baseline,floor=MINUTE_PARAMS['amountMadFloor'])
         volume_key = f'volume_{minutes}m'
         volume_history = feature_history[volume_key]
         v11[f'baseline_{volume_key}'] = (median(volume_history)
-            if len(volume_history) >= 5 else None)
+            if len(volume_history) >= MINIMUM_HISTORY_DAYS else None)
     v3, v15 = v11.get('v3_ratio'),v11.get('v15_ratio')
     v11['va_ratio'] = v3/v15 if v3 is not None and v15 and v15 > 0 else None
     v11['price_efficiency_r5_v5'] = (v11['r5_pct']/v11['v5_ratio']
         if v11.get('r5_pct') is not None and v11.get('v5_ratio') and v11['v5_ratio'] > 0 else None)
     result['v11Inputs'] = v11
-    result['baselineMedianAmount'] = median(samples) if len(samples) == 20 else None
+    result['baselineMedianAmount'] = median(samples) if len(samples) == FORMAL_HISTORY_DAYS else None
     result['baselineSource'] = ', '.join(sorted({r['source'] for at,r in rows.items() if at.date() in dates}))
-    if len(samples) == 20 and median(samples) > 0 and metrics['amount_3m'] is not None:
+    if len(samples) == FORMAL_HISTORY_DAYS and median(samples) > 0 and metrics['amount_3m'] is not None:
         metrics['relative_amount_3m_20d'] = metrics['amount_3m']/median(samples)
         result['baselineReady'] = True
     else:
@@ -421,7 +556,15 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
     return result
 
 
-def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, backfill=True, software_count=8000):
+def _formal_history_ready(evidence):
+    # A three-minute amount needs three bars; its price return needs four.
+    # Twenty amount samples alone therefore cannot close the history repair.
+    return all(evidence.get(key, 0) >= FORMAL_HISTORY_DAYS
+               for key in ('historyDays', 'priceHistoryDays'))
+
+
+def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, backfill=True, software_count=8000,
+                       required_days=None):
     cutoff = _datetime(cutoff)
     archive = MinuteArchive(cache_dir)
     archived = archive.read(code, cutoff)
@@ -430,7 +573,7 @@ def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, bac
     if archived and software_count > 240:
         latest = max(_datetime(row['end']) for row in archived)
         history = compute_bar_evidence(archived, cutoff)
-        if (cutoff-latest).total_seconds() < 300 and history['historyDays'] >= 5:
+        if (cutoff-latest).total_seconds() < MINUTE_MAX_AGE and _formal_history_ready(history):
             software_count = 240
     errors = []
     software_fetched = False
@@ -449,18 +592,30 @@ def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, bac
                 software_fetched = True
             except (requests.RequestException, RuntimeError, ValueError, TypeError, KeyError) as exc:
                 errors.append('软件分钟更新失败：'+type(exc).__name__)
-    if not software_fetched:
+    supplemental = {'attempted': False}
+    cached_after_software = archive.read(code, cutoff)
+    required_coverage = minute_coverage(cached_after_software, cutoff, required_days or [cutoff.date()])
+    needs_supplement = backfill and (not required_coverage['pricePathComplete'] or
+        any(required_coverage['missingFields'].values()) or
+        software_count > 240 and not _formal_history_ready(compute_bar_evidence(cached_after_software, cutoff)))
+    if not software_fetched or needs_supplement:
+        supplemental['attempted'] = True
         try:
-            archive.save(code, fetch_sina_bars(code,getter=getter), cutoff)
+            public_rows = fetch_sina_bars(code,getter=getter)
+            if not normalize_bars(public_rows, cutoff):
+                raise ValueError('Sina returned no usable complete minutes')
+            supplemental.update(archive.save(code, public_rows, cutoff))
+            supplemental['status'] = 'fetched'
         except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
             errors.append('Sina分钟更新失败：'+type(exc).__name__)
+            supplemental.update(status='failed', error=type(exc).__name__)
     rows = archive.read(code,cutoff)
     result = compute_bar_evidence(rows, cutoff)
     day = cutoff.date().isoformat()
-    history_backfill = {'status':'not_needed' if result['historyDays'] >= 20 else 'not_available',
-                        'pages':0,'newBars':0,'requestedEnds':[]}
-    if (backfill and result['historyDays'] < 20 and client is not None and client.available
-            and rows and archive.claim_attempt(code,day,'software_history')):
+    history_backfill = {'status':'not_needed' if _formal_history_ready(result) else 'not_available',
+                        'pages':0,'newBars':0,'requestedEnds':[], 'pageCoverage': []}
+    if (backfill and not _formal_history_ready(result) and client is not None and client.available
+            and rows and archive.claim_attempt(code,day,'software_history',retry_incomplete=True)):
         history_backfill['status'] = 'empty'
         try:
             for _ in range(2):
@@ -469,24 +624,29 @@ def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, bac
                 history_backfill['requestedEnds'].append(before)
                 page = fetch_software_bars(code,count=8000,client=client,end=before)
                 history_backfill['pages'] += 1
-                older = [row for at,row in normalize_bars(page,cutoff).items() if at < oldest]
+                accepted = normalize_bars(page,cutoff)
+                older = [row for at,row in accepted.items() if at < oldest]
+                history_backfill['pageCoverage'].append({'requestedEnd': before, 'returnedMinutes': len(accepted),
+                    'oldestReturned': min(accepted).isoformat() if accepted else None, 'olderMinutes': len(older)})
                 if not older:
+                    history_backfill['reason'] = 'provider_returned_no_older_minutes'
                     break  # Provider ignored end or has no older data.
                 archive.save(code,older,cutoff)
                 history_backfill['newBars'] += len(older)
                 rows = archive.read(code,cutoff)
                 result = compute_bar_evidence(rows,cutoff)
                 history_backfill['status'] = 'fetched'
-                if result['historyDays'] >= 20:
+                if _formal_history_ready(result):
                     break
         except (requests.RequestException,RuntimeError,ValueError,TypeError,KeyError) as exc:
             errors.append('软件历史分钟回填失败：'+type(exc).__name__)
             history_backfill['status'] = 'failed' if not history_backfill['newBars'] else 'partial'
         archive.record(code,day,'software_history',history_backfill['status'])
-    elif backfill and result['historyDays'] < 20 and archive.attempted(code,day,'software_history'):
+    elif backfill and not _formal_history_ready(result) and archive.attempted(code,day,'software_history'):
         history_backfill['status'] = 'already_attempted_today'
-    if backfill and not result['baselineReady'] and not archive.attempted(code,day,'tushare'):
-        if os.getenv('TUSHARE_TOKEN') or os.getenv('TUSHARE_API_TOKEN'):
+    if backfill and (not result['baselineReady'] or not _formal_history_ready(result)):
+        if ((os.getenv('TUSHARE_TOKEN') or os.getenv('TUSHARE_API_TOKEN'))
+                and archive.claim_attempt(code,day,'tushare',retry_incomplete=True)):
             try:
                 archive.save(code, fetch_tushare_bars(code,cutoff,poster=poster), cutoff)
                 archive.record(code,day,'tushare','fetched')
@@ -496,13 +656,17 @@ def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, bac
                 archive.record(code,day,'tushare','failed')
     result.update(code=code, fetchedAt=datetime.now(SHANGHAI).isoformat(), archivePath=str(archive.path))
     result['historyBackfill'] = history_backfill
+    result['supplementalMinuteFetch'] = supplemental
+    if required_days:
+        result['requiredCoverage'] = minute_coverage(archive.read(code, cutoff), cutoff, required_days)
     result['gaps'].extend(errors)
     result['softwareMarketUsed'] = software_fetched
     result['historyAccess'] = 'configured' if os.getenv('TUSHARE_TOKEN') or os.getenv('TUSHARE_API_TOKEN') else 'public_archive_warming'
     return result
 
 
-def archive_universe(codes, cutoff, cache_dir, *, workers=4, fetcher=None, progress=None):
+def archive_universe(codes, cutoff, cache_dir, *, workers=4, fetcher=None, progress=None,
+                     include_registered=True, timeout=None, count=240, required_days=None):
     """Daily whole-universe maintenance, independent of recommendation membership."""
     cutoff = _datetime(cutoff)
     archive = MinuteArchive(cache_dir)
@@ -511,31 +675,61 @@ def archive_universe(codes, cutoff, cache_dir, *, workers=4, fetcher=None, progr
         saved = json.loads(registry.read_text(encoding='utf-8')).get('codes',[])
     except (OSError,ValueError,TypeError):
         saved = []
-    codes = sorted({str(code) for code in [*codes,*saved] if re.fullmatch(r'(?:60|00)\d{4}',str(code))})
+    requested = list(dict.fromkeys(str(code) for code in codes if re.fullmatch(r'(?:60|00)\d{4}', str(code))))
+    registered = sorted(set(requested) | {str(code) for code in saved if re.fullmatch(r'(?:60|00)\d{4}', str(code))})
+    codes = requested + sorted(set(registered) - set(requested)) if include_registered else requested
     temporary=registry.with_suffix('.tmp')
-    temporary.write_text(json.dumps({'codes':codes,'updatedAt':cutoff.isoformat()}),encoding='utf-8')
+    temporary.write_text(json.dumps({'codes':registered,'updatedAt':cutoff.isoformat()}),encoding='utf-8')
     os.replace(temporary,registry)
     day = cutoff.date().isoformat()
     def collect(code):
-        if archive.attempted(code,day,'sina_archive') == ('ok',):
-            return 'cached'
+        dates = (required_days or {}).get(code)
+        diagnostic = {'code': code}
+        # A prior pre-close or stale response must not suppress the close fetch.
+        post_close = cutoff.hour >= 15
+        def complete(rows):
+            if dates:
+                coverage = minute_coverage(rows, cutoff, dates)
+                return coverage['pricePathComplete'] and not any(coverage['missingFields'].values())
+            current = [row for row in rows if str(row['end'])[:10] == day]
+            return len(current) == 240 if post_close else bool(current)
+        before = archive.read(code, cutoff)
+        if ((dates or count <= 240) and archive.attempted(code,day,'sina_archive') == ('ok',) and complete(before)):
+            diagnostic.update(status='cached', coverage=minute_coverage(before, cutoff, dates) if dates else None)
+            return diagnostic
         try:
-            raw = fetcher(code) if fetcher else fetch_recent_bars(code,count=240)
+            raw = fetcher(code) if fetcher else fetch_recent_bars(code,count=count,cutoff=cutoff,
+                                                                required_days=dates,diagnostics=diagnostic)
             rows = normalize_bars(raw,cutoff)
             if not rows:
                 raise ValueError('no valid bars')
-            archive.save(code,list(rows.values()),cutoff)
-            archive.record(code,day,'sina_archive','ok')
-            return 'updated'
-        except Exception:
+            diagnostic['archiveMerge'] = archive.save(code,list(rows.values()),cutoff)
+            after = archive.read(code, cutoff)
+            status = 'updated' if complete(after) else 'incomplete'
+            if not dates and count > 240 and len(after) < count:
+                status = 'incomplete'
+            if dates:
+                diagnostic['coverage'] = minute_coverage(after, cutoff, dates)
+            archive.record(code,day,'sina_archive','ok' if status == 'updated' else status)
+            diagnostic['status'] = status
+            return diagnostic
+        except Exception as error:
             archive.record(code,day,'sina_archive','failed')
-            return 'failed'
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        statuses = []
-        for status in pool.map(collect,codes):
-            statuses.append(status)
-            if progress and (len(statuses)%100==0 or len(statuses)==len(codes)):
-                progress({'done':len(statuses),'total':len(codes),'failed':statuses.count('failed')})
-    return {'universe':len(codes), **{key:statuses.count(key) for key in ('cached','updated','failed')},
+            diagnostic.update(status='failed', error=type(error).__name__)
+            if dates:
+                diagnostic['coverage'] = minute_coverage(archive.read(code, cutoff), cutoff, dates)
+            return diagnostic
+    if timeout is None:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            details = list(pool.map(collect,codes))
+        unfinished = []
+    else:
+        details, unfinished = bounded_fetch_map(collect, codes, workers=workers, timeout=timeout)
+    statuses = [item['status'] for item in details]
+    if progress:
+        progress({'done':len(statuses),'total':len(codes),'failed':statuses.count('failed')})
+    return {'universe':len(codes), **{key:statuses.count(key) for key in ('cached','updated','failed','incomplete')},
+            'deferred':len(unfinished), 'status':'partial' if unfinished or any(s in ('failed','incomplete') for s in statuses) else 'completed',
             'archivePath':str(archive.path),'asOf':cutoff.isoformat(),
+            'details':details,
             'scope':'全部沪深主板；与是否入选无关；公共源滚动积累，完整20日方可启用基准'}

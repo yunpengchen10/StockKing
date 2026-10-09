@@ -28,6 +28,7 @@ def make_service(monkeypatch, start, tmp_path, fetch=None, batch=None):
     def quote(code):
         events.append(('quote', tick[0]))
         return {'code': code, 'source': 'tencent', 'price': 10, 'pre_close': 9.8, 'open_price': 9.7,
+                'limit_up': 10.78, 'limit_down': 8.82,
                 'high': 10.05, 'low': 9.65, 'change_pct': 100*(10/9.8-1),
                 'amount': 980000000, 'volume':100000000, 'provider_timestamp': tick[0].isoformat(),
                 'active_buy_share_pct':60,'active_flow_source':'fixture','active_flow_as_of':tick[0].isoformat()}
@@ -39,6 +40,11 @@ def make_service(monkeypatch, start, tmp_path, fetch=None, batch=None):
         quote_fetcher=fetch or quote, batch_quote_fetcher=batch,
         minute_fetcher=lambda *a: {'metrics':{'speed_3m_pct':.3,'speed_5m_pct':.6,'local_high_5m':9.99,
                                                'local_low_5m':9.7,'amount_3m':5000000,'relative_amount_3m_20d':2},'historyDays':20,
+                                   'priceHistoryDays':20,
+                                   'v11Inputs':{'history_days':20,'price_history_days':20,
+                                       'z_r3_pct':1,'z_r5_pct':1,'z_a3_pct_per_min':1,'z_a1_pct_per_min':1,
+                                       'z_amount_3m':1,'z_amount_5m':1,'v3_ratio':2,'v5_ratio':2,
+                                       'r3_pct':.3,'r5_pct':.6,'vwap_slope_5m_pct':.1},
                                    'asOf':(tick[0]-timedelta(minutes=1)).isoformat(), 'source':'test_minutes','gaps':[]},
         sector_fetcher=lambda codes,*a: {code:{'metrics':{'sector_coverage_pct':100,'sector_peer_count':10,'sector_return_5m_pct':.2,'sector_breadth':80,'sector_relative_5m_pct':.4},
             'asOf':(tick[0]-timedelta(minutes=1)).isoformat(),'sector':{'name':'fixture'}} for code in codes},
@@ -76,13 +82,46 @@ def test_manual_live_refresh_does_not_wait_for_schedule(monkeypatch, tmp_path):
     assert len(events) == 2
 
 
+def test_emotion_archive_failure_does_not_abort_quote_and_risk_checks(monkeypatch, tmp_path):
+    import sqlite3
+    from src.services.yao_scout import research_factors
+    start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
+    service, _, events, _ = make_service(monkeypatch, start, tmp_path)
+    def failed(*args, **kwargs):
+        raise sqlite3.OperationalError('database locked')
+    monkeypatch.setattr(research_factors.MarketEmotionArchive, 'observe', failed)
+    result = service.run('live')
+    assert result['marketEmotion']['status'] == 'unavailable'
+    assert result['marketEmotion']['score'] is None
+    assert result['dataQuality']['quote_coverage']['fresh'] == 1
+    assert ('quote', start) in events
+
+
+def test_market_snapshot_is_archived_at_receipt_before_slow_research(monkeypatch, tmp_path):
+    from src.services.yao_scout import research_factors
+    start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
+    service, tick, _, _ = make_service(monkeypatch, start, tmp_path)
+    original = service.yao.history_fetcher
+    def slow(*args, **kwargs):
+        tick[0] += timedelta(minutes=6)
+        return original(*args, **kwargs)
+    service.yao.history_fetcher = slow
+    captured = []
+    def observe(self, snapshot, cutoff, *, received_at):
+        captured.append((tick[0], cutoff, received_at))
+        return {'status': 'insufficient', 'score': None, 'asOf': start.isoformat(), 'features': {}, 'gaps': []}
+    monkeypatch.setattr(research_factors.MarketEmotionArchive, 'observe', observe)
+    service.run('live')
+    assert captured == [(start, start, start)]
+
+
 def test_manual_progress_tracks_evidence_stages_and_usable_minutes(monkeypatch, tmp_path):
     start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
     service, _, _, _ = make_service(monkeypatch, start, tmp_path)
     progress = []
     service.progress_callback = lambda value, message: progress.append((value, message))
     result = service.run('live')
-    assert [value for value, _ in progress] == [12, 20, 32, 48, 60, 72, 80, 88, 94]
+    assert [value for value, _ in progress] == [12, 20, 32, 48, 60, 72, 80, 82, 88, 94]
     assert result['dataQuality']['minute_coverage'] == {'requested': 1, 'usable': 1, 'missing': 0}
     assert 'minute_warmup' not in result['dataQuality']['stageTimingsMs']
     assert set(result['dataQuality']['stageTimingsMs']) >= {'snapshot', 'daily_history', 'minute_evidence', 'final_quotes', 'evaluation'}
@@ -91,6 +130,22 @@ def test_manual_progress_tracks_evidence_stages_and_usable_minutes(monkeypatch, 
     for candidate in result['candidates']:
         assert candidate['algorithmContractId'] == result['algorithm']['contractId']
         assert is_entry_eligible(candidate)
+
+
+def test_slow_context_evaluation_finishes_before_final_quote(monkeypatch, tmp_path):
+    from src.services import akshare_context
+    start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
+    service, tick, events, _ = make_service(monkeypatch, start, tmp_path)
+    original = akshare_context.for_stock
+    def slow_context(*args, **kwargs):
+        result = original(*args, **kwargs)
+        tick[0] += timedelta(seconds=45)
+        return result
+    monkeypatch.setattr(akshare_context, 'for_stock', slow_context)
+    result = service.run('live')
+    assert events[-1] == ('quote', start + timedelta(seconds=45))
+    assert result['dataQuality']['quote_coverage']['fresh'] == 1
+    assert result['dataQuality']['stageTimingsMs'].get('context_evaluation') is not None
 
 
 def test_total_minute_stage_failure_is_reported_even_with_fresh_quotes(monkeypatch, tmp_path):
@@ -105,7 +160,12 @@ def test_total_minute_stage_failure_is_reported_even_with_fresh_quotes(monkeypat
     assert result['dataQuality']['minute_coverage'] == {'requested': 1, 'usable': 0, 'missing': 1}
     assert result['dataQuality']['stageIncompleteCounts']['minute_evidence'] == 1
     from src.services.stock_king_display import displayable_run
-    assert not displayable_run(result)
+    # Current day/daily structure can support explicitly separate T+1 research;
+    # it must not upgrade the failed intraday entry checks.
+    assert not result['candidates']
+    assert result['nextDayWatchlist']
+    assert not result['nextDayWatchlist'][0]['nextDaySignal']['executionEligible']
+    assert displayable_run(result)
 
 
 def test_local_daily_history_reuses_software_chart_provider(monkeypatch, tmp_path):
@@ -117,7 +177,7 @@ def test_local_daily_history_reuses_software_chart_provider(monkeypatch, tmp_pat
     class Client:
         available=True
         def bars(self,code,period,count):
-            assert (code,period,count)==('600001','101',100)
+            assert (code,period,count)==('600001','101',260)
             return {'source':'fixture','adjustment':'none','bars':[
                 {'end':day.date().isoformat()+'T15:00:00+08:00',
                  'open':9.7,'high':10.8,'low':9.5,'close':9.8}
@@ -178,7 +238,8 @@ def test_missing_timestamp_stays_missing_and_reviewable(monkeypatch, tmp_path):
 def test_scan_reads_prior_review_reminders_without_changing_rank(monkeypatch, tmp_path):
     start = datetime(2026, 9, 14, 10, 30, tzinfo=base.TZ)
     service, _, _, _ = make_service(monkeypatch, start, tmp_path)
-    monkeypatch.setattr(local, 'read_observation_reminders', lambda db, code, now: ['历史缺口需重新核验'])
+    monkeypatch.setattr(local, 'read_observation_reminders_batch',
+                        lambda db, codes, now: {code: ['历史缺口需重新核验'] for code in codes})
     result = service.run('1030')
     candidate = result['candidates'][0]
     assert candidate['observationReminders'] == ['历史缺口需重新核验']
@@ -193,12 +254,39 @@ def test_daily_review_wires_observations_and_new_ledger(monkeypatch, tmp_path):
     service.db.save_yao_adaptive_state = lambda *a: None
     monkeypatch.setattr(local, 'review_local_observations', lambda *a, **kw: {'status': 'reviewed', 'verified_count': 2})
     captured=[]
-    monkeypatch.setattr(minute_history,'archive_universe',lambda codes,*a: captured.extend(codes) or {'universe':len(codes),'updated':len(codes)})
+    monkeypatch.setattr(minute_history,'archive_universe',lambda codes,*a,**kw: captured.extend(codes) or {'universe':len(codes),'updated':len(codes)})
     result = service.run('review')
     assert result['observationReview']['verified_count'] == 2
     assert result['learningReview']['updated'] == 0
     assert events == [('snapshot',start)] and result['llmUsed'] is False
     assert captured==['600001'] and result['minuteArchiveMaintenance']['updated']==1
+
+
+def test_review_is_saved_even_when_whole_market_archive_fails(monkeypatch, tmp_path):
+    from src.services.yao_scout import minute_history, signal_learning
+    start = datetime(2026, 9, 14, 15, 30, tzinfo=base.TZ)
+    service, _, _, saved = make_service(monkeypatch, start, tmp_path)
+    service.db.save_yao_adaptive_state = lambda *a: None
+    calls = []
+    monkeypatch.setattr(signal_learning.SignalLearningService, 'review_requirements',
+                        lambda *a: {'600002': ['2026-09-14']})
+    monkeypatch.setattr(signal_learning.SignalLearningService, 'review_due',
+                        lambda *a: calls.append('review') or {'updated': 1})
+    monkeypatch.setattr(local, 'review_local_observations', lambda *a, **kw: {'status': 'reviewed'})
+    def archive(codes, *a, **kw):
+        calls.append('priority' if not kw.get('include_registered', True) else 'whole_market')
+        assert saved and saved[0]['learningReview']['updated'] == 1
+        if kw.get('include_registered', True):
+            raise RuntimeError('provider failed')
+        assert list(codes) == ['600002'] and kw['count'] == 1970 and kw['timeout'] == 120
+        assert kw['required_days'] == {'600002': ['2026-09-14']}
+        return {'updated': 1}
+    monkeypatch.setattr(minute_history, 'archive_universe', archive)
+    result = service.run('review')
+    assert calls == ['review', 'priority', 'review', 'whole_market']
+    assert result['learningReview']['updated'] == 1
+    assert result['minuteArchiveMaintenance']['status'] == 'failed'
+    assert saved[-1]['reviewProgress']['stage'] == 'completed'
 
 
 def test_expanded_prescreen_researches_every_stock_in_a_small_universe(monkeypatch, tmp_path):

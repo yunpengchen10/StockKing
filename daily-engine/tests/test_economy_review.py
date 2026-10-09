@@ -86,6 +86,7 @@ def test_local_scan_never_fills_missing_evidence_with_llm_or_candidates(tmp_path
     from zoneinfo import ZoneInfo
     from src.services.yao_scout import local_opportunities as local
     from src.services.yao_scout import daily_opportunities as base
+    from src.services import software_market
     saved=[]
     db=SimpleNamespace(list_yao_runs=lambda **kw:[],list_yao_dlm=lambda **kw:[],save_yao_run=saved.append)
     frame=pd.DataFrame([{'code':f'60000{i}','name':'股票','price':10} for i in range(8)])
@@ -93,12 +94,13 @@ def test_local_scan_never_fills_missing_evidence_with_llm_or_candidates(tmp_path
                         data_dir=tmp_path, history_fetcher=lambda *a,**kw:pd.DataFrame())
     monkeypatch.setattr(base.HighClient,'ask',lambda *a:pytest.fail('LLM in background'))
     monkeypatch.setattr(base,'is_market_open',lambda *a:True)
-    monkeypatch.setattr(local,'get_tier_model_service',lambda:SimpleNamespace(score_local_five_day=lambda rows:rows))
+    monkeypatch.setattr(software_market.SoftwareMarketClient, 'from_environment',
+                        lambda: SimpleNamespace(available=False))
     result=local.LocalOpportunityService(yao,{'api_key':'ignored'},quote_fetcher=lambda code:{'code':code},
         context_provider=SimpleNamespace(collect=lambda *a:{'tables':[]}),
         minute_fetcher=lambda *a:{'metrics':{}}, sector_fetcher=lambda *a:{}, fund_fetcher=lambda *a:{},
         clock=lambda:datetime(2026,9,10,10,30,tzinfo=ZoneInfo('Asia/Shanghai'))).run('1030')
-    assert result['candidates']==[] and result['modelVersion']==local.VERSION
+    assert result['candidates']==[] and result['modelVersion']==local.SCORE_VERSION
     assert result['evidenceInsufficient'] and result['dataQuality']['llm_calls']==0
     assert result['llmUsed'] is False and result['aiAudit']==[]
 

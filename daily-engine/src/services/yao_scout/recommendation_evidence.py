@@ -80,6 +80,9 @@ def daily_evidence(frame, cutoff):
     close = data.close
     tr = pd.concat([data.high-data.low, (data.high-close.shift()).abs(), (data.low-close.shift()).abs()], axis=1).max(axis=1)
     result['asOf'] = data.date.iloc[-1].isoformat()
+    result['previousSession'] = {'asOf': result['asOf'], 'preCloseAsOf': data.date.iloc[-2].isoformat(), 'source': result['source'],
+        'priceBasis': frame.attrs.get('daily_adjustment') or frame.attrs.get('adjustment'),
+        'preClose': float(close.iloc[-2]), 'close': float(close.iloc[-1]), 'high': float(data.high.iloc[-1])}
     m = result['metrics']
     m.update(history_sessions=len(data), last_close=float(close.iloc[-1]),
              ma5=float(close.tail(5).mean()), ma10=float(close.tail(10).mean()), ma20=float(close.tail(20).mean()),
@@ -261,12 +264,13 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
         branch = '高波动·' + branch
         risks.append(f'当日振幅金额{high-low:.2f}元高于历史ATR14 {d["atr14"]:.2f}元，须防冲高回落；高波动本身不加分或淘汰')
     gaps = list((daily or {}).get('gaps') or []) + minute_gaps + independent_gaps
-    gaps.append('催化事件及预期差尚未独立核验，不作为本轮入选理由')
+    if not v11:
+        gaps.append('催化事件及预期差尚未独立核验，不作为本轮入选理由')
     if not sector_ok:
         gaps.append('行业同刻共振未完整确认；降低置信度，不作为单项否决' if v11 else
                     '未同时满足行业同刻上涨、半数同业上涨及个股相对领先；不按孤立脉冲推荐')
     if not baseline_ok:
-        gaps.append('同刻20日基准尚未齐全；5—19日仅低置信排序，少于5日不生成V1.1分数' if v11 else
+        gaps.append('同刻20日基准尚未齐全；5—19日仅观察，少于5日不评分；正式候选另须通过关键因子和分档风险检查' if v11 else
                     '同刻20日基准尚未齐全，盘中推荐资格未开放')
     elif not volume_confirmed:
         risks.append('近3分钟成交额未超过20日同刻中位数，即时放量未确认')

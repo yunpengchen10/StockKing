@@ -1,5 +1,6 @@
 <script setup>
-import { computed, h, inject, onBeforeMount, onBeforeUnmount, ref } from 'vue'
+import { computed, h, inject, onBeforeMount, onBeforeUnmount, ref, watch } from 'vue'
+import { usePageActive } from '../utils/pageSession.mjs'
 import { useRouter } from 'vue-router'
 import { NButton, NInput, NSelect, NTag, useDialog, useMessage } from 'naive-ui'
 import {
@@ -22,6 +23,7 @@ import { watchReturn, priceText } from '../utils/watchlist.mjs'
 import StockKingIcon from './StockKingIcon.vue'
 
 const router = useRouter()
+const pageActive = usePageActive()
 const message = useMessage()
 const dialog = useDialog()
 const darkTheme = inject('appDarkTheme', ref(true))
@@ -314,10 +316,11 @@ const columns = [
 ]
 
 onBeforeMount(() => {
-  unsubscribePrice = EventsOn("stock_price", () => { if (!quoteRefreshTimer) quoteRefreshTimer=setTimeout(() => { quoteRefreshTimer=null; loadWatchlist() },1000) })
+  unsubscribePrice = EventsOn("stock_price", () => { if (pageActive.value && !quoteRefreshTimer) quoteRefreshTimer=setTimeout(() => { quoteRefreshTimer=null; if (pageActive.value) loadWatchlist() },1000) })
   Promise.all([loadGroups(), loadWatchlist(true)]).catch(error => message.error(`初始化自选失败：${error?.message || error}`))
 })
 onBeforeUnmount(() => { unsubscribePrice?.(); clearTimeout(quoteRefreshTimer); if (searchTimer) clearTimeout(searchTimer); searchSequence++ })
+watch(pageActive, active => { if (active) void Promise.all([loadGroups(), loadWatchlist()]) })
 </script>
 
 <template>

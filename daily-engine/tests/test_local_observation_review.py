@@ -48,6 +48,20 @@ def test_price_comparison_keeps_two_source_times_and_never_creates_trade_returns
     assert "非成交收益" in result["meaning"]
 
 
+def test_batch_reminders_reads_large_saved_state_once_and_keeps_time_boundary():
+    db = MemoryDB([])
+    db.state = {'reviewed_at': NOW.isoformat(), 'days': {NOW.date().isoformat(): {
+        'missing': {'600001': 3}, 'windvanes': {'600002': 1}}}}
+    reads = []
+    original = db.get_yao_adaptive_state
+    db.get_yao_adaptive_state = lambda key: reads.append(key) or original(key)
+    result = mod.read_observation_reminders_batch(db, ['600001', '600002', '600003'], NOW)
+    assert len(reads) == 1
+    assert '3' in result['600001'][0] and '风向标' in result['600002'][0]
+    assert result['600003'] == []
+    assert mod.read_observation_reminders_batch(db, ['600001'], NOW-timedelta(seconds=1)) == {'600001': []}
+
+
 def test_all_profiles_and_rejected_controls_are_reviewed_once():
     saved = row()
     pick = saved['result']['candidates'].pop()
@@ -62,6 +76,15 @@ def test_all_profiles_and_rejected_controls_are_reviewed_once():
     assert observations['600001']['selected_profiles'] == ['aggressive']
     assert observations['600002']['selected_profiles'] == []
     assert not result['training_eligible']
+
+
+@pytest.mark.parametrize("mode", ["king_0940", "king_0955"])
+def test_current_morning_slots_are_included_in_close_observation_review(mode):
+    saved = row()
+    saved["mode"] = mode
+    result = mod.review_local_observations(MemoryDB([saved]), lambda _: quote(), NOW)
+    assert result["observation_count"] == result["verified_count"] == 1
+    assert result["observations"][0]["run_id"] == saved["run_id"]
 
 
 @pytest.mark.parametrize("change", [

@@ -150,3 +150,75 @@ def test_old_positive_financials_do_not_hide_incomplete_latest_coverage():
     context = good_context()
     context['coverage']['financials'] = False
     assert evaluate(candidate(), context, DAILY)['profiles']['conservative']['state'] == 'watch'
+
+
+def v12_candidate(price=10):
+    from src.services.yao_scout.v11_factors import SCORE_VERSION
+    return {**candidate(price), 'scoreVersion':SCORE_VERSION, 'finalScore':70,
+            'quote': {'price': price, 'pre_close': 9.8, 'limit_up': 10.78, 'limit_down': 8.82},
+            'strategyBranch':'分钟局部突破观察', 'baselineHistoryDays':20,
+            'priceHistoricalCoverageDays':20, 'dataEligibility':{'status':'formal'},
+            'factorScores':{key:60 for key in ('M','V','W','B')},
+            'indicatorEvidence':[{'key':'local_high_5m','value':9.99,'status':'observed'}]}
+
+
+def test_v12_three_profiles_execute_distinct_price_limits():
+    from src.services.yao_scout.precision_policy import V11_VERSION
+    result = evaluate(v12_candidate(10.3), good_context(), DAILY)
+    assert result['version'] == V11_VERSION
+    assert result['profiles']['conservative']['state']=='avoid'
+    assert result['profiles']['regular']['state']=='avoid'
+    assert result['profiles']['aggressive']['entryEligible']
+    assert result['probability'] is None
+
+
+@pytest.mark.parametrize('field,value', [('limit_up', None), ('limit_down', None),
+                                        ('pre_close', None), ('limit_down', 11)])
+def test_missing_or_conflicting_provider_limit_cannot_be_formal_recommendation(field, value):
+    item = v12_candidate()
+    item['quote'][field] = value
+    result = evaluate(item, good_context(), DAILY)
+    assert result['executionQuoteData']['status'] == 'incomplete'
+    assert not any(profile['entryEligible'] for profile in result['profiles'].values())
+
+
+@pytest.mark.parametrize('context', [
+    {**good_context(), 'coverage':{}},
+    {**good_context(), 'forecasts':[{'type':'预减','metric':'归母净利润'}]},
+    {**good_context(), 'unlocks':[{'floatRatioPct':10}]},
+    {**good_context(), 'unlocks':[{'floatRatioPct':None}]},
+])
+def test_v12_missing_events_and_known_negative_risks_override_high_score(context):
+    item = {**v12_candidate(), 'finalScore':100, 'confidence':1.}
+    assert not any(row['entryEligible'] for row in evaluate(item, context, DAILY)['profiles'].values())
+
+
+def test_v12_known_reward_risk_and_profile_unlock_limits_are_enforced():
+    item = {**v12_candidate(), 'structureRewardRisk':1.3}
+    profiles = evaluate(item, good_context(), DAILY)['profiles']
+    assert not profiles['conservative']['entryEligible']
+    assert not profiles['regular']['entryEligible']
+    assert profiles['aggressive']['entryEligible']
+    profiles = evaluate(v12_candidate(), {**good_context(),'unlocks':[{'floatRatioPct':6}]}, DAILY)['profiles']
+    assert not profiles['regular']['entryEligible'] and profiles['aggressive']['entryEligible']
+
+
+def test_v12_aggressive_unknown_reward_risk_requires_verified_minute_breakout():
+    item = {**v12_candidate(), 'structureRewardRisk':None}
+    profiles = evaluate(item, good_context(), DAILY)['profiles']
+    assert not profiles['regular']['entryEligible']
+    assert not profiles['conservative']['entryEligible']
+    assert profiles['aggressive']['entryEligible']
+    assert '未知' in profiles['aggressive']['uncertainties'][0]
+    for change in ({'indicatorEvidence':[]}, {'strategyBranch':'分钟趋势延续观察'},
+                   {'indicatorEvidence':[{'key':'local_high_5m','value':9.99,'status':'unavailable'}]},
+                   {'evidenceChecks':{'minute_structure':False}}):
+        assert not evaluate({**item, **change}, good_context(), DAILY)['profiles']['aggressive']['entryEligible']
+    assert not evaluate({**item,'structureRewardRisk':1.1},good_context(),DAILY)['profiles']['aggressive']['entryEligible']
+
+
+def test_v12_aggressive_does_not_require_daily_bullish_alignment():
+    nontrend = {'metrics':{**DAILY['metrics'],'ma10':10.2,'ma20':10.4}}
+    profiles = evaluate(v12_candidate(), good_context(), nontrend)['profiles']
+    assert profiles['regular']['state']=='watch'
+    assert profiles['aggressive']['entryEligible']

@@ -1,5 +1,7 @@
 <script setup>
 import {onBeforeMount, onBeforeUnmount, ref, computed, h} from 'vue'
+import {usePageActive} from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 import {GetConfig, GetUplimitHot, IsTradingTime, IsTradingDay, GetLatestTradingDay} from "../../wailsjs/go/main/App";
 import {NButton, NText, NTag, NTooltip, NProgress, useMessage} from "naive-ui";
 import StockLightweightKlineChart from "./StockLightweightKlineChart.vue";
@@ -32,6 +34,7 @@ let refreshTimer = null
 function startAutoRefresh() {
   stopAutoRefresh()
   refreshTimer = setInterval(() => {
+    if (!pageActive.value) return
     if (selectedDate.value !== todayYMD.value) return
     IsTradingTime().then(trading => {
       if (trading) {

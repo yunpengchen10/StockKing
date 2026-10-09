@@ -20,6 +20,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from .eastmoney_context import TABLES as EASTMONEY_TABLES, fetch_eastmoney_context
+
 TZ = ZoneInfo("Asia/Shanghai")
 VERSION = "akshare-context-v1"
 FIELDS = {
@@ -56,6 +58,36 @@ def quarter_ends(day, count=2):
     ends = [date(year, month, last) for year in range(day.year - 2, day.year + 1)
             for month, last in ((3, 31), (6, 30), (9, 30), (12, 31))]
     return sorted((d for d in ends if d < day), reverse=True)[:count]
+
+
+def _event_identity(kind, params, row):
+    """Content revisions have their own identity; identical downloads do not."""
+    content = {key: row.get(key) for key in FIELDS[kind]}
+    encoded = json.dumps([kind, params.get('date'), content], ensure_ascii=False,
+                         sort_keys=True, separators=(',', ':'), allow_nan=False)
+    return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+
+def _first_seen_rows(folder, kind, params, rows, observed):
+    first = {}
+    for path in folder.glob('*.json'):
+        try:
+            old = json.loads(path.read_text(encoding='utf-8'))
+            at = timestamp(old['observedAt'])
+            if old.get('kind') != kind or old.get('status') != 'available' or at > observed:
+                continue
+            for row in old.get('rows', []):
+                identity = _event_identity(kind, old.get('params') or {}, row)
+                known = timestamp(row.get('_firstSeenAt') or old['observedAt'])
+                if known <= at:
+                    first[identity] = min(first.get(identity, known), known)
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+    for row in rows:
+        identity = _event_identity(kind, params, row)
+        row['_eventId'] = identity
+        row['_firstSeenAt'] = first.get(identity, observed).isoformat()
+    return rows
 
 
 def publication_time(value):
@@ -108,11 +140,14 @@ def _fetch_worker(connection, endpoint, params):
 class AkshareContextProvider:
     def __init__(self, directory, *, fetcher=None, clock=None, timeout=35):
         self.directory = Path(directory)
-        self.fetcher = fetcher or fetch_akshare
+        self.fetcher = fetcher or fetch_eastmoney_context
         self.clock = clock or (lambda: datetime.now(TZ))
         self.timeout = timeout
 
     def _table(self, kind, params, cutoff, refresh):
+        direct_table = EASTMONEY_TABLES[ENDPOINTS[kind]] if self.fetcher is fetch_eastmoney_context else None
+        source = ('Eastmoney datacenter/' + direct_table['report']) if direct_table else 'AKShare/' + ENDPOINTS[kind]
+        source_url = direct_table['url'] if direct_table else None
         key = hashlib.sha256(json.dumps([kind, params], sort_keys=True).encode()).hexdigest()[:20]
         folder = self.directory / key
         for path in sorted(folder.glob("*.json"), reverse=True):
@@ -120,12 +155,15 @@ class AkshareContextProvider:
                 packet = json.loads(path.read_text(encoding="utf-8"))
                 age = (cutoff - timestamp(packet["observedAt"])).total_seconds()
                 if 0 <= age <= 21600 and packet.get("version") == VERSION:
+                    if any(not row.get('_firstSeenAt') for row in packet.get('rows', [])):
+                        packet['rows'] = _first_seen_rows(folder, kind, params, packet['rows'],
+                                                         timestamp(packet['observedAt']))
                     return packet
             except (OSError, ValueError, KeyError, TypeError):
                 continue
         if not refresh:
             return {"kind": kind, "status": "unavailable", "rows": [], "params": params,
-                    "source": "AKShare/" + ENDPOINTS[kind], "reason": "截止时点前无有效归档；禁止用当前数据补历史"}
+                    "source": source, "sourceUrl": source_url, "reason": "截止时点前无有效归档；禁止用当前数据补历史"}
         try:
             frame = self.fetcher(ENDPOINTS[kind], params, self.timeout)
             required = {"股票代码", "最新公告日期" if kind == "financials" else "公告日期" if kind == "forecast" else "解禁时间"}
@@ -139,8 +177,13 @@ class AkshareContextProvider:
             for row in rows:
                 row["股票代码"] = code_of(row["股票代码"])
             observed = timestamp(self.clock())
+            rows = _first_seen_rows(folder, kind, params, rows, observed)
             packet = {"version": VERSION, "kind": kind, "params": params, "status": "available",
-                      "source": "AKShare/" + ENDPOINTS[kind], "observedAt": observed.isoformat(), "rows": rows}
+                      "source": frame.attrs.get('source') or source,
+                      "sourceUrl": frame.attrs.get('sourceUrl') or source_url,
+                      "collection": {key: frame.attrs[key] for key in ('pages', 'recordCount', 'complete', 'collectionMethod', 'sourceUrl', 'universeFilter', 'pageVersions')
+                                     if key in frame.attrs},
+                      "observedAt": observed.isoformat(), "rows": rows}
             folder.mkdir(parents=True, exist_ok=True)
             path = folder / (observed.strftime("%Y%m%dT%H%M%S%f") + ".json")
             temporary = path.with_suffix("." + uuid4().hex + ".tmp")
@@ -152,7 +195,7 @@ class AkshareContextProvider:
             return packet
         except Exception as exc:
             return {"kind": kind, "params": params, "status": "unavailable", "rows": [],
-                    "source": "AKShare/" + ENDPOINTS[kind], "reason": type(exc).__name__ + ": " + str(exc)[:120]}
+                    "source": source, "sourceUrl": source_url, "reason": type(exc).__name__ + ": " + str(exc)[:120]}
 
     def collect(self, cutoff=None, *, refresh=True):
         now = timestamp(self.clock())
@@ -198,13 +241,23 @@ def for_stock(bundle, code, cutoff):
                 continue
             base = {"source": table["source"], "observedAt": observed.isoformat(),
                     "reportPeriod": table.get("params", {}).get("date") or ""}
+            try:
+                first_seen = timestamp(row.get('_firstSeenAt') or table['observedAt'])
+                if first_seen > observed:
+                    raise ValueError('first observation follows this archive')
+            except (ValueError, TypeError):
+                covered[kind].append(False)
+                output['gaps'].append(kind + ' 首次可知时间无效')
+                continue
+            base.update(firstSeenAt=first_seen.isoformat(),
+                        eventId=row.get('_eventId') or _event_identity(kind, table.get('params') or {}, row))
             if kind in ("financials", "forecast"):
                 published = publication_time(row.get("最新公告日期" if kind == "financials" else "公告日期"))
                 if published is None or published > cutoff:
                     output["gaps"].append(kind + " 公告时间未知或尚未到可用时点")
                     covered[kind].append(False)
                     continue
-                base["availableAt"] = max(published, observed).isoformat()
+                base["availableAt"] = max(published, first_seen).isoformat()
                 base["publishedDate"] = str(row.get("最新公告日期" if kind == "financials" else "公告日期"))[:10]
             if kind == "financials":
                 base.update(profit=number(row.get("净利润-净利润")), profitGrowthPct=number(row.get("净利润-同比增长")),

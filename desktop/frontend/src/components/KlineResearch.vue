@@ -15,8 +15,10 @@ import { useMessage } from 'naive-ui'
 import StockLightweightKlineChart from './StockLightweightKlineChart.vue'
 import StockKingIcon from './StockKingIcon.vue'
 import { stockOption, toInternalStockCode, toResearchCode } from '../utils/symbol'
+import { usePageActive } from '../utils/pageSession.mjs'
 
 const route = useRoute()
+const pageActive = usePageActive()
 const router = useRouter()
 const message = useMessage()
 const darkTheme = inject('appDarkTheme', ref(true))
@@ -86,7 +88,7 @@ async function openSymbol(nextCode, nextName = '', syncRoute = true) {
       SaveStockKingPreference('kline.lastViewedSymbol', JSON.stringify({ code: normalized, name: name.value })),
     ])
   } catch {}
-  if (syncRoute && (route.query.code !== code.value || route.query.name !== name.value)) {
+  if (syncRoute && pageActive.value && router.currentRoute.value.name === 'klineAnalysis' && (route.query.code !== code.value || route.query.name !== name.value)) {
     await router.replace({ name: 'klineAnalysis', query: { code: code.value, name: name.value } })
   }
   void loadNote()
@@ -98,8 +100,10 @@ async function loadNote() {
     note.value = { symbolCode: '', symbolName: '', coreLogic: '', observationPlan: '', invalidationRisk: '' }
     return
   }
+  const symbol = code.value
   try {
-    const stored = await GetResearchNote(code.value)
+    const stored = await GetResearchNote(symbol)
+    if (code.value !== symbol) return
     note.value = {
       symbolCode: code.value,
       symbolName: name.value,
@@ -129,17 +133,21 @@ async function saveNote() {
 async function loadForecasts() {
   if (!code.value) {
     forecasts.value = []
+    forecastsLoading.value = false
     return
   }
   if (!/\.(SH|SZ|BJ)$/i.test(code.value)) {
     forecasts.value = []
+    forecastsLoading.value = false
     return
   }
   forecastsLoading.value = true
+  const symbol = code.value
   const result = await Promise.all([1, 5, 20].map(async (horizon) => {
-    try { return await GetForecast(code.value, horizon) }
+    try { return await GetForecast(symbol, horizon) }
     catch (error) { return { horizon, available: false, unavailableReason: error?.message || String(error) } }
   }))
+  if (code.value !== symbol) return
   forecasts.value = result
   forecastsLoading.value = false
 }
@@ -192,7 +200,7 @@ onMounted(() => {
   window.addEventListener('resize', updateHeight)
   try {
     EventsOn('klineSelectStock', (payload) => {
-      if (payload?.ts_code) void openSymbol(payload.ts_code, payload.name)
+      if (pageActive.value && payload?.ts_code) void openSymbol(payload.ts_code, payload.name)
     })
   } catch {}
 })

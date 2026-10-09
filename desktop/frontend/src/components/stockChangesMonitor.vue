@@ -1,5 +1,7 @@
 <script setup>
 import {computed, h, onBeforeMount, onBeforeUnmount, onMounted, onUnmounted, ref, reactive} from 'vue'
+import {usePageActive} from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 import {GetStockChanges, GetConfig, GetStockChangeHistory, SaveStockChangesToHistory, GetAllStockChangesWithPaging} from "../../wailsjs/go/main/App";
 import {NButton, NTag, NText, useMessage, useNotification} from "naive-ui";
 import {useRouter} from 'vue-router'
@@ -410,6 +412,7 @@ function startAutoRefresh() {
   stopAutoRefresh()
   countdown.value = refreshSeconds.value
   refreshInterval.value = setInterval(() => {
+    if (!pageActive.value) return
     checkTradingTime()
     countdown.value--
     if (countdown.value <= 0) {

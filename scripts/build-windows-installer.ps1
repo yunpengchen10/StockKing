@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$BuiltExe,
     [Parameter(Mandatory = $true)][string]$BuiltEngineDir,
     [Parameter(Mandatory = $true)][string]$WebViewInstaller,
-    [string]$OutputDir
+    [string]$OutputDir,
+    [ValidateSet('lzma', 'zlib')][string]$Compression = 'lzma'
 )
 
 # Package validated native builds. This does not read the user's installation,
@@ -53,7 +54,7 @@ try {
     try {
         & $nsisPath "/DINFO_PRODUCTVERSION=$version" "/DARG_WAILS_AMD64_BINARY=$desktopExe" `
             "/DARG_STOCKKING_SIDECAR_ROOT=$mappedDrive" "/DARG_STOCKKING_WEBVIEW2_INSTALLER=$runtimeInstaller" `
-            "/DARG_STOCKKING_OUTPUT=$outputFile" 'project.nsi'
+            "/DARG_STOCKKING_OUTPUT=$outputFile" "/DARG_STOCKKING_COMPRESSOR=$Compression" 'project.nsi'
         if ($LASTEXITCODE -ne 0) { throw 'NSIS installer build failed.' }
     } finally { Pop-Location }
 } finally {
@@ -61,6 +62,7 @@ try {
 }
 $manifest = [ordered]@{
     version = $version
+    compression = $Compression
     createdAtUtc = [DateTime]::UtcNow.ToString('o')
     installer = [IO.Path]::GetFileName($outputFile)
     installerSha256 = (Get-FileHash -LiteralPath $outputFile -Algorithm SHA256).Hash.ToLowerInvariant()

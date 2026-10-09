@@ -76,7 +76,7 @@ def test_corrupt_configured_champion_is_not_reported_as_effective(tmp_path):
     assert state['configuredChampionVersion'] == 'missing'
     assert state['championVersion'] is None
     assert state['stage'] == 'rules_cold_start'
-    assert state['effectiveRankVersion'] == 'rules_v1.1'
+    assert state['effectiveRankVersion'] == 'rules_v1.2'
     assert state['effectiveRankSource'] == 'rules'
     assert state['rankingFallbackReason']
 
@@ -111,17 +111,22 @@ def test_live_ranking_and_saved_provenance_use_only_shared_eligible_rows(tmp_pat
         return np.arange(len(rows),dtype=float)+70,np.full(len(rows),.5)
     monkeypatch.setattr(service,'_predict_artifact',predict)
     good = _candidate('000001',DAY)
+    good['researchFactors'] = {'C': {'value': 55, 'source': 'announcement', 'availableAt': _clock(DAY).isoformat()}}
+    good['factorCoverage'] = {'early': .9}
     blocked = {**_candidate('000002',DAY),'evidenceEligible':False,'finalScore':99}
     ranked = service.rank_candidates([blocked,good])
     assert observed == [1]
     assert ranked[0]['code'] == '000001'
     assert ranked[0]['learningRankVersion'] == 'model'
-    assert ranked[1]['learningRankVersion'] == 'rules_v1.1'
+    assert ranked[1]['learningRankVersion'] == 'rules_v1.2'
     service.persist_scan({'status':'completed_observations','scoreVersion':algorithm_contract()['scoreVersion'],
                           'candidates':ranked[:1],'controls':ranked[1:]},'0940',_clock(DAY),True)
     signals = service.history()['items'][0]['signals']
     assert signals[0]['snapshot']['learningRankVersion'] == 'model'
     assert signals[0]['snapshot']['algorithmContractId'] == algorithm_contract()['contractId']
+    assert signals[0]['snapshot']['researchFactors'] == good['researchFactors']
+    assert signals[0]['snapshot']['dataEligibility']['status'] == 'formal'
+    assert signals[0]['snapshot']['priceHistoricalCoverageDays'] == 20
     assert signals[0]['trainingEligible']
     assert not signals[1]['trainingEligible']
 
@@ -130,7 +135,8 @@ def test_account_baseline_uses_saved_selection_rank_and_model_ties_use_live_orde
     day = DAY.isoformat()
     common = {'day':day,'runId':'same-scan','selected':True,'filled':True,
               'decisionAt':_clock(DAY).isoformat(),'entryAt':_clock(DAY,9,42).isoformat(),
-              'exitAt':_clock(DAY,15,0).isoformat(),'entryPrice':10.,'entryMinuteVolume':1_000_000}
+              'exitAt':_clock(DAY,15,0,0).isoformat(),'entryPrice':10.,'entryMinuteVolume':1_000_000,
+              'exitMinuteVolume': 1_000_000}
     winner = {**common,'code':'000001','features':{'finalScore':10},'selectionRank':1,
               'recordedRankScore':90,'rankingTieBreakOrder':0,'exitPrice':12.,'marks':{day:12.}}
     loser = {**common,'code':'000002','features':{'finalScore':99},'selectionRank':2,
@@ -140,3 +146,22 @@ def test_account_baseline_uses_saved_selection_rank_and_model_ties_use_live_orde
     assert SignalLearningService._account_nav(samples,None,config)['net'] > 0
     assert SignalLearningService._account_nav(samples,np.array([90,90]),config)['net'] > 0
     assert SignalLearningService._account_nav(samples,np.array([99,80]),config)['net'] < 0
+
+
+def test_deferred_intraday_exit_releases_cash_before_later_scan():
+    tomorrow, next_day = DAY + timedelta(days=1), DAY + timedelta(days=2)
+    first = {'day': DAY.isoformat(), 'runId': 'first', 'code': '000001', 'selected': True,
+             'filled': True, 'features': {'finalScore': 70}, 'decisionAt': _clock(DAY).isoformat(),
+             'entryAt': _clock(DAY, 9, 42).isoformat(), 'entryPrice': 10.,
+             'exitAt': _clock(tomorrow, 9, 31).isoformat(), 'exitPrice': 9.,
+             'entryMinuteVolume': 1_000_000, 'exitMinuteVolume': 1_000_000,
+             'marks': {DAY.isoformat(): 9., tomorrow.isoformat(): 9.}}
+    second = {**first, 'day': tomorrow.isoformat(), 'runId': 'second', 'code': '000002',
+              'decisionAt': _clock(tomorrow).isoformat(), 'entryAt': _clock(tomorrow, 9, 42).isoformat(),
+              'exitAt': _clock(next_day, 15, 0, 0).isoformat(), 'exitPrice': 10.2,
+              'marks': {tomorrow.isoformat(): 10., next_day.isoformat(): 10.2}}
+    result = SignalLearningService._account_nav([first, second], np.array([70., 70.]), AccountConfig(max_positions=1))
+    assert result['valid'] and result['completedTrades'] == 2
+    second['exitMinuteVolume'] = 1
+    failed = SignalLearningService._account_nav([first, second], np.array([70., 70.]), AccountConfig(max_positions=1))
+    assert not failed['valid'] and failed['reason'] == 'exit_participation_evidence_missing_or_exceeded'
