@@ -57,12 +57,13 @@ def test_v11_weights_final_risk_and_uncalibrated_outputs():
     history = [row for day in DATES for row in _bars(day)]
     minute = compute_bar_evidence(history+_bars(NOW.date(),amount=2000,current=True),NOW,expected_dates=DATES)
     score = score_v11(_candidate(),minute,now=NOW)
-    assert score['scoreVersion']=='stockking-v1.1-rules'
+    assert score['scoreVersion']=='stockking-v1.2-rules'
     assert score['factorScores']['C'] is None and score['factorScores']['G'] is None
     assert score['factorScores']['L'] is None
-    assert score['factorWeightsApplied']['early']['M']==pytest.approx(EARLY_WEIGHTS['M']/.8,abs=1e-6)
-    assert score['factorWeightsApplied']['main']['F']==pytest.approx(MAIN_WEIGHTS['F']/.83,abs=1e-6)
-    assert score['finalScore']==pytest.approx(max(score['earlyScore'],score['mainRiseScore'])-.2*score['distributionRisk'],abs=1e-4)
+    assert score['factorWeightsApplied']['early']['M']==pytest.approx(EARLY_WEIGHTS['M'],abs=1e-6)
+    assert score['factorWeightsApplied']['main']['F']==pytest.approx(MAIN_WEIGHTS['F'],abs=1e-6)
+    assert score['selectedScoreBranch']=='early'
+    assert score['finalScore']==pytest.approx(score['earlyScore']-.2*score['distributionRisk'],abs=1e-4)
     assert score['expectedMFE5'] is None and score['mainRiseProbability'] is None
     assert score['firstTradablePrice'] is None and score['tradability']['status']=='unverified'
     assert score['dataConfidence'] < 1
@@ -72,18 +73,19 @@ def test_v11_weights_final_risk_and_uncalibrated_outputs():
     contract = algorithm_contract()
     assert score['scoreVersion'] == contract['scoreVersion']
     assert score['riskPenaltyCoefficient'] == contract['riskPenaltyCoefficient']
-    assert score['factorWeightsApplied']['early']['M'] == pytest.approx(contract['weights']['early']['M']/.8, abs=1e-6)
+    assert score['factorWeightsApplied']['early']['M'] == pytest.approx(contract['weights']['early']['M'], abs=1e-6)
 
 
-def test_v11_under_five_days_only_nulls_historical_factors():
+def test_v12_under_five_days_emits_no_score():
     rows = [row for day in DATES[:4] for row in _bars(day)] + _bars(NOW.date(),current=True)
     minute = compute_bar_evidence(rows,NOW,expected_dates=DATES)
     score = score_v11(_candidate(),minute,now=NOW)
     assert score['historicalCoverageDays']==4
     assert score['factorScores']['M'] is None and score['factorScores']['V'] is None
-    assert score['factorScores']['W'] is not None and score['factorScores']['B'] is not None
-    assert score['finalScore'] is not None
-    assert 0 < score['dataConfidence'] < .35
+    assert all(value is None for value in score['factorScores'].values())
+    assert score['finalScore'] is None
+    assert score['dataConfidence']==0
+    assert score['dataEligibility']['status']=='insufficient'
 
 
 def test_missing_historical_amount_does_not_erase_price_momentum_baseline():
@@ -95,10 +97,12 @@ def test_missing_historical_amount_does_not_erase_price_momentum_baseline():
     assert minute['v11Inputs']['z_r3_pct'] is not None
     assert minute['v11Inputs']['v3_ratio'] is None
     score = score_v11(_candidate(),minute,now=NOW)
-    assert score['factorScores']['M'] is not None
+    assert score['v11Inputs']['z_r3_pct'] is not None  # raw observations retained
+    assert score['factorScores']['M'] is None
     assert score['factorScores']['V'] is None
     assert score['priceHistoricalCoverageDays']==20
-    assert score['confidenceStatus']=='low'
+    assert score['confidenceStatus']=='insufficient'
+    assert score['finalScore'] is None
 
 
 def test_software_market_bars_feed_same_archive_and_missing_amount(monkeypatch,tmp_path):
@@ -140,6 +144,7 @@ def test_software_history_pages_only_older_bars_once_per_day(monkeypatch,tmp_pat
     from src.services import software_market
     from src.services.yao_scout import minute_history
     monkeypatch.setattr(minute_history,'_prior_sessions',lambda day:DATES)
+    monkeypatch.setattr(minute_history,'fetch_sina_bars',lambda *a,**k: [])
     calls=[]
     latest = _bars(NOW.date(),current=True)+[row for day in DATES[:3] for row in _bars(day)]
     older = [row for day in DATES[3:] for row in _bars(day)]
@@ -163,6 +168,7 @@ def test_software_history_stops_when_provider_ignores_end(monkeypatch,tmp_path):
     from src.services import software_market
     from src.services.yao_scout import minute_history
     monkeypatch.setattr(minute_history,'_prior_sessions',lambda day:DATES)
+    monkeypatch.setattr(minute_history,'fetch_sina_bars',lambda *a,**k: [])
     calls=[]
     latest = _bars(NOW.date(),current=True)+[row for day in DATES[:3] for row in _bars(day)]
     class Client:
@@ -175,6 +181,7 @@ def test_software_history_stops_when_provider_ignores_end(monkeypatch,tmp_path):
     second = fetch_bar_evidence('600001',NOW,tmp_path,backfill=True)
     assert first['historyDays']==3
     assert first['historyBackfill']['status']=='empty'
+    assert first['historyBackfill']['reason']=='provider_returned_no_older_minutes'
     assert second['historyBackfill']['status']=='already_attempted_today'
     assert sum(end is not None for end in calls)==1
 
@@ -192,7 +199,6 @@ def test_v11_uses_five_to_nineteen_day_low_confidence_without_optional_factors()
     minute['metrics']['local_high_5m']=10.05
     explanation = explain_candidate({'code':'600001'},quote,{},minute,NOW,'1030',
                                     sector={},funds={},v11=True)
-    assert explanation['evidenceEligible']
     assert not explanation['evidenceChecks']['history_20d']
     candidate = {**_candidate(),**explanation,'status':'conditional',
                  'referencePrice':quote['price'],'quote':quote}
@@ -200,7 +206,9 @@ def test_v11_uses_five_to_nineteen_day_low_confidence_without_optional_factors()
     assert candidate['confidenceStatus']=='low'
     assert candidate['finalScore'] is not None
     assert candidate['factorScores']['F'] is None and candidate['factorScores']['S'] is None
-    assert evaluate(candidate,{'coverage':{},'gaps':[]},{})['profiles']['regular']['entryEligible']
+    assert candidate['dataEligibility']['status']=='observation'
+    assert not any(profile['entryEligible'] for profile in
+        evaluate(candidate,{'coverage':{},'gaps':[]},{})['profiles'].values())
 
 
 def test_turnover_and_book_are_observations_not_executed_fill():
@@ -221,3 +229,104 @@ def test_turnover_and_book_are_observations_not_executed_fill():
     assert score['tradability']['status']=='order_book_observed'
     assert score['firstTradablePrice'] is None
     assert score['tradability']['executionVerified'] is False
+
+
+def _full_minute():
+    return compute_bar_evidence([row for day in DATES for row in _bars(day)]
+        + _bars(NOW.date(), amount=2000, current=True), NOW, expected_dates=DATES)
+
+
+def test_vwap_slope_percentage_scale_preserves_small_move_distinctions():
+    minute = _full_minute()
+    scores = {}
+    for slope in (0., .1, .2, 1., 2.):
+        minute['v11Inputs']['vwap_slope_5m_pct'] = slope
+        scores[slope] = score_v11(_candidate(), minute, now=NOW)['factorScores']['W']
+    assert scores[.1] - scores[0.] == pytest.approx(1.25)
+    assert scores[.2] - scores[.1] == pytest.approx(1.25)
+    assert scores[1.] == scores[2.]
+    assert scores[.2] < scores[1.]
+
+
+def test_turnover_is_funded_from_volume_budget_and_changes_rule_score():
+    minute = _full_minute()
+    candidate = _candidate()
+    without = score_v11(candidate, minute, now=NOW)
+    candidate['float_shares'] = 100_000_000
+    with_turnover = score_v11(candidate, minute, now=NOW)
+    assert EARLY_WEIGHTS['V'] + EARLY_WEIGHTS['T'] == pytest.approx(.14)
+    assert MAIN_WEIGHTS['V'] + MAIN_WEIGHTS['T'] == pytest.approx(.10)
+    assert with_turnover['finalScore'] - without['finalScore'] == pytest.approx(
+        .05 * with_turnover['turnoverScore'], abs=1e-4)
+    assert sum(EARLY_WEIGHTS.values()) == pytest.approx(1.)
+    assert sum(MAIN_WEIGHTS.values()) == pytest.approx(1.)
+
+
+@pytest.mark.parametrize('branch,stage,selected', [
+    ('分钟局部突破观察','breakout','early'), ('分歧修复观察','repair','early'),
+    ('分钟趋势延续观察','continuation','main')])
+def test_stage_selects_one_prespecified_score_not_the_maximum(branch, stage, selected):
+    candidate = {**_candidate(), 'strategyBranch': branch}
+    result = score_v11(candidate, _full_minute(), now=NOW)
+    assert result['scoreStage'] == stage and result['selectedScoreBranch'] == selected
+    base = result['earlyScore'] if selected == 'early' else result['mainRiseScore']
+    assert result['finalScore'] == pytest.approx(max(0, base-.2*result['distributionRisk']), abs=1e-4)
+
+
+def test_missing_positive_evidence_never_redistributes_or_increases_score():
+    candidate = _candidate()
+    complete = score_v11(candidate, _full_minute(), now=NOW)
+    candidate['indicatorEvidence'] = [row for row in candidate['indicatorEvidence']
+        if row['key'] not in {'active_buy_share_pct','main_net_flow_3m'}]
+    missing = score_v11(candidate, _full_minute(), now=NOW)
+    assert missing['finalScore'] <= complete['finalScore']
+    assert missing['factorWeightsApplied']['early']['M'] == complete['factorWeightsApplied']['early']['M']
+    assert missing['factorCoverage']['early'] < complete['factorCoverage']['early']
+    assert missing['distributionRisk'] >= complete['distributionRisk']
+    assert 'F' in missing['missingFactors'] and 'activeSell' in missing['missingRiskComponents']
+
+
+def _packet(score, **changes):
+    return {'status':'observed', 'score':score, 'asOf':NOW.isoformat(),
+            'features':{'sample_count':20}, 'gaps':[], **changes}
+
+
+@pytest.mark.parametrize('packet', [
+    _packet(80, asOf=(NOW+timedelta(seconds=1)).isoformat()),
+    _packet(80, asOf=NOW.replace(tzinfo=None).isoformat()),
+    _packet(80, asOf=(NOW-timedelta(days=2)).isoformat()),
+    _packet(80, status='insufficient'), _packet(float('nan')), _packet(101),
+    _packet(80, features={'bad':float('inf')})])
+def test_invalid_or_future_research_packet_cannot_score_or_enter_training_features(packet):
+    candidate = {**_candidate(), 'researchFactors':{'C':packet}}
+    result = score_v11(candidate, _full_minute(), now=NOW)
+    assert result['factorScores']['C'] is None
+    assert not any(key.startswith('research_C_') for key in result['v11Inputs'])
+
+
+def test_verified_cg_are_scored_emotion_only_reduces_and_theme_is_shadow():
+    minute = _full_minute()
+    candidate = _candidate()
+    baseline = score_v11(candidate, minute, now=NOW)
+    candidate['researchFactors'] = {'C':_packet(80), 'G':_packet(60), 'H':_packet(100)}
+    scored = score_v11(candidate, minute, now=NOW)
+    assert scored['finalScore'] - baseline['finalScore'] == pytest.approx(.08*80+.07*60, abs=1e-4)
+    assert scored['v11Inputs']['research_H_score'] == 100
+    assert scored['marketRegime']['state'] == 'unknown'
+    candidate['researchFactors']['E'] = _packet(10)
+    weak = score_v11(candidate, minute, now=NOW)
+    assert weak['marketRegime']['state']=='weak'
+    assert weak['finalScore']==pytest.approx(scored['finalScore']*.5, abs=1e-4)
+    candidate['researchFactors']['E'] = _packet(90)
+    hot = score_v11(candidate, minute, now=NOW)
+    assert hot['finalScore']==pytest.approx(scored['finalScore']*.75, abs=1e-4)
+
+
+def test_twenty_days_does_not_override_missing_critical_factors_or_stale_minutes():
+    minute = _full_minute()
+    for key in ('z_r3_pct','z_r5_pct','z_a3_pct_per_min','z_a1_pct_per_min'):
+        minute['v11Inputs'][key] = None
+    result = score_v11(_candidate(), minute, now=NOW)
+    assert result['dataEligibility']['status']=='observation'
+    assert not result['dataEligibility']['criticalFactorsReady']
+    assert score_v11(_candidate(), _full_minute(), now=NOW+timedelta(minutes=5))['finalScore'] is None

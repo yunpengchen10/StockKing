@@ -41,7 +41,7 @@ def get_data(endpoint, params, getter=None):
     errors=[]
     for base in ('https://70.push2.eastmoney.com/api/qt/','https://17.push2.eastmoney.com/api/qt/',BASE):
         try:
-            response = (getter or public_get)(base+endpoint,params=params,timeout=4)
+            response = (getter or public_get)(base+endpoint,params=params,headers=HEADERS,timeout=4)
             response.raise_for_status()
             response.encoding = 'utf-8'
             payload = response.json()
@@ -77,7 +77,8 @@ def cached_metadata(directory, key, cutoff, fetch):
     cutoff = _datetime(cutoff)
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
-        if data['fetchedAt'][:10] == cutoff.date().isoformat() and data['value']:
+        observed = _datetime(data['fetchedAt'])
+        if observed.date() == cutoff.date() and observed <= cutoff and data['value']:
             return data['value']
     except (OSError,ValueError,TypeError,KeyError):
         pass
@@ -93,8 +94,29 @@ def cached_metadata(directory, key, cutoff, fetch):
 
 def discover_sectors(codes, cutoff, cache_dir, *, getter=None, deadline=None):
     directory = Path(cache_dir)/'sector-membership'
-    industries = cached_metadata(directory,'industry-list',cutoff,lambda:all_members('m:90+t:2',getter))
-    industry_map = {row['code']:row['name'] for row in industries}
+    cutoff = _datetime(cutoff)
+    if deadline is None:
+        deadline = monotonic() + 20
+    def saved(key):
+        try:
+            packet = json.loads((directory/(key+'.json')).read_text(encoding='utf-8'))
+            stamp = _datetime(packet['fetchedAt'])
+            if stamp.date() == cutoff.date() and stamp <= cutoff and packet.get('value'):
+                return packet['value']
+        except (OSError,ValueError,TypeError,KeyError):
+            pass
+        return None
+    # A slow uncached symbol must not hide already archived memberships later
+    # in the queue when the request budget runs out.
+    membership = {code: value for code in codes if isinstance(value := saved('stock-'+code),dict)}
+    missing_codes = [code for code in codes if code not in membership]
+    industry_map = {}
+    if missing_codes and monotonic() < deadline:
+        try:
+            industries = cached_metadata(directory,'industry-list',cutoff,lambda:all_members('m:90+t:2',getter))
+            industry_map = {row['code']:row['name'] for row in industries}
+        except Exception:
+            pass
     def lookup(code):
         def fetch():
             data = get_data('slist/get',{'secid':('1.' if code.startswith('6') else '0.')+code,
@@ -108,20 +130,22 @@ def discover_sectors(codes, cutoff, cache_dir, *, getter=None, deadline=None):
             return code, cached_metadata(directory,'stock-'+code,cutoff,fetch)
         except Exception:
             return code, {}
-    if deadline is None:
-        deadline = monotonic() + 20
-    completed, _ = bounded_fetch_map(lookup,codes,workers=4,timeout=max(0,deadline-monotonic()))
-    membership = dict(completed)
+    completed, _ = bounded_fetch_map(lookup,missing_codes if industry_map else [],workers=4,
+                                     timeout=max(0,deadline-monotonic()))
+    membership.update(completed)
     selected = {row['code']:row for row in membership.values() if row}
+    def equity_codes(rows):
+        return [row['code'] for row in rows if re.fullmatch(r'(?:60|68|00|30)\d{4}',row['code'])]
+    peers = {board: equity_codes(rows) for board in selected if isinstance(rows := saved('board-'+board),list)}
     def constituents(board):
         try:
             rows = cached_metadata(directory,'board-'+board,cutoff,lambda:all_members('b:'+board,getter))
-            codes = [row['code'] for row in rows if re.fullmatch(r'(?:60|68|00|30)\d{4}',row['code'])]
-            return board, codes
+            return board, equity_codes(rows)
         except Exception:
             return board, []
-    completed, _ = bounded_fetch_map(constituents,selected,workers=4,timeout=max(0,deadline-monotonic()))
-    peers = dict(completed)
+    completed, _ = bounded_fetch_map(constituents,[board for board in selected if board not in peers],
+                                     workers=4,timeout=max(0,deadline-monotonic()))
+    peers.update(completed)
     return membership, peers
 
 
@@ -213,15 +237,27 @@ def prepare_sector_membership(codes, cutoff, cache_dir, *, getter=None, timeout=
             raise requests.Timeout('行业成员采集达到时间预算')
         kwargs['timeout'] = min(float(kwargs.get('timeout',4)),remaining)
         return (getter or public_get)(url,**kwargs)
-    def discover(_):
+    try:
+        membership, peers = discover_sectors(codes,cutoff,cache_dir,getter=bounded_get,deadline=deadline)
+    except Exception:
+        membership, peers = {}, {}
+    missing = [code for code in codes if not membership.get(code)]
+    if missing:
         try:
-            return discover_sectors(codes,cutoff,cache_dir,getter=bounded_get,deadline=deadline)
+            # Primary discovery may return only its completed subset without
+            # raising. Complete those missing identities from the independent
+            # catalogue, preserving each provider's board and constituents.
+            extra_members, extra_peers = discover_sina_sectors(
+                missing,cutoff,cache_dir,getter=bounded_get,deadline=deadline)
+            membership.update({code: value for code,value in extra_members.items() if value})
+            peers.update(extra_peers)
         except Exception:
-            return discover_sina_sectors(codes,cutoff,cache_dir,getter=bounded_get,deadline=deadline)
-    completed, _ = bounded_fetch_map(discover,[None],workers=1,timeout=timeout)
-    if not completed:
+            pass
+    # Every network request and worker queue already has the same deadline.
+    # An outer timeout used to discard the useful cached/partial return value.
+    if not any(membership.values()):
         raise TimeoutError('行业成员读取失败或达到时间预算，未生成行业证据')
-    return completed[0]
+    return membership, peers
 
 
 def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_fetcher=None, prepared=None, timeout=20):
@@ -308,4 +344,9 @@ def fetch_fund_evidence(code, cutoff, *, getter=None):
             'lmt':'0','klt':'1','fields1':'f1,f2,f3,f7','fields2':'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63'},getter)
         return compute_fund_evidence(code,data,cutoff)
     except Exception as exc:
-        return {'metrics':{},'gaps':['分钟资金源不可用：'+type(exc).__name__]}
+        # Preserve our own bounded provider diagnostics without leaking arbitrary
+        # exception messages, request credentials or environment proxy details.
+        reason = str(exc) if isinstance(exc, ValueError) and str(exc).startswith('Eastmoney sources unavailable: ') else type(exc).__name__
+        return {'metrics':{}, 'source':'Eastmoney分钟资金流（供应商大单分类估算）',
+                'asOf':None, 'flowKind':'vendor_estimate', 'status':'unavailable',
+                'reason':reason, 'gaps':['分钟资金源不可用：'+reason]}

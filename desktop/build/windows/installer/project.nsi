@@ -1,11 +1,20 @@
 Unicode true
-SetCompressor /SOLID lzma
+!ifndef ARG_STOCKKING_COMPRESSOR
+    !define ARG_STOCKKING_COMPRESSOR "lzma"
+!endif
+!if "${ARG_STOCKKING_COMPRESSOR}" == "lzma"
+    SetCompressor /SOLID lzma
+!else if "${ARG_STOCKKING_COMPRESSOR}" == "zlib"
+    SetCompressor zlib
+!else
+    !error "Unsupported Stock King compressor"
+!endif
 
 !define INFO_PROJECTNAME "stock-king"
 !define INFO_COMPANYNAME "Stock King"
 !define INFO_PRODUCTNAME "Stock King"
 !ifndef INFO_PRODUCTVERSION
-    !define INFO_PRODUCTVERSION "2.6.2"
+    !define INFO_PRODUCTVERSION "2.6.3"
 !endif
 !define PRODUCT_EXECUTABLE "Stock King.exe"
 !define REQUEST_EXECUTION_LEVEL "user"
@@ -146,8 +155,10 @@ Section
 
     !insertmacro wails.files
 
-    SetOutPath "$INSTDIR\resources\daily-engine"
-    File /r "${ARG_STOCKKING_SIDECAR_ROOT}\stock_analysis"
+    # Anchor the recursive search inside this exact build. Searching for the
+    # directory name itself also picks up sibling backend\stock_analysis builds.
+    SetOutPath "$INSTDIR\resources\daily-engine\stock_analysis"
+    File /r "${ARG_STOCKKING_SIDECAR_ROOT}\stock_analysis\*"
 
     SetOutPath "$INSTDIR\licenses"
     File "/oname=Stock-King-GPL-3.0.txt" "..\..\..\LICENSE"

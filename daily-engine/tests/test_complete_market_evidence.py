@@ -61,6 +61,44 @@ def test_daily_collection_covers_unselected_codes_and_retries_failures(tmp_path)
     assert first['universe']==2 and first['failed']==1
     assert second['cached']==1 and second['updated']==1
 
+
+def test_priority_archive_does_not_expand_to_registered_universe(tmp_path):
+    archive_universe(['600000', '000001'], NOW, tmp_path, fetcher=lambda code: bars())
+    called = []
+    result = archive_universe(['600002'], NOW, tmp_path, include_registered=False,
+                              fetcher=lambda code: called.append(code) or bars())
+    assert called == ['600002'] and result['universe'] == 1
+    assert len(json.loads((tmp_path/'archive-universe.json').read_text())['codes']) == 3
+
+
+def test_preclose_success_cannot_mask_incomplete_close_archive(tmp_path):
+    archive_universe(['600000'], NOW, tmp_path, fetcher=lambda code: bars())
+    called = []
+    close = NOW.replace(hour=15, minute=30)
+    result = archive_universe(['600000'], close, tmp_path,
+                              fetcher=lambda code: called.append(code) or bars())
+    assert called == ['600000'] and result['cached'] == 0
+    assert result['incomplete'] == 1 and result['status'] == 'partial'
+
+
+def test_archive_budget_reports_deferred_work_without_false_completion(tmp_path):
+    called = []
+    result = archive_universe(['600000', '000001'], NOW, tmp_path, timeout=0,
+                              fetcher=lambda code: called.append(code) or bars())
+    assert not called and result['deferred'] == 2 and result['status'] == 'partial'
+
+
+def test_archive_keeps_priority_order_with_a_single_worker(tmp_path):
+    called = []
+    archive_universe(['600009', '000001'], NOW, tmp_path, workers=1, include_registered=False,
+                     fetcher=lambda code: called.append(code) or bars())
+    assert called == ['600009', '000001']
+
+
+def test_normalization_preserves_known_suspension():
+    row = {**bars()[0], 'suspended': True}
+    assert list(normalize_bars([row], NOW).values())[0]['suspended'] is True
+
 def test_sector_uses_same_five_minutes_all_peers_and_excludes_self():
     peers=['600000','600001','600002','600003','600004','600005']
     rows={code:bars() for code in peers}

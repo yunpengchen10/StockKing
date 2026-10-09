@@ -1,5 +1,7 @@
 <script setup>
 import {h, onMounted, onUnmounted, reactive, ref, nextTick} from 'vue'
+import {usePageActive} from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 import * as echarts from 'echarts'
 import {
   NAlert, NButton, NCard, NCheckbox, NCollapse, NCollapseItem, NDataTable, NDatePicker,
@@ -817,6 +819,7 @@ onMounted(() => {
   }).catch(() => {})
   // 交易时间内每10秒刷新价格（sparkLine 组件 watchEffect 监听 lastPrice 自动刷新分时图）
   refreshTimer = setInterval(() => {
+    if (!pageActive.value) return
     if (isTradingHours() && dataRef.value.length > 0) {
       fetchPlanPrices(dataRef.value)
     }

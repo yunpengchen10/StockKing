@@ -11,6 +11,7 @@ import {
 } from 'lightweight-charts'
 import { NButton, NDatePicker, NDropdown, NFlex, NInput, NModal, NSpin, NText, NTooltip, useMessage } from 'naive-ui'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { usePageActive } from '../utils/pageSession.mjs'
 import {
   smaValues, emaFinite, emaLeadingNull, weightedMaValues, bollingerBands, obvValues,
   macdBundle, kdjBundle, rsiBundle, atrValues, vwapValues, mfiValues, kamaValues,
@@ -75,6 +76,8 @@ const emit = defineEmits([
   'crosshair-change',
 ])
 const chartContainerRef = ref(null)
+const pageActive = usePageActive()
+let retainedLogicalRange = null
 const showIndicatorPanel = ref(false)
 /** 十字线当前 K 对应的原始行（东财字段） */
 const hoverRawRow = ref(null)
@@ -4144,7 +4147,7 @@ function clearPoll() {
 
 function setupPoll() {
   clearPoll()
-  if (props.realtimeIntervalMs > 0 && props.code && !isHistoricalMinuteView.value) {
+  if (pageActive.value && props.realtimeIntervalMs > 0 && props.code && !isHistoricalMinuteView.value) {
     pollTimer = setInterval(refreshLatestPoll, props.realtimeIntervalMs)
   }
 }
@@ -4302,6 +4305,7 @@ function scheduleLoadOlderDebounced() {
 
 /** 根据当前可见逻辑区间判断是否需要加载更早 K 线（与 subscribe 共用 + 轮询兜底） */
 function tryScheduleLoadOlderFromVisibleRange(range) {
+  if (!pageActive.value) return
   if (!chart || !candleSeries) return
   if (programmaticRangeDepth > 0 || loadingHistory.value || !hasMoreOlder.value) return
   const lr = range ?? chart?.timeScale().getVisibleLogicalRange()
@@ -4327,6 +4331,7 @@ function onVisibleTimeRangeChanged() {
 
 function startHistoryVisiblePoll() {
   stopHistoryVisiblePoll()
+  if (!pageActive.value) return
   historyVisiblePollTimer = setInterval(() => {
     tryScheduleLoadOlderFromVisibleRange(null)
   }, 400)
@@ -4412,6 +4417,7 @@ async function loadOlderHistory() {
 }
 
 async function refreshLatestPoll() {
+  if (!pageActive.value) return
   if (!props.code || !candleSeries || isHistoricalMinuteView.value) return
   const kltSnap = activeKlt.value
   const codeSnap = props.code
@@ -4830,6 +4836,36 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   disposeChart()
+})
+
+watch(pageActive, active => {
+  if (!active) {
+    retainedLogicalRange = chart?.timeScale().getVisibleLogicalRange() || null
+    chart?.applyOptions({ autoSize: false })
+    clearPoll()
+    stopHistoryVisiblePoll()
+    clearTimeout(loadOlderDebounceTimer)
+    loadOlderDebounceTimer = null
+    detachMeasureKeydown()
+    detachWaveKeydown()
+    detachDrawingKeydown()
+    detachLongDragWindowListeners()
+    return
+  }
+  void nextTick(() => {
+    if (!pageActive.value || !chart) return
+    // The chart and its logical range stay alive; only resume live updates.
+    const width = chartContainerRef.value?.clientWidth
+    if (width) chart.resize(width, props.chartHeight)
+    chart.applyOptions({ autoSize: true, height: props.chartHeight })
+    if (retainedLogicalRange) chart.timeScale().setVisibleLogicalRange(retainedLogicalRange)
+    setupPoll()
+    startHistoryVisiblePoll()
+    if (showMeasure.value) attachMeasureKeydown()
+    if (showWave.value) attachWaveKeydown()
+    if (drawingActiveTool.value) attachDrawingKeydown()
+    if (showChip.value) drawChipCanvas()
+  })
 })
 
 watch(

@@ -1,4 +1,8 @@
 import {createRouter, createWebHashHistory} from 'vue-router'
+import { createPageNavigationMemory } from '../utils/pageSession.mjs'
+
+const pageMemory = createPageNavigationMemory()
+export const resumePage = pageMemory.destination
 
 const stockView = () => import('../components/StockKingWatchlist.vue')
 const settingsView = () => import('../components/settings.vue')
@@ -43,6 +47,10 @@ const router = createRouter({
     //history: createWebHistory(),
     history: createWebHashHistory(),
     routes,
+})
+
+router.afterEach((to, _from, failure) => {
+    if (!failure) pageMemory.remember(to)
 })
 
 export default router

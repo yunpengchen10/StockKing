@@ -93,6 +93,7 @@ $hiddenImports = @(
   'src.services.stock_king_display',
   'src.services.economy_review',
   'src.services.yao_scout.local_opportunities',
+  'src.services.yao_scout.next_day_watch',
   'src.services.yao_scout.local_algorithm',
   'src.services.yao_scout.signal_learning',
   'src.services.yao_scout.v11_factors',
@@ -207,7 +208,7 @@ if (-not (Test-Path $packagedEntry)) {
 }
 $previousProbe = $env:DSA_PACKAGED_IMPORT_PROBE
 try {
-  foreach ($module in @('src.services.stock_king_display', 'src.services.economy_review', 'src.services.yao_scout.local_opportunities', 'src.services.yao_scout.signal_learning', 'src.services.yao_scout.v11_factors', 'src.services.software_market', 'src.services.screening.pipeline', 'src.quant.service', 'src.quant.executable_backtest', 'api.v1.endpoints.stock_king', 'api.v1.endpoints.quant', 'api.v1.endpoints.portfolio', 'src.services.yao_scout.adaptive', 'lightgbm', 'torch', 'futu', 'orjson')) {
+  foreach ($module in @('src.services.stock_king_display', 'src.services.economy_review', 'src.services.yao_scout.local_opportunities', 'src.services.yao_scout.signal_learning', 'src.services.yao_scout.v11_factors', 'src.services.yao_scout.research_policy', 'src.services.yao_scout.research_factors', 'src.services.yao_scout.theme_evidence', 'src.services.yao_scout.local_algorithm', 'src.services.software_market', 'src.services.screening.pipeline', 'src.quant.service', 'src.quant.executable_backtest', 'api.v1.endpoints.stock_king', 'api.v1.endpoints.quant', 'api.v1.endpoints.portfolio', 'src.services.yao_scout.adaptive', 'lightgbm', 'torch', 'futu', 'orjson')) {
     $env:DSA_PACKAGED_IMPORT_PROBE = $module
     $probeProcess = Start-Process -FilePath $packagedEntry -WindowStyle Hidden -Wait -PassThru
     if ($probeProcess.ExitCode -ne 0) {

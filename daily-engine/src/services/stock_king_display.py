@@ -22,7 +22,25 @@ _VALID_STATUSES = {
 
 
 def has_candidates(run: dict[str, Any]) -> bool:
-    return bool(run.get("candidates") or any((run.get("profileCandidates") or {}).values()))
+    return bool(run.get("candidates") or run.get("nextDayWatchlist") or run.get("nextDayContinuationWatchlist")
+                or any((run.get("profileCandidates") or {}).values()))
+
+
+def display_counts(run: dict[str, Any]) -> dict[str, Any]:
+    """Count frozen selections, keeping execution and research meanings separate."""
+    def codes(key):
+        return {str(row.get("code")).split(".")[0].strip() for row in run.get(key) or []
+                if isinstance(row, dict) and row.get("code")}
+    trade, watch, continuation = (codes(key) for key in
+                                  ("candidates", "nextDayWatchlist", "nextDayContinuationWatchlist"))
+    return {
+        "displayRunId": run.get("run_id") or run.get("runId"),
+        "tradeCandidateCount": len(trade),
+        "nextDayCandidateCount": len(watch),
+        "continuationCandidateCount": len(continuation),
+        # Continuations are an auxiliary queue, not a first-board recommendation.
+        "savedRecommendationCount": len(trade | watch),
+    }
 
 
 def displayable_run(run: Any) -> bool:
@@ -40,7 +58,8 @@ def displayable_run(run: Any) -> bool:
     if coverage.get("requested", 0) > 0 and not coverage.get("fresh", 0):
         return False
     minutes = quality.get("minute_coverage") or {}
-    if minutes.get("requested", 0) > 0 and not minutes.get("usable", 0):
+    if (minutes.get("requested", 0) > 0 and not minutes.get("usable", 0)
+            and not run.get("nextDayWatchlist") and not run.get("nextDayContinuationWatchlist")):
         return False
     return True
 
@@ -65,7 +84,9 @@ class LocalPicksDisplayStore:
                 if (isinstance(value, dict) and value.get("displaySnapshotVersion") == 1
                         and value.get("schemaVersion") == STOCK_KING_SCHEMA_VERSION
                         and displayable_run(value.get("adaptive"))):
-                    return value
+                    # Response-only compatibility: opening a saved page never
+                    # rewrites its immutable selection or upgrades its rules.
+                    return {**value, **display_counts(value["adaptive"])}
             except (OSError, ValueError, TypeError):
                 pass
             if self.db is None:
@@ -108,6 +129,7 @@ class LocalPicksDisplayStore:
             "asOfDate": str(generated_at or "")[:10],
             "scanSlot": run.get("scanSlot", "live"),
             "candidateCount": len(run.get("candidates") or []),
+            **display_counts(run),
             "adaptive": run,
             "tiers": {}, "kechuang": [], "nonKeChuang": [],
             "cacheHit": False,

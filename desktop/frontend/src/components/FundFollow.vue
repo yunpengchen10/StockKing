@@ -1,5 +1,7 @@
 <script setup>
 import {h, onBeforeMount, onBeforeUnmount, onMounted, reactive, ref, computed} from "vue";
+import {usePageActive} from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 import {Add, RefreshOutline} from "@vicons/ionicons5";
 import {NButton, NEllipsis, NText, useMessage, NTag, NModal, NDataTable, NPopover, NIcon} from "naive-ui";
 import {
@@ -135,10 +137,12 @@ onMounted(() => {
   })
 
   ticker.value = setInterval(() => {
+    if (!pageActive.value) return
     refreshAllFunds()
   }, 1000 * REFRESH_INTERVAL)
 
   countdownTimer.value = setInterval(() => {
+    if (!pageActive.value) return
     if (countdown.value > 0) {
       countdown.value--
     }

@@ -1,13 +1,14 @@
 <script setup>
-import { computed, inject, onBeforeMount, onBeforeUnmount, ref } from 'vue'
+import { computed, inject, onActivated, onBeforeMount, onBeforeUnmount, onDeactivated, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Follow, GetEngineStatus, GetKingPicks, GetKingPicksHistory, GetDisplayedKingPicks, StartKingPicksRefresh, GetKingPicksRefreshTask, GetStockKingBackgroundLearning, GetStockKingBackgroundStatus, SetStockKingBackgroundLearning, GetStockKingAutoRecommendations, SetStockKingAutoRecommendations } from '../../wailsjs/go/main/App'
 import { useMessage } from 'naive-ui'
 import { toResearchCode } from '../utils/symbol'
 import PickIndicatorEvidence from './PickIndicatorEvidence.vue'
 import PicksLedger from './PicksLedger.vue'
-import { explainPick, PICK_BRANCHES } from '../utils/pickExplain.mjs'
+import { explainPick, PICK_BRANCHES, isEvidenceRuleVersion } from '../utils/pickExplain.mjs'
 import { createPicksRefreshController, readDisplayedPicks, saveDisplayedPicks, selectDisplayedPicks } from '../utils/picksRefresh.mjs'
+import { nextDayQueueLabel, nextDayTouchLabel, savedRecommendationSummary } from '../utils/pickLedger.mjs'
 
 const router = useRouter()
 const message = useMessage()
@@ -15,7 +16,7 @@ const darkTheme = inject('appDarkTheme', ref(true))
 const loading = ref(false), refreshError = ref(''), viewingHistory = ref(false), methodVisible = ref(false), selectedPick = ref(null), explanationVisible = ref(false)
 const restoring = ref(true)
 const refreshProgress = ref(0), refreshStage = ref(''), refreshElapsed = ref(0)
-const isV11 = computed(() => String(adaptive.value.scoreVersion || adaptive.value.modelVersion || '').startsWith('stockking-v1.1') || adaptivePicks.value.some(pick => isV11Pick(pick)))
+const isV11 = computed(() => isEvidenceRuleVersion(adaptive.value.scoreVersion || adaptive.value.modelVersion) || adaptivePicks.value.some(pick => isV11Pick(pick)))
 const explanation = computed(() => explainPick(selectedPick.value || {}))
 function showWhy(pick, insufficient = false) { selectedPick.value = pick; selectedIsInsufficient.value = insufficient; explanationVisible.value = true }
 const engine = ref({ state: 'starting', ready: false })
@@ -27,6 +28,14 @@ const activeTier = ref('regular')
 const precisionProfile = ref('regular')
 const activeBoard = ref('nonKeChuang')
 const viewMode = ref('adaptive')
+const pageActive = ref(true)
+const ledgerModes = ['records', 'reviews', 'learning']
+const visitedLedgerModes = ref([])
+const recordsRefreshToken = ref(0)
+const continuationVisible = ref(false)
+watch(viewMode, mode => {
+  if (ledgerModes.includes(mode) && !visitedLedgerModes.value.includes(mode)) visitedLedgerModes.value.push(mode)
+})
 const backgroundEnabled = ref(true)
 const recommendationsEnabled = ref(true)
 const backgroundStatus = ref({ status: 'never_run', updatedAt: '' })
@@ -84,6 +93,13 @@ const snapshotIsOld = computed(() => {
   return stamp.toLocaleDateString('sv-SE', options) < new Date().toLocaleDateString('sv-SE', options)
 })
 const adaptivePicks = computed(() => adaptive.value?.profileCandidates?.[precisionProfile.value] || adaptive.value?.candidates || [])
+const nextDayWatchlist = computed(() => Array.isArray(adaptive.value?.nextDayWatchlist) ? adaptive.value.nextDayWatchlist : [])
+const nextDayContinuationWatchlist = computed(() => Array.isArray(adaptive.value?.nextDayContinuationWatchlist) ? adaptive.value.nextDayContinuationWatchlist : [])
+const savedRecommendations = computed(() => savedRecommendationSummary(adaptive.value))
+const nextDayQueues = computed(() => [
+  ...(nextDayWatchlist.value.length || savedRecommendations.value.splitQueues ? [{ key: savedRecommendations.value.splitQueues ? 'first_board' : 'legacy', picks: nextDayWatchlist.value, title: savedRecommendations.value.splitQueues ? '未触板潜伏 · 次日研究推荐' : '次日观察 · 历史未分队列' }] : []),
+  ...(nextDayContinuationWatchlist.value.length ? [{ key: 'continuation', picks: nextDayContinuationWatchlist.value, title: '已触板延续 · 辅助观察' }] : []),
+])
 const precisionWatchlist = computed(() => (adaptive.value?.precisionWatchlist || []).filter(p => !p.precisionDecision?.profiles?.[precisionProfile.value]?.entryEligible))
 const adaptiveCards = computed(() => adaptivePicks.value.map((pick, index) => ({ pick: { ...pick, rank: index + 1 }, detail: explainPick(pick) })))
 const insufficientCards = computed(() => (Array.isArray(adaptive.value?.evidenceInsufficient) ? adaptive.value.evidenceInsufficient : []).map(pick => ({ pick, detail: explainPick(pick) })))
@@ -153,6 +169,11 @@ function scoreOf(pick) {
   const value = Number(raw)
   return Number.isFinite(value) ? value.toFixed(1) : '—'
 }
+function nextDayScore(pick) {
+  const score = pick?.nextDaySignal?.score
+  return score != null && Number.isFinite(Number(score)) ? Number(score).toFixed(1) : '—'
+}
+function nextDayChange(pick) { return pick?.nextDaySignal?.features?.changePct ?? pick?.currentChange }
 function percent(value, digits = 2) {
   if (value === null || value === undefined || value === '') return '—'
   const parsed = Number(value)
@@ -221,9 +242,9 @@ function readSnapshot() {
 }
 
 function canSyncSavedResults() {
-  return !disposed && document.visibilityState !== 'hidden'
+  return !disposed && pageActive.value && document.visibilityState !== 'hidden'
 }
-function isV11Pick(pick) { return String(pick?.scoreVersion || '').startsWith('stockking-v1.1') }
+function isV11Pick(pick) { return isEvidenceRuleVersion(pick?.scoreVersion) }
 function calibrationValue(pick, key) {
   return pick?.probabilityStatus === 'withheld_until_calibrated' || pick?.[key] == null ? '待校准' : percent(pick[key])
 }
@@ -231,6 +252,8 @@ function factorValue(value) { return value == null || !Number.isFinite(Number(va
 
 async function syncSavedResults() {
   if (disposed || savedSyncInFlight) return
+  if (savedSyncTimer !== null) clearTimeout(savedSyncTimer)
+  savedSyncTimer = null
   savedSyncInFlight = true
   try {
     if (!canSyncSavedResults()) return
@@ -245,7 +268,7 @@ async function syncSavedResults() {
     if (background && !disposed) backgroundStatus.value = background
   } finally {
     savedSyncInFlight = false
-    if (!disposed) {
+    if (!disposed && pageActive.value) {
       const delay = document.visibilityState !== 'hidden' && !engine.value?.ready && startupPolls < 45 ? 2000 : 30000
       savedSyncTimer = setTimeout(syncSavedResults, delay)
     }
@@ -276,6 +299,10 @@ function returnToDisplayed() {
 
 function historyResult(item) { return item?.result || {} }
 function historyCandidates(item) { return historyResult(item)?.candidates || [] }
+function historyNextDayCandidates(item) { return historyResult(item)?.nextDayWatchlist || [] }
+function historyContinuationCandidates(item) { return historyResult(item)?.nextDayContinuationWatchlist || [] }
+function historySavedSummary(item) { return savedRecommendationSummary(historyResult(item)) }
+function hasNextDayHistory(item) { return Array.isArray(historyResult(item)?.nextDayWatchlist) }
 function isScanHistory(item) { return ['king_live', 'king_0920', 'king_0922', 'king_0940', 'king_0955', 'king_1030', 'king_1455'].includes(item?.mode) }
 function isReviewHistory(item) { return ['king_review', 'king_weekly'].includes(item?.mode) }
 function isRestorableSnapshot(snapshot) {
@@ -330,6 +357,7 @@ function restoreHistory(item) {
   if (!snapshot || !Array.isArray(snapshot.candidates)) return
   mergeAdaptive(snapshot)
   viewingHistory.value = true
+  viewMode.value = 'adaptive'
   historyVisible.value = false
   message.success(`已恢复 ${formatTime(snapshot.generatedAt || item?.as_of)} 的推荐快照`)
 }
@@ -342,6 +370,11 @@ async function addWatch(pick) {
 
 function openKline(pick) {
   router.push({ name: 'klineAnalysis', query: { code: codeOf(pick), name: nameOf(pick) } })
+}
+function openRecommendationRecords() {
+  // This is an explicit query action; ordinary tab/route returns remain frozen.
+  recordsRefreshToken.value++
+  viewMode.value = 'records'
 }
 
 async function toggleBackground(value) {
@@ -383,6 +416,18 @@ onBeforeUnmount(() => {
   refreshController.dispose()
   if (savedSyncTimer !== null) clearTimeout(savedSyncTimer)
 })
+onActivated(() => {
+  pageActive.value = true
+  if (!restoring.value && savedSyncTimer === null) void syncSavedResults()
+})
+onDeactivated(() => {
+  pageActive.value = false
+  methodVisible.value = false
+  historyVisible.value = false
+  explanationVisible.value = false
+  if (savedSyncTimer !== null) clearTimeout(savedSyncTimer)
+  savedSyncTimer = null
+})
 </script>
 
 <template>
@@ -402,7 +447,7 @@ onBeforeUnmount(() => {
     <div class="picks-meta"><span>{{ pageResult.asOfDate || pageResult.as_of_date || '待生成' }}</span><details class="sk-help-details"><summary>扫描信息</summary><p>生成 {{ pageResult.generatedAt || pageResult.generated_at || '—' }} · 版本 {{ pageResult.methodologyVersion || '兼容旧榜' }}</p><p>后台学习 {{ backgroundEnabled ? '开启' : '暂停' }} · {{ backgroundStatus.status || '未运行' }} {{ backgroundStatus.updatedAt }}</p><p>每轮扫描保留当时证据，可在历史中回看。</p></details></div>
     <n-tabs v-model:value="viewMode" type="line" animated class="view-tabs"><n-tab-pane name="adaptive" tab="本地精选" /><n-tab-pane name="records" tab="推荐记录" /><n-tab-pane name="reviews" tab="延后复盘" /><n-tab-pane name="learning" tab="学习状态" /><n-tab-pane name="classic" tab="策略分组" /></n-tabs>
 
-    <template v-if="viewMode === 'adaptive'">
+    <section v-show="viewMode === 'adaptive'">
       <n-tabs v-if="adaptive.profileCandidates && !isV11" v-model:value="precisionProfile" type="segment">
         <n-tab-pane name="conservative" tab="稳健 · 财务与回撤" />
         <n-tab-pane name="regular" tab="均衡 · 趋势与买点" />
@@ -412,10 +457,11 @@ onBeforeUnmount(() => {
       <details v-if="precisionWatchlist.length" class="sk-help-details"><summary>等待条件的股票（{{ precisionWatchlist.length }}）</summary>
         <p v-for="pick in precisionWatchlist" :key="codeOf(pick)">{{ nameOf(pick) }}：{{ pick.precisionDecision?.profiles?.[precisionProfile]?.reasons?.join('；') }}</p>
       </details>
-      <p class="quote-coverage">软件行情 · 本地计算 · 沪深主板非ST · 每轮最多5只，不凑数。已保存推荐会在重启后保留，手动刷新成功后更新。</p>
+      <p class="quote-coverage">软件行情 · 本地计算 · 沪深主板非ST。次日冲板观察与交易条件候选分别保留，点击“刷新扫描”才重新选股。</p>
       <n-alert v-if="adaptive.message" type="warning" :show-icon="false">{{ adaptive.message }}</n-alert>
-      <div class="adaptive-summary"><div><b>{{ result.adaptive ? '已保存推荐' : '本地精选' }}</b><n-tag v-if="snapshotIsOld" size="small" type="warning" :bordered="false">历史结果</n-tag><small>生成时间 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small></div><span>{{ loading ? '扫描中 · 暂时保留原列表' : `新增 ${adaptive.changes?.added?.length || 0} · 移除 ${adaptive.changes?.removed?.length || 0}` }}</span></div>
-      <p class="quote-coverage">本轮主板初筛 {{ researchCoverage.universe }} 只 · 进入深研 {{ researchCoverage.queued }} 只 · 完成深研 {{ researchCoverage.completed }} 只 · 本档入选 {{ adaptivePicks.length }} 只</p>
+      <div class="adaptive-summary saved-recommendations"><div><b>{{ result.adaptive ? savedRecommendations.saved ? `已保存研究推荐 · ${savedRecommendations.saved} 只` : '已保存扫描 · 暂无研究推荐' : '本地精选' }}</b><n-tag v-if="snapshotIsOld" size="small" type="warning" :bordered="false">历史结果</n-tag><small>生成时间 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small><small v-if="adaptive.run_id || adaptive.runId">扫描编号 {{ adaptive.run_id || adaptive.runId }}</small></div><n-button v-if="result.adaptive" size="small" secondary @click="openRecommendationRecords">查看最新推荐记录</n-button><span v-if="loading">扫描中 · 暂时保留原列表</span></div>
+      <p v-if="adaptive.nextDayResearch" class="quote-coverage">已保存研究推荐按股票去重：{{ savedRecommendations.splitQueues ? '未触板潜伏' : '次日观察' }} {{ savedRecommendations.primary }} 只 · 交易条件候选 {{ savedRecommendations.execution }} 只<template v-if="savedRecommendations.splitQueues">；已触板延续 {{ savedRecommendations.continuation }} 只单列辅助观察，不计入主推荐。</template>研究观察保留依据和缺口，不代表已通过交易条件。</p>
+      <p class="quote-coverage">本轮主板初筛 {{ researchCoverage.universe }} 只 · 进入深研 {{ researchCoverage.queued }} 只 · 完成深研 {{ researchCoverage.completed }} 只 · <template v-if="adaptive.nextDayResearch">研究推荐 {{ savedRecommendations.saved }} 只</template><template v-else>本档入选 {{ adaptivePicks.length }} 只</template></p>
       <p v-if="snapshotIsOld" class="quote-coverage">以上为已保存的历史结果，价格与证据截至标注的生成时间；刷新成功后才会更新。</p>
       <div v-if="quoteCoverageSummary || scheduleSummary" class="quote-coverage"><span v-if="quoteCoverageSummary" title="新鲜表示通过本轮报价时效核验，不代表已成交。">{{ quoteCoverageSummary }}</span><span v-if="scheduleSummary" :title="`北京时间 · 目标 ${adaptive.delivery.target_at} · 实际 ${adaptive.delivery.decision_at || '未记录'}`">{{ scheduleSummary }}</span></div>
       <div v-if="adaptive.dataQuality?.independent_evidence" class="quote-coverage">
@@ -424,8 +470,36 @@ onBeforeUnmount(() => {
         <span>行业联动确认：{{ adaptive.dataQuality.independent_evidence.sector_confirmed }} 只</span>
         <span>分钟资金数据：{{ adaptive.dataQuality.independent_evidence.fund_source_available }} 只</span>
       </div>
-      <details v-if="isV11" class="sk-help-details picks-method"><summary>规则与覆盖</summary><p>{{ researchCoverage.description }}</p><p>行情 {{ adaptive.dataQuality?.snapshot_count ?? '未知' }} 只；深研完成表示已逐只核验，缺失和过期证据仍单独记录，不代表全部证据齐全。</p><p>{{ adaptive.marketSummary }}</p><p>算法 {{ adaptive.scoreVersion || adaptive.recommendationLogicVersion || '以单只候选记录为准' }}。同刻历史5～19日按实际覆盖降低置信度，不足5日对应因子留空。可用因子重新分配权重。</p><p>冷启动分数 = max(Early, MainRise) − 0.2 × 风险分，再限制至0～100。风险系数为未验证初值；分数用于排序，概率与收益预测待校准。</p></details>
+      <details v-if="isV11" class="sk-help-details picks-method"><summary>规则与覆盖</summary><p>{{ researchCoverage.description }}</p><p>行情 {{ adaptive.dataQuality?.snapshot_count ?? '未知' }} 只；深研完成表示已逐只核验，缺失和过期证据仍单独记录，不代表全部证据齐全。</p><p>{{ adaptive.marketSummary }}</p><p>算法 {{ adaptive.scoreVersion || adaptive.recommendationLogicVersion || '以单只候选记录为准' }}。</p><p>{{ adaptive.algorithm?.missingFactorPolicy || '缺失处理以该次记录的算法版本为准。' }}</p><p>{{ adaptive.algorithm?.formula || '评分公式以该次记录为准。' }}</p><p>{{ adaptive.algorithm?.profilePolicy }}</p><p>参数为待验证初值。分数用于研究排序，数据覆盖不是胜率；市场情绪调节不表示实际仓位或成交。</p></details>
       <details v-else class="sk-help-details picks-method"><summary>旧版历史口径</summary><p>{{ modelMix }} · {{ adaptive.modelVersion }}。旧分快照保留用于回看；下一次刷新采用当前规则与证据筛选。</p></details>
+      <section v-for="queue in nextDayQueues" :key="queue.key" class="next-day-watch" :class="queue.key === 'continuation' ? 'next-day-continuation' : 'next-day-primary'">
+        <n-alert v-if="adaptive.nextDayResearch?.retrospectiveProjection" type="warning" :show-icon="false">历史证据重排 · 非当时推荐。{{ adaptive.nextDayResearch.projectionMeaning || '按当时已保存的证据重新排序，不作为当时已经发出的推荐或新规则命中率。' }}</n-alert>
+        <div class="adaptive-summary"><div><b>{{ queue.title }} · {{ queue.picks.length }} 只</b><small>目标交易日 {{ queue.picks[0]?.nextDaySignal?.targetSession || '下一交易日' }}</small></div><n-button v-if="queue.key === 'continuation'" size="small" secondary @click="continuationVisible = !continuationVisible">{{ continuationVisible ? '收起延续观察' : '展开延续观察' }}</n-button><n-tag v-else size="small" type="warning" :bordered="false">研究观察</n-tag></div>
+        <p class="quote-coverage">{{ queue.key === 'first_board' ? '优先查看扫描时未触板的潜伏线索；具体涨幅、距模式价与昨日形态依据见每只记录。' : queue.key === 'continuation' ? '这些股票扫描时已触及当日模式限价，单独观察延续，不与未触板潜伏混排。' : '旧版名单保留原样，未事后划分潜伏或延续队列。' }}排序分不是涨停概率，交易条件仍待确认。</p>
+        <div v-show="queue.key !== 'continuation' || continuationVisible" class="pick-grid">
+          <n-card v-for="(pick, index) in queue.picks" :key="`${queue.key}-${codeOf(pick)}`" size="small" :bordered="false" class="pick-card" :class="queue.key === 'continuation' ? 'next-day-continuation-card' : 'next-day-card'">
+            <template #header><div class="pick-title"><b>{{ index + 1 }}</b><strong>{{ nameOf(pick) }}</strong><code>{{ codeOf(pick) }}</code><n-tag size="small" :bordered="false" type="warning">观察分 {{ nextDayScore(pick) }}</n-tag></div></template>
+            <div class="pick-body">
+              <p class="next-day-reason">{{ pick.nextDaySignal?.reasons?.[0] || '查看本轮保存的量价结构线索' }}</p>
+              <div class="pick-quote"><strong>{{ pick.referencePrice == null ? '—' : `¥${Number(pick.referencePrice).toFixed(2)}` }}</strong><span>扫描参考价</span><span :class="Number(nextDayChange(pick)) > 0 ? 'up' : Number(nextDayChange(pick)) < 0 ? 'down' : ''">{{ observationChange(nextDayChange(pick)) }}</span></div>
+              <div v-if="pick.quote" class="quote-evidence">{{ quoteEvidence(pick) }}</div>
+              <p v-if="pick.nextDaySignal?.branches?.length" class="quote-coverage">结构：{{ pick.nextDaySignal.branches.join(' · ') }}</p>
+              <p v-if="pick.nextDaySignal?.queue" class="quote-coverage">{{ nextDayQueueLabel(pick.nextDaySignal) }} · 扫描时{{ nextDayTouchLabel(pick.nextDaySignal) }}<template v-if="pick.nextDaySignal.features?.limitDistancePct != null"> · 距当日模式限价 {{ Number(pick.nextDaySignal.features.limitDistancePct).toFixed(2) }}%</template></p>
+              <details class="sk-help-details pick-details"><summary>观察依据与待确认条件</summary>
+                <p v-for="reason in pick.nextDaySignal?.reasons || []" :key="reason"><span>线索</span>{{ reason }}</p>
+                <p v-for="gap in pick.nextDaySignal?.gaps || []" :key="gap"><span>待确认</span>{{ gap }}</p>
+                <p v-for="risk in pick.riskReasons || []" :key="risk"><span>风险</span>{{ risk }}</p>
+                <p><span>评分含义</span>{{ pick.nextDaySignal?.scoreMeaning || '用于研究排序，未经胜率校准' }}</p>
+                <p><span>证据日期</span>{{ pick.nextDaySignal?.signalSession || '未记录' }} · 目标 {{ pick.nextDaySignal?.targetSession || '下一交易日' }}</p>
+                <p><span>交易条件</span>此通道仅用于观察，未给出买入许可；开盘、量价和风险条件仍需重新确认。</p>
+              </details>
+            </div>
+            <template #footer><n-space justify="end"><n-button size="small" secondary @click="addWatch(pick)">自选</n-button><n-button size="small" type="primary" @click="openKline(pick)">图表</n-button></n-space></template>
+          </n-card>
+        </div>
+        <n-empty v-if="queue.key === 'first_board' && !queue.picks.length" description="本轮暂无满足潜伏条件的研究推荐。已触板延续单列在下方，不补入潜伏名单。" style="padding:24px 0" />
+      </section>
+      <div v-if="nextDayQueues.length && adaptivePicks.length" class="adaptive-summary"><b>交易条件候选 · {{ adaptivePicks.length }} 只</b><small>按本轮已核验的证据与交易门槛筛选</small></div>
       <n-spin :show="loading && !adaptivePicks.length">
         <section v-if="adaptivePicks.length" class="pick-grid">
           <n-card v-for="{ pick, detail } in adaptiveCards" :key="codeOf(pick)" size="small" :bordered="false" class="pick-card tier-adaptive">
@@ -437,7 +511,7 @@ onBeforeUnmount(() => {
               <div v-if="pick.quote" class="quote-evidence" title="北京时间；延迟按采集时间减原始源时间计算。此处为本轮保存的行情快照。">{{ quoteEvidence(pick) }}</div>
               <div v-if="isV11Pick(pick)" class="v11-facts">
                 <div><span>Early / MainRise</span><b>{{ factorValue(pick.earlyScore) }} / {{ factorValue(pick.mainRiseScore) }}</b></div>
-                <div><span>风险 / 置信度</span><b>{{ factorValue(pick.distributionRisk) }} / {{ percent(pick.dataConfidence ?? pick.confidence, 0) }}</b></div>
+                <div><span>风险 / 数据覆盖</span><b>{{ factorValue(pick.distributionRisk) }} / {{ percent(pick.dataConfidence ?? pick.confidence, 0) }}</b></div>
                 <div><span>同刻历史覆盖</span><b>{{ pick.historicalCoverageDays ?? pick.baselineHistoryDays ?? 0 }} / 20 日</b></div>
                 <div><span>价格结构</span><b>{{ pick.observableStructure || '待确认' }}</b></div>
               </div>
@@ -451,6 +525,9 @@ onBeforeUnmount(() => {
                 <p v-if="pick.precisionDecision"><span>财务与事件</span>{{ pick.precisionDecision.sourceContext?.gaps?.join('；') || '已取得财报、预告与解禁覆盖；按记录时点核验' }}</p>
                 <p v-if="pick.precisionDecision"><span>价格位置</span>MA5乖离 {{ pick.precisionDecision.metrics.biasMa5Pct?.toFixed(2) ?? '未知' }}% · ATR距离 {{ pick.precisionDecision.metrics.atrExtension?.toFixed(2) ?? '未知' }} 倍</p>
                 <p><span>研究排序分</span>{{ scoreOf(pick) }} · 不是胜率或收益预测</p>
+                <p v-if="pick.dataEligibility"><span>数据资格</span>{{ { formal: '满足历史与关键因子要求', observation: '历史、关键因子或时效未满足，仅观察', insufficient: '历史或关键证据不足' }[pick.dataEligibility.status] || '待核验' }} · {{ pick.scoreStage || '阶段待确认' }}</p>
+                <p v-for="(packet, key) in pick.researchFactors || {}" :key="key"><span>{{ { C: '事件催化', G: '历史股性', E: '市场情绪', H: '题材扩散（影子）' }[key] || key }}</span>{{ { observed: '已记录', insufficient: '样本不足', unavailable: '未取得' }[packet.status] || '未取得' }} · {{ packet.gaps?.join('；') || packet.source || '来源见指标证据' }}</p>
+                <p v-if="pick.marketRegime"><span>情绪调节</span>{{ { weak: '偏弱', hot: '过热', normal: '正常', unknown: '证据不足，保留基础分' }[pick.marketRegime.state] || '待核验' }} · 研究分系数 {{ pick.marketRegime.multiplier ?? '未取得' }}，不代表实际仓位</p>
                 <template v-if="isV11Pick(pick)"><p><span>主升概率</span>{{ calibrationValue(pick, 'mainRiseProbability') }}</p><p><span>预计MFE</span>1日 {{ calibrationValue(pick, 'expectedMFE1') }} · 3日 {{ calibrationValue(pick, 'expectedMFE3') }} · 5日 {{ calibrationValue(pick, 'expectedMFE5') }}</p><p><span>预计MAE</span>1日 {{ calibrationValue(pick, 'expectedMAE1') }} · 3日 {{ calibrationValue(pick, 'expectedMAE3') }} · 5日 {{ calibrationValue(pick, 'expectedMAE5') }}</p></template>
                 <p><span>观察周期</span>{{ detail.entryPlan.holdingWindow }}</p>
                 <p><span>不追条件</span>{{ detail.entryPlan.noChase }}</p>
@@ -471,14 +548,15 @@ onBeforeUnmount(() => {
             <template #footer><n-space justify="end"><n-button size="small" secondary @click="addWatch(pick)">自选</n-button><n-button size="small" type="primary" @click="openKline(pick)">图表</n-button></n-space></template>
           </n-card>
         </section>
-        <n-empty v-else :description="adaptive.message || (result.generatedAt ? '本轮无候选 · 请查看规则与覆盖' : '尚未保存推荐，请点击“刷新扫描”。盘前当日分钟证据可能尚未形成。')" style="padding:56px 0" />
-        <details v-if="insufficientCards.length" class="sk-help-details insufficient-evidence"><summary>证据不足未入选 · {{ insufficientCards.length }} 只</summary><p>这些股票未进入推荐候选；查看缺失证据和未满足的条件。</p><article v-for="{ pick, detail } in insufficientCards" :key="codeOf(pick)"><div><b>{{ nameOf(pick) }}</b><code>{{ codeOf(pick) }}</code><n-button size="tiny" secondary @click="showWhy(pick, true)">查看证据缺口</n-button></div><p>{{ detail.risks.join('；') || detail.reason }}</p></article></details>
+        <p v-else-if="nextDayQueues.length" class="quote-coverage">交易条件候选 0 只；{{ savedRecommendations.saved ? '本轮研究推荐保存在上方，交易证据与风险门槛仍待确认。' : '研究队列与交易条件分别核验，本轮未以延续观察补足主推荐。' }}</p>
+        <n-empty v-else :description="adaptive.message || (result.generatedAt ? '本轮无候选 · 请查看规则与覆盖' : '尚未保存推荐，请点击“刷新扫描”。盘前当日分钟证据可能尚未形成。')" style="padding:36px 0" />
+        <details v-if="insufficientCards.length" class="sk-help-details insufficient-evidence"><summary>交易条件待补证据 · {{ insufficientCards.length }} 只</summary><p>这些股票未通过交易候选条件，其中有研究线索的可同时保留在上方观察队列；查看具体缺口。</p><article v-for="{ pick, detail } in insufficientCards" :key="codeOf(pick)"><div><b>{{ nameOf(pick) }}</b><code>{{ codeOf(pick) }}</code><n-button size="tiny" secondary @click="showWhy(pick, true)">查看交易缺口</n-button></div><p>{{ detail.risks.join('；') || detail.reason }}</p></article></details>
       </n-spin>
-    </template>
+    </section>
 
-    <PicksLedger v-else-if="['records', 'reviews', 'learning'].includes(viewMode)" :mode="viewMode" @open-chart="openKline" />
+    <PicksLedger v-for="mode in visitedLedgerModes" v-show="viewMode === mode" :key="mode" :mode="mode" :active="pageActive && viewMode === mode" :refresh-token="mode === 'records' ? recordsRefreshToken : 0" @open-chart="openKline" />
 
-    <template v-else-if="viewMode === 'classic'">
+    <section v-show="viewMode === 'classic'">
       <n-tabs v-model:value="activeTier" type="segment" animated class="tier-tabs"><n-tab-pane v-for="tier in tierOptions" :key="tier.key" :name="tier.key"><template #tab><span class="tier-tab" :title="tier.note"><b>{{ tier.label }}</b></span></template></n-tab-pane></n-tabs>
       <details class="sk-help-details picks-method"><summary>方法与口径</summary><p>{{ tierData.description || (activeTier === 'regular' ? '均衡多因子与趋势质量策略。' : '暂无新版数据。') }}</p><p v-if="activeTier === 'aggressive'">“生成时未封板”只表示当时有成交、未停牌且低于涨停价至少0.01元，不保证之后可成交。卡片分数为候选百分位；触板概率仅在模型通过发布门槛时显示。</p></details>
       <n-tabs v-model:value="activeBoard" type="line" animated><n-tab-pane name="nonKeChuang" tab="非科创板" /><n-tab-pane name="kechuang" tab="科创板" /></n-tabs>
@@ -506,18 +584,19 @@ onBeforeUnmount(() => {
         </section>
         <n-empty v-else :description="shortfall ? `合格候选不足，缺额 ${shortfall} 只` : '暂无合格候选'" style="padding:56px 0" />
       </n-spin>
-    </template>
+    </section>
     <n-drawer v-model:show="methodVisible" :width="500" placement="right"><n-drawer-content title="精选 · 方法与使用" closable><div class="pick-explanation">
       <ol class="usage-steps"><li><b>刷新扫描</b> · 检查列表生成时间、行情源时间和覆盖范围。</li><li><b>为何入选</b> · 查看实际因子、价格结构与失效条件。</li><li><b>图表</b> · 使用共用行情核对当前结构。</li><li><b>延后复盘</b> · 查看T+1、T+3、T+5的观察变化与模拟成交。</li></ol>
-      <h3>本地精选 V1.1</h3><p>使用软件行情、本地因子及两通道评分，筛选沪深主板非ST，每轮最多5只。每轮重新选深度核验队列，候选及未入选对照一同记录。</p>
-      <details><summary>入选依据与指标</summary><p>每只候选展示已保存的入选理由、指标数值、单位、阈值、来源和数据时间，以及触发、失效和不追条件。历史不足5日时，对应历史因子留空；5～19日展示实际天数并降低置信度；达到20日才使用完整基准。成交额缺失保留为空。</p><p>冷启动研究分不是胜率或收益预测。未经校准的MFE、MAE预测及概率显示待校准。风险只扣一次，0.2系数是待验证初值。旧记录没有保存的指标不会事后补写。</p></details>
+      <h3>本地精选 V1.2（当前规则）</h3><p>筛选沪深主板非ST，每档每轮最多5只。突破和修复使用启动分，延续使用主升分，再计入风险与市场状态调节。每轮重新核验队列，候选及未入选对照一同记录；已保存的V1.1记录仍显示其原版本公式。</p>
+      <h3>次日冲板研究 · 潜伏与延续分开</h3><p>主推荐默认展示最多5只未触板潜伏：本轮规则要求扫描时涨幅在−3%至5%、当日尚未触及模式限价且仍有至少4%距离，并核验日线、量价与昨日形态；昨日证据缺失会列为缺口，不声称已确认首板。最多5只已触板延续单列为辅助观察，默认折叠，不用于补足潜伏名单或主推荐数量。两队列分别排序，保存当时依据、目标日与缺口。</p><p>已保存研究推荐数量为潜伏与交易候选按股票去重后的并集。研究观察不代表通过交易条件；排序分未校准为涨停概率，下一交易日仍需核验。旧版名单保留原算法记录，不事后分队列。</p>
+      <details><summary>入选依据与指标</summary><p>量或价的同刻历史不足5日时不生成评分；5～19日仅供观察。正式候选须量价历史均达到20日、M/V/W/B关键因子有效且分钟证据新鲜，再通过本档风险门槛。数据覆盖不是胜率。缺失因子保持为空、得分贡献为零，固定权重不重新分配；缺失风险按该项上界计入惩罚。</p><p>事件、历史股性和换手参与规则分；市场情绪仅向下调节研究分，未知时保留基础分，不代表实际仓位。题材扩散只作影子记录，新闻社交舆情尚未接入。研究分不是收益预测；未经校准的MFE、MAE及概率保持待校准。风险系数0.2等参数均为待验证初值，旧记录没有保存的证据不事后补写。</p></details>
       <details><summary>旧版历史分支名称</summary><div class="branch-list"><div v-for="(item,key) in PICK_BRANCHES" :key="key"><code>{{ key }}</code><span>{{ item.name }}</span></div></div></details>
-      <h3>策略分组</h3><p>保守、均衡、进攻采用不同目标，分数不能跨组比较。旧策略记录与V1.1训练集分别保留。</p>
-      <details><summary>定时扫描与学习</summary><p>北京时间09:20盘前观察；09:40、09:55、10:30、14:55独立扫描；15:30归档与到期复盘；周五15:45本地训练。自动推荐和自动学习分别控制。错过时点保留遗漏记录，手动刷新不重复计入训练。</p><p>默认至少120个成熟交易日、1000条有效样本才检验模型晋升。经时间隔离、样本外扣费收益、优势置信下界与回撤检查后，还须完成20个交易日前瞻影子验证。未达门槛继续使用当前版本。</p><p>进入页面读取已保存的展示快照，关闭再开也会保留；后台定时扫描记入历史，不替换当前展示。“刷新扫描”成功后才更新，刷新期间或失败时仍显示原推荐；新一轮确实无合格候选时会明确显示空结果。模拟成交采用下一完整分钟入场和期限收盘退出，未成交独立记录。价格观察与模拟收益均不代表用户真实交易。</p></details>
+      <h3>策略分组</h3><p>V1.2三档共用研究排序，分别执行乖离、ATR、结构盈亏比、业绩与解禁门槛。事件风险覆盖未知时仅观察；已知负面业绩预告或超限解禁独立否决。激进档在分钟突破已核验时允许上方压力与盈亏比未知，但不生成目标价；已知盈亏比仍须达标。旧版不同策略的分值不能直接比较，旧契约模型不会用于新规则。</p>
+      <details><summary>定时扫描与学习</summary><p>北京时间09:20盘前观察；09:40、09:55、10:30、14:55独立扫描；15:30归档与到期复盘；周五15:45本地训练。自动推荐和自动学习分别控制。错过时点保留遗漏记录，手动刷新不计入正式训练。</p><p>默认至少120个成熟交易日、1000条有效样本，并满足训练和校准分段要求后才检验模型。独立留出段至少60个信号日、50笔完成交易；训练与验证按实际标签结束时间隔离，至少留5个交易日间隔。扣费收益与相对优势的置信下界须为正，回撤不恶化，再从模型实际创建后开展至少20个交易日前瞻影子验证。失败标签日与空仓日保留，未达要求继续使用规则。</p><p>页面读取已保存的展示快照。“刷新扫描”成功后才更新，刷新期间或失败时仍显示原推荐；新一轮无合格候选时明确显示空结果。模拟成交使用下一完整分钟入场，满足T+1后尝试期限收盘退出；遇跌停、停牌或容量不足则继续持仓，逐日标价并等待首个有完整证据的可卖分钟。缺路径不跳过，未成交独立记录；价格观察与模拟收益均不是用户真实交易。</p></details>
     </div></n-drawer-content></n-drawer>
-    <n-drawer v-model:show="explanationVisible" :width="520" placement="right"><n-drawer-content :title="`${nameOf(selectedPick)} · ${selectedIsInsufficient ? '证据不足未入选' : '为什么入选'}`" closable><div class="pick-explanation">
+    <n-drawer v-model:show="explanationVisible" :width="520" placement="right"><n-drawer-content :title="`${nameOf(selectedPick)} · ${selectedIsInsufficient ? '交易条件未满足' : '为什么入选'}`" closable><div class="pick-explanation">
       <h3>{{ explanation.title }}</h3><small>快照 {{ formatTime(adaptive.generatedAt || result.generatedAt) }} · 行情来源 {{ explanation.source }}<br/>推荐逻辑 {{ explanation.logicVersion }}</small>
-      <h3>{{ selectedIsInsufficient ? '已记录线索（未入选）' : '为什么入选' }}</h3><ul v-if="explanation.reasons.length" class="explanation-reasons"><li v-for="reason in explanation.reasons" :key="reason">{{ reason }}</li></ul><p v-else>{{ explanation.reason }}</p>
+      <h3>{{ selectedIsInsufficient ? '已记录线索（非交易候选）' : '为什么入选' }}</h3><ul v-if="explanation.reasons.length" class="explanation-reasons"><li v-for="reason in explanation.reasons" :key="reason">{{ reason }}</li></ul><p v-else>{{ explanation.reason }}</p>
       <p v-if="explanation.legacyNotice" class="legacy-notice">{{ explanation.legacyNotice }}</p>
       <details v-if="explanation.savedExplanation"><summary>原记录说明（不作为补写的入选依据）</summary><p>{{ explanation.savedExplanation }}</p></details>
       <h3>风险与反证</h3><ul v-if="explanation.risks.length" class="explanation-reasons"><li v-for="risk in explanation.risks" :key="risk">{{ risk }}</li></ul><p v-else>未取得具体风险说明，需进一步核验。</p>
@@ -538,7 +617,7 @@ onBeforeUnmount(() => {
     <n-drawer v-model:show="historyVisible" :width="520" placement="right"><n-drawer-content title="精选历史" closable><n-spin :show="historyLoading">
       <div v-if="historyItems.length" class="history-list">
         <article v-for="item in historyItems" :key="item.run_id" class="history-run">
-          <div class="history-head"><div><b>{{ formatTime(historyResult(item).generatedAt || item.as_of) }}</b><small>{{ historySlotLabel(item) }}<template v-if="!isReviewHistory(item)"> · {{ historyCandidates(item).length }} 只</template> · {{ historyStatusLabel(item) }}</small></div><n-button v-if="isScanHistory(item)" size="small" secondary @click="restoreHistory(item)">查看</n-button></div>
+          <div class="history-head"><div><b>{{ formatTime(historyResult(item).generatedAt || item.as_of) }}</b><small>{{ historySlotLabel(item) }}<template v-if="!isReviewHistory(item)"><template v-if="hasNextDayHistory(item)"> · 研究推荐 {{ historySavedSummary(item).saved }} 只 · {{ historySavedSummary(item).splitQueues ? '潜伏' : '次日观察' }} {{ historyNextDayCandidates(item).length }} 只 · 交易候选 {{ historyCandidates(item).length }} 只<template v-if="historySavedSummary(item).splitQueues"> · 延续 {{ historyContinuationCandidates(item).length }} 只</template></template><template v-else> · {{ historyCandidates(item).length }} 只</template></template> · {{ historyStatusLabel(item) }}</small></div><n-button v-if="isScanHistory(item)" size="small" secondary @click="restoreHistory(item)">查看</n-button></div>
           <details v-if="isReviewHistory(item)" class="sk-help-details history-review">
             <summary>查看{{ item.mode === 'king_review' ? '复盘' : '学习' }}摘要</summary>
             <p>{{ reviewSummary(item) }}</p>
@@ -556,7 +635,11 @@ onBeforeUnmount(() => {
               </tbody></table>
             </template>
           </details>
-          <div v-else-if="historyCandidates(item).length" class="history-candidates"><n-tag v-for="pick in historyCandidates(item)" :key="`${item.run_id}-${codeOf(pick)}`" size="small" :bordered="false">#{{ pick.rank }} {{ nameOf(pick) }} · {{ pick.modelBranch || pick.model }} · {{ scoreOf(pick) }}</n-tag></div><n-empty v-else size="small" :description="historyEmptyLabel(item)" />
+          <div v-else-if="historyCandidates(item).length || historyNextDayCandidates(item).length || historyContinuationCandidates(item).length">
+            <template v-if="historyNextDayCandidates(item).length"><p class="history-channel">{{ historySavedSummary(item).splitQueues ? '未触板潜伏' : '历史次日观察（未分队列）' }} · 分数用于研究排序，不是涨停概率</p><div class="history-candidates"><n-tag v-for="(pick, index) in historyNextDayCandidates(item)" :key="`${item.run_id}-next-day-${codeOf(pick)}-${index}`" size="small" type="warning" :bordered="false">#{{ pick.rank ?? index + 1 }} {{ nameOf(pick) }} · 观察分 {{ nextDayScore(pick) }} · 目标 {{ pick.nextDaySignal?.targetSession || '下一交易日' }}</n-tag></div></template>
+            <template v-if="historyCandidates(item).length"><p v-if="hasNextDayHistory(item)" class="history-channel">交易条件候选</p><div class="history-candidates"><n-tag v-for="(pick, index) in historyCandidates(item)" :key="`${item.run_id}-entry-${codeOf(pick)}-${index}`" size="small" :bordered="false">#{{ pick.rank ?? index + 1 }} {{ nameOf(pick) }} · {{ pick.modelBranch || pick.model }} · {{ scoreOf(pick) }}</n-tag></div></template>
+            <details v-if="historyContinuationCandidates(item).length" class="sk-help-details"><summary>已触板延续 · {{ historyContinuationCandidates(item).length }} 只辅助观察</summary><div class="history-candidates"><n-tag v-for="(pick, index) in historyContinuationCandidates(item)" :key="`${item.run_id}-continuation-${codeOf(pick)}-${index}`" size="small" :bordered="false">#{{ pick.rank ?? index + 1 }} {{ nameOf(pick) }} · 延续分 {{ nextDayScore(pick) }} · 目标 {{ pick.nextDaySignal?.targetSession || '下一交易日' }}</n-tag></div></details>
+          </div><n-empty v-else size="small" :description="historyEmptyLabel(item)" />
         </article>
       </div><n-empty v-else description="暂无历史" />
     </n-spin></n-drawer-content></n-drawer>
@@ -564,6 +647,8 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.pick-body>p.next-day-reason,.pick-body>p.quote-coverage{display:block}
+.history-channel{margin:10px 0 6px;font-size:11px;color:var(--sk-text-muted)}
 .refresh-progress{margin:12px 0;padding:12px;background:var(--sk-surface-2);border-radius:8px;font-size:12px}.refresh-progress>div{display:flex;justify-content:space-between;gap:14px;margin-bottom:8px}.refresh-progress span,.refresh-progress small{color:var(--sk-text-muted)}.refresh-progress small{display:block;margin-top:7px}.adaptive-summary>div{flex-wrap:wrap}
 .v11-facts{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0 12px;padding:10px;background:var(--sk-surface-2);border-radius:6px;font-size:11px}.v11-facts>div{display:flex;flex-direction:column;gap:3px}.v11-facts b{font-weight:500;font-variant-numeric:tabular-nums}.background-switch{white-space:nowrap}
 .indicator-highlights{display:flex;flex-wrap:wrap;gap:5px 12px;margin:0 0 8px;font-size:10px;color:var(--sk-text-muted)}.indicator-highlights b{color:var(--sk-text);font-variant-numeric:tabular-nums}.explanation-reasons{padding-left:18px}.explanation-reasons li{margin:7px 0}.legacy-notice{padding:9px 11px;border-left:3px solid var(--sk-accent);background:var(--sk-surface-2)}.insufficient-evidence{margin:18px 0;font-size:12px}.insufficient-evidence>article{padding:10px 0;border-top:1px solid var(--sk-border)}.insufficient-evidence>article>div{display:flex;align-items:center;gap:10px}.insufficient-evidence code{color:var(--sk-text-muted)}.insufficient-evidence .n-button{margin-left:auto}

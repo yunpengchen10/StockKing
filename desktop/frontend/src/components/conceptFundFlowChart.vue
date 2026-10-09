@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import {onBeforeUnmount, onMounted, ref, watch, computed} from "vue";
+import {nextTick, onBeforeUnmount, onMounted, ref, watch, computed} from "vue";
+import {usePageActive} from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 import {GetConceptFundFlowListByDate, GetConceptFundFlowTopListByDate, GetAllConceptCodes} from "../../wailsjs/go/main/App";
 import * as echarts from "echarts";
 
@@ -68,7 +70,7 @@ onMounted(async () => {
     await loadAllData()
     // 交易时间每分钟刷新（仅当天）
     refreshInterval.value = setInterval(async () => {
-      if (isToday.value && isTradingTime()) {
+      if (pageActive.value && isToday.value && isTradingTime()) {
         await loadAllData()
       }
     }, 60000)
@@ -365,7 +367,7 @@ function startPlay() {
 }
 
 function tickPlay() {
-  if (!isPlaying.value) return
+  if (!pageActive.value || !isPlaying.value) return
   if (playIndex.value >= totalPoints.value) {
     isPlaying.value = false
     return
@@ -511,6 +513,10 @@ watch(() => props.darkTheme, () => {
 
 watch(() => props.chartHeight, () => {
   if (chart) chart.resize()
+})
+watch(pageActive, active => {
+  if (!active) { clearTimeout(playTimer.value); return }
+  void nextTick(() => { chart?.resize(); if (isPlaying.value) tickPlay() })
 })
 </script>
 

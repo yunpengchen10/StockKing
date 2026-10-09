@@ -8,6 +8,8 @@ import {
 } from 'lightweight-charts'
 import { NButton, NFlex, NSpin, NText } from 'naive-ui'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { usePageActive } from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 
 const CLR_RISE = '#e1000f'
 const CLR_FALL = '#26a69a'
@@ -251,7 +253,7 @@ let resizeObserver = null
 onMounted(() => {
   if (chartContainerRef.value) {
     resizeObserver = new ResizeObserver(() => {
-      if (chart && chartContainerRef.value) {
+      if (pageActive.value && chart && chartContainerRef.value?.clientWidth) {
         chart.applyOptions({ width: chartContainerRef.value.clientWidth })
       }
     })
@@ -261,6 +263,11 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (resizeObserver) resizeObserver.disconnect()
+})
+watch(pageActive, active => {
+  if (active) void nextTick(() => {
+    if (chart && chartContainerRef.value?.clientWidth) chart.applyOptions({ width: chartContainerRef.value.clientWidth })
+  })
 })
 </script>
 

@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import {onBeforeMount, onUnmounted, ref} from 'vue'
+import {usePageActive} from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 import {HotTopic, OpenURL} from "../../wailsjs/go/main/App";
 import {Environment} from "../../wailsjs/runtime";
 const list  = ref([])
@@ -7,7 +9,8 @@ const task =ref()
 
 onBeforeMount(async () => {
   list.value = await HotTopic(10)
-  setInterval(async ()=>{
+  task.value=setInterval(async ()=>{
+    if (!pageActive.value) return
     list.value = await HotTopic(10)
   }, 1000*10)
 })

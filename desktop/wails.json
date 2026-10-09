@@ -12,7 +12,7 @@
   "info": {
     "companyName": "Stock King",
     "productName": "Stock King",
-    "productVersion": "2.6.2",
+    "productVersion": "2.6.3",
     "copyright": "Based on go-stock (GPL-3.0) and Daily Stock Analysis (MIT)",
     "comments": "Stock King：行情、行动计划、AI 研究与量化验证工作台。"
   }

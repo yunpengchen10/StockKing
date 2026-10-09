@@ -19,11 +19,15 @@ def _candidate(code: str, day: date, *, price: float = 10.0) -> dict:
         "precisionDecision": {"version": contract["entryPolicyVersion"],
                               "profiles": {"regular": {"entryEligible": True}}},
         "code": code, "name": "样本", "decision_at": _clock(day, second=30).isoformat(),
-        "signalPrice": price, "referencePrice": price, "baselineHistoryDays": 5,
-        "quote": {"price": price, "pre_close": price, "limit_up": 11.0,
+        "signalPrice": price, "referencePrice": price, "baselineHistoryDays": 20,
+        "priceHistoricalCoverageDays": 20,
+        "dataEligibility": {"status": "formal", "minimumScoreDays": 5, "formalHistoryDays": 20,
+                            "criticalFactors": ["M", "V", "W", "B"], "criticalFactorsReady": True,
+                            "amountHistoryDays": 20, "priceHistoryDays": 20},
+        "quote": {"price": price, "pre_close": price, "limit_up": 11.0, "limit_down": 9.0,
                   "source_time": _clock(day, second=25).isoformat()},
         "tradability": {"status": "unverified"}, "finalScore": 70.0,
-        "v11Inputs": {"r3_pct": 0.5}, "factorScores": {"momentum": 75.0},
+        "v11Inputs": {"r3_pct": 0.5}, "factorScores": {"M": 75.0, "V": 75.0, "W": 75.0, "B": 75.0},
     }
 
 
@@ -198,7 +202,7 @@ def test_corrupt_or_nonfinite_champion_falls_back_to_rule_rank(tmp_path, monkeyp
     candidates = [{"code": "000001", "finalScore": 20}, {"code": "000002", "finalScore": 80}]
     ranked = service.rank_candidates(candidates)
     assert [row["code"] for row in ranked] == ["000002", "000001"]
-    assert all(row["learningRankVersion"] == "rules_v1.1" for row in ranked)
+    assert all(row["learningRankVersion"] == "rules_v1.2" for row in ranked)
     monkeypatch.setattr(service, "_model_artifact", lambda version, **_: {"version": "corrupt"})
     monkeypatch.setattr(service, "_predict_artifact", lambda artifact, rows: (
         np.array([np.nan, 80.0]), np.array([0.5, 0.5])))
@@ -206,19 +210,24 @@ def test_corrupt_or_nonfinite_champion_falls_back_to_rule_rank(tmp_path, monkeyp
 
 
 def test_training_uses_separate_calibration_and_test_without_publishing(tmp_path, monkeypatch):
-    service = SignalLearningService(tmp_path, clock=lambda: _clock(date(2026, 9, 29), 15, 45))
+    training_at = _clock(date(2026, 12, 31), 15, 45)
+    service = SignalLearningService(tmp_path, clock=lambda: training_at)
     start = date(2026, 1, 5)
     samples = []
-    for index in range(120):
+    for index in range(300):
         day = (start + timedelta(days=index)).isoformat()
         for number in range(10):
             x = ((index * 7 + number * 13) % 31) / 30
             net = 0.06 * x - 0.026 + 0.002 * ((index + number) % 3)
             samples.append({"day": day, "code": f"{number:06d}",
+                            "signalId": f"{day}:{number}",
+                            "labelEndAt": _clock(start + timedelta(days=index + 5), 15, 0).isoformat(),
                             "features": {"x": x, "finalScore": 60 + 20 * x},
                             "net": net, "mae": 0.02 + 0.03 * (1 - x),
                             "marks": {day: 10.0}})
     monkeypatch.setattr(service, "_dataset", lambda now, dedupe=True: samples)
+    monkeypatch.setattr(service, "_evaluation_days", lambda now: sorted({sample["day"] for sample in samples}))
+    monkeypatch.setattr(service, "_complete_universe", lambda days, rows: True)
     observed = {}
 
     def capture(test, challenger, logistic, **kwargs):
@@ -228,9 +237,117 @@ def test_training_uses_separate_calibration_and_test_without_publishing(tmp_path
         return {"passed": False, "reason": "test_gate_rejected"}
 
     monkeypatch.setattr(service, "_gates", capture)
-    state = service.train_and_evaluate(_clock(date(2026, 9, 29), 15, 45))
-    assert observed["test_days"] == 24
+    state = service.train_and_evaluate(training_at)
+    assert observed["test_days"] == 60
     assert 0 <= observed["calibrated_range"][0] <= observed["calibrated_range"][1] <= 100
     assert observed["logistic_finite"]
     assert state["shadowVersion"] is None and state["championVersion"] is None
     assert state["reason"] == "challenger_holdout_gate_failed"
+    registry = service._registry()
+    registry.pop("lastCandidateTrainThrough")
+    service._save_registry(registry, training_at)
+    monkeypatch.setattr(service, "_gates", lambda *args, **kwargs: {"passed": True})
+    state = service.train_and_evaluate(training_at)
+    assert state["shadowVersion"] and state["championVersion"] is None
+    assert service._registry()["shadowAfterDay"] == training_at.date().isoformat()
+    assert service._registry()["shadowStartedAt"] == training_at.isoformat()
+
+
+def test_blocked_exit_keeps_loss_and_retries_first_legal_minute(tmp_path):
+    days = [date(2026, 9, 7) + timedelta(days=i) for i in range(7)]
+    bars = _bars(days)
+    # The scheduled T+5 close cannot sell. The next session can; do not remove
+    # this losing trade from training or pretend the exit happened at T+5.
+    for bar in bars:
+        day = date.fromisoformat(bar["end"][:10])
+        if day == days[5]:
+            bar.update(open=9.33, high=9.33, low=9.33, close=9.33,
+                       volume_shares=0, amount_cny=0)
+        elif day == days[6]:
+            bar.update(open=9.4, high=9.45, low=9.3, close=9.4, amount_cny=940000)
+    service = SignalLearningService(tmp_path, clock=lambda: _clock(days[0]),
+        bar_fetcher=lambda code, cutoff: bars,
+        calendar_provider=lambda start, end: [day for day in days if start <= day <= end])
+    service.persist_scan({"status": "completed_observations", "scoreVersion": algorithm_contract()["scoreVersion"],
+                          "candidates": [_candidate("000001", days[0])]}, "0940", _clock(days[0]), True)
+    service.review_due(_clock(days[5], 15, 30))
+    blocked = next(row for row in service.reviews()["items"] if row["horizon"] == 5)
+    assert blocked["status"] == "exit_blocked"
+    assert blocked["positionOpen"] and blocked["simulatedNetReturn"] is None
+    assert blocked["unrealizedPriceReturn"] < 0 and blocked["mae"] > .06
+    assert not service._dataset(_clock(days[5], 15, 30))
+    # A missing first minute cannot be skipped in favor of a later good price.
+    first = next(bar for bar in bars if bar["end"] == _clock(days[6], 9, 31, 0).isoformat())
+    bars.remove(first)
+    service.review_due(_clock(days[6], 15, 30))
+    pending = next(row for row in service.reviews()["items"] if row["horizon"] == 5)
+    assert pending["status"] == "pending_data" and pending["positionOpen"]
+    assert pending["reason"] == "post_target_minute_path_missing"
+    bars.append(first)
+    service.review_due(_clock(days[6], 15, 31))
+    completed = next(row for row in service.reviews()["items"] if row["horizon"] == 5)
+    assert completed["status"] == "mature" and completed["simulatedNetReturn"] < 0
+    assert completed["exitAt"] == _clock(days[6], 9, 31, 0).isoformat()
+    assert completed["deferredExitSessions"] == 1
+    assert service._dataset(_clock(days[6], 15, 31))[0]["labelEndAt"] == completed["exitAt"]
+    assert not service._dataset(_clock(days[5], 15, 31))  # no future labels in an earlier replay
+
+
+def test_frozen_validation_dates_keep_days_with_all_outcomes_missing_and_cash_days(tmp_path):
+    days = [date(2026, 9, 7) + timedelta(days=i) for i in range(8)]
+    clock = [days[0]]
+    service = SignalLearningService(tmp_path, clock=lambda: _clock(clock[0]),
+        calendar_provider=lambda start, end: [day for day in days if start <= day <= end],
+        bar_fetcher=lambda code, cutoff: [])
+    for day in days[:2]:
+        clock[0] = day
+        service.persist_scan({"status": "completed_observations", "scoreVersion": algorithm_contract()["scoreVersion"],
+                              "candidates": [_candidate("000001", day)] if day == days[0] else []},
+                             "0940", _clock(day), True)
+    service.review_due(_clock(days[-1], 15, 30))
+    assert service._dataset(_clock(days[-1], 15, 30)) == []
+    assert service._evaluation_days(_clock(days[-1], 15, 30)) == [day.isoformat() for day in days[:2]]
+    assert not service._complete_universe({day.isoformat() for day in days[:2]}, [])
+    assert service._complete_universe({days[1].isoformat()}, [])  # explicit no-pick day stays cash
+    state = service.train_and_evaluate(_clock(days[-1], 15, 30))
+    assert state["cohortAudit"]["completeQueue"] is False
+    assert len(state["cohortAudit"]["frozenSignalDays"]) == 2
+
+
+def test_purge_uses_actual_deferred_label_end_and_requires_timestamp():
+    rows = [{"signalId": "normal", "day": "2026-09-01", "labelEndAt": "2026-09-08T15:00:00+08:00"},
+            {"signalId": "blocked", "day": "2026-09-01", "labelEndAt": "2026-09-20T09:31:00+08:00"},
+            {"signalId": "missing", "day": "2026-09-01"}]
+    assert [row["signalId"] for row in SignalLearningService._purge_before(rows, "2026-09-15")] == ["normal"]
+
+
+def test_holdout_requires_sixty_signal_days_and_fifty_completed_account_trades(tmp_path):
+    service = SignalLearningService(tmp_path)
+    start = date(2026, 1, 5)
+    samples = []
+    for index in range(60):
+        day, exit_day = start + timedelta(days=index), start + timedelta(days=index + 1)
+        samples.append({"day": day.isoformat(), "runId": str(index), "signalId": str(index),
+            "code": f"{index:06d}", "selected": True, "filled": True,
+            "decisionAt": _clock(day).isoformat(), "entryAt": _clock(day, 9, 42).isoformat(),
+            "exitAt": _clock(exit_day, 15, 0, 0).isoformat(), "entryPrice": 10., "exitPrice": 10.2,
+            "entryMinuteVolume": 1_000_000, "exitMinuteVolume": 1_000_000, "features": {"finalScore": 70},
+            "marks": {day.isoformat(): 10., exit_day.isoformat(): 10.2}})
+    scores = np.ones(60)
+    too_few_days = service._gates(samples[:59], scores[:59], scores[:59], seed=1,
+                                 config=service.execution_config, complete_universe=True)
+    assert too_few_days["independentSignalDays"] == 59
+    assert too_few_days["reason"] == "insufficient_independent_days_or_completed_trades"
+    for sample in samples[:11]:
+        sample["filled"] = False
+    too_few_trades = service._gates(samples, scores, scores, seed=1,
+                                   config=service.execution_config, complete_universe=True)
+    assert too_few_trades["completedTrades"] == 49
+    assert not too_few_trades["passed"]
+    samples[0]["filled"] = True
+    sufficient = service._gates(samples, scores, scores, seed=1,
+                                config=service.execution_config, complete_universe=True)
+    assert sufficient["completedTrades"] == 50
+    assert sufficient["minimumSignalDays"] == 60
+    assert sufficient["periodDiagnostics"] and sufficient["fillRate"] < 1
+    assert not sufficient["passed"]  # enough samples alone cannot prove an advantage

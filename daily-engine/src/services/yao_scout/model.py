@@ -10,6 +10,8 @@ from typing import Any
 
 import numpy as np
 
+from .labels import LABEL_SCHEMA_VERSION
+
 FEATURE_NAMES = (
     "change_1d",
     "change_60d",
@@ -36,6 +38,7 @@ def train_challenger(
     mature = [
         item for item in records
         if item.get("labels", {}).get("maturity_status") == "mature"
+        and item.get("labels", {}).get("labelSchemaVersion") == LABEL_SCHEMA_VERSION
         and all(_finite(item.get("features", {}).get(name)) for name in FEATURE_NAMES)
     ]
     dates = sorted({str(item.get("as_of") or "") for item in mature if item.get("as_of")})
@@ -129,6 +132,7 @@ def train_challenger(
         "targets": gates,
     }
     artifact = {
+        "labelSchemaVersion": LABEL_SCHEMA_VERSION,
         "model_version": version,
         "status": "champion" if qualified else "challenger",
         "trained_at": datetime.now().astimezone().isoformat(),
@@ -154,6 +158,8 @@ def predict_probabilities(features: dict[str, Any], *, champion_path: Path) -> t
         return empty, "withheld_until_model_gate_passes", "yao-audit-v1"
     try:
         artifact = json.loads(champion_path.read_text(encoding="utf-8"))
+        if artifact.get("labelSchemaVersion") != LABEL_SCHEMA_VERSION:
+            return empty, "withheld_incompatible_label_schema", str(artifact.get("model_version") or "yao-audit-v1")
         if not artifact.get("gates", {}).get("qualified"):
             return empty, "withheld_until_model_gate_passes", str(artifact.get("model_version") or "yao-audit-v1")
         raw = np.asarray([_number(features[name]) for name in artifact["feature_names"]], dtype=float)
@@ -196,6 +202,7 @@ def _matched_counterexample_summary(rows: list[dict[str, Any]]) -> dict[str, Any
 
 def _insufficient(version: str, samples: int, symbols: int, years: int, reason: str) -> dict[str, Any]:
     return {
+        "labelSchemaVersion": LABEL_SCHEMA_VERSION,
         "model_version": version,
         "status": "research_observation",
         "trained_at": datetime.now().astimezone().isoformat(),

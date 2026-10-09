@@ -44,7 +44,7 @@
 
 ## 快速开始
 
-Windows v2.6.2 提供 `Stock-King-Setup-x64-v2.6.2.exe` 一键安装包，包含本地引擎和离线 WebView2，无需安装 Python、Go 或 Node.js；修复了推荐记录响应超过 16 MiB 时被截断、无法显示的问题，并包含 v2.6.1 的窗口启动修复。参见[安装与修复说明](docs/WINDOWS_INSTALL.md)。以下 wheel 为可选安装方式。
+Windows v2.6.3 提供 `Stock-King-Setup-x64-v2.6.3.exe` 一键安装包，包含本地引擎和离线 WebView2，无需安装 Python、Go 或 Node.js；修复分钟历史分页、行情关键字段合并、财报与行业证据导入及延后复盘，并保留此前的记录显示与窗口启动修复。参见[安装与修复说明](docs/WINDOWS_INSTALL.md)。以下 wheel 为可选安装方式。
 
 1. 已有安装包时，Mac 用户直接解压 `Stock-King-macos-arm64.zip`，将 `Stock King.app` 放入“应用程序”并打开；看到界面左下角“已连接”即表示本地引擎已启动。此方式无需安装 Python、Go 或 Node.js。Windows 也可选择平台原生 wheel。也可从本公开仓库获取源码，按 [本地构建与分发](docs/LOCAL_BUILD.md) 在自己的电脑构建，无需 Actions、付费构建平台或云服务器。
 2. 使用原生 wheel 时，安装对应平台的 64 位 Python 3.11+（推荐 3.12），在 wheel 所在目录运行（版本号变化时使用实际文件名）：

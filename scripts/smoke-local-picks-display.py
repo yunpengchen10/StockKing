@@ -20,6 +20,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", required=True, type=Path)
     parser.add_argument("--history-db", required=True, type=Path)
+    parser.add_argument("--expected-recommendations", type=int)
     args = parser.parse_args()
     source = args.history_db.resolve(strict=True)
     with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
@@ -39,6 +40,8 @@ def main():
         os.environ["YAO_SCOUT_DATA_DIR"] = str(root / "picks")
         expected = LocalPicksDisplayStore(History()).read()
         assert expected.get("adaptive"), "No valid historical result for migration"
+        if args.expected_recommendations is not None:
+            assert expected.get("savedRecommendationCount") == args.expected_recommendations, "Saved research recommendation count is incorrect"
         token = secrets.token_urlsafe(32)
         environment = os.environ.copy()
         environment.update({
@@ -103,6 +106,9 @@ def main():
                     process.wait(timeout=5)
         print(json.dumps({"frozenEngine": str(args.engine), "restartPreserved": True,
             "candidateCount": len(expected["adaptive"]["candidates"]),
+            "nextDayCandidateCount": len(expected["adaptive"].get("nextDayWatchlist") or []),
+            "continuationCandidateCount": len(expected["adaptive"].get("nextDayContinuationWatchlist") or []),
+            "savedRecommendationCount": expected.get("savedRecommendationCount"),
             "generatedAt": expected.get("generatedAt"), "displayReadMs": durations,
             "validationContract": validated_contract,
             "historyDatabaseReadOnly": True, "profileIsolated": True}, ensure_ascii=False))

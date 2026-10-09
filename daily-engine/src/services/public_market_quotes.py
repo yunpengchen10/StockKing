@@ -158,12 +158,15 @@ def parse_quote_payload(payload, source, requested_codes):
                             active_flow_basis='腾讯外盘/内盘成交量分类估算；股数，不是资金净额')
                 except (ValueError, IndexError):
                     pass
-            # This is an explicit provider field, never a guessed 10% limit.
-            if source == 'tencent' and len(fields) > 47:
-                try:
-                    quotes[code]['limit_up'] = _number(fields[47], True)
-                except ValueError:
-                    pass
+            # Explicit provider fields; absent bounds remain unknown. In
+            # particular, do not manufacture limits from a presumed 10% rule.
+            if source == 'tencent':
+                for key, index in (('limit_up', 47), ('limit_down', 48)):
+                    if len(fields) > index:
+                        try:
+                            quotes[code][key] = _number(fields[index], True)
+                        except ValueError:
+                            pass
         except (IndexError, ValueError) as exc:
             errors[code] = str(exc) if isinstance(exc, ValueError) else 'empty_or_incomplete_quote'
     return {'quotes': quotes, 'errors': errors}
@@ -244,6 +247,43 @@ def _fetch_source(source, codes, fetcher, clock, progress=None, progress_lock=No
     return {'observations': observations, 'attempts': attempts, 'errors': errors}
 
 
+def _with_price_limit_evidence(quote, observations, checked):
+    """Keep explicit daily limits even when a newer Sina price wins selection.
+
+    Each bound belongs to its own provider observation. An auxiliary quote
+    must already be available, fresh on the same session, and agree on the
+    limit reference price; its timestamp is never relabelled as the price's.
+    """
+    quote = dict(quote)
+    fields = ('limit_up', 'limit_down')
+    provider = quote if any(key in quote for key in fields) else None
+    if provider is None and _fresh(quote, checked):
+        provider = next((row for row in observations
+                         if row.get('code') == quote.get('code')
+                         and any(key in row for key in fields)
+                         and _fresh(row, checked)
+                         and row['source_time'] <= quote['source_time']
+                         and abs(row['previous_close'] - quote['previous_close']) <= 1e-6), None)
+    if provider is None:
+        quote['price_limit_evidence'] = {
+            'status': 'unavailable', 'method': 'explicit_provider_fields',
+            'missing_fields': list(fields), 'reason': 'matching_available_provider_limits_missing'}
+        return quote
+    limits = {key: provider[key] for key in fields if key in provider}
+    quote.update(limits)
+    quote['price_limit_evidence'] = {
+        'status': 'observed' if len(limits) == len(fields) else 'partial',
+        'method': 'explicit_provider_fields', **limits,
+        'source': provider.get('source'), 'source_time': provider['source_time'],
+        'fetched_at': provider.get('fetched_at'), 'source_url': provider.get('source_url'),
+        'transport': provider.get('transport'), 'previous_close': provider['previous_close'],
+        'provider_field_indexes': {key: {'limit_up': 47, 'limit_down': 48}[key] for key in limits}
+            if provider.get('source') == 'tencent' else {},
+        'missing_fields': [key for key in fields if key not in limits],
+    }
+    return quote
+
+
 def _assess(code, results, checked):
     ranked = sorted([row for result in results for row in result['observations'] if row['code'] == code],
                     key=lambda row: (row['source_time'], row['transport'] == 'https'), reverse=True)
@@ -257,6 +297,7 @@ def _assess(code, results, checked):
                        and abs(r['price']-quote['price'])<=.011),None)
         if active:
             quote = {**quote, **{k:v for k,v in active.items() if k.startswith('active_')}}
+    quote = _with_price_limit_evidence(quote, ranked, checked)
     phase, source_phase = market_phase(checked), market_phase(quote['source_time'])
     fresh = _fresh(quote, checked)
     same_day = quote['source_time'][:10] == _iso(checked)[:10]
@@ -294,7 +335,8 @@ def _assess(code, results, checked):
     if book_quote:
         book = {key: book_quote[key] for key in ('source', 'source_time', 'fetched_at', 'source_url', 'transport', 'bids', 'asks')}
         book.update(observed_quote_price=book_quote['price'], age_milliseconds=_age(book_quote['source_time'], checked))
-        if book_quote is not quote:
+        if any(book_quote.get(key) != quote.get(key) for key in (
+                'source', 'source_time', 'fetched_at', 'source_url', 'transport')):
             issues.append('order_book_from_separate_observation')
             if book_quote['transport'] == 'http':
                 issues.append('order_book_unencrypted_public_source_fallback')

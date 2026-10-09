@@ -7,8 +7,8 @@ import pandas as pd
 import pytest
 
 from src.config import Config
-from src.services.yao_scout.labels import calculate_limit_price, evaluate_outcome_labels
-from src.services.yao_scout.model import train_challenger
+from src.services.yao_scout.labels import LABEL_SCHEMA_VERSION, calculate_limit_price, evaluate_outcome_labels
+from src.services.yao_scout.model import predict_probabilities, train_challenger
 from src.services.yao_scout.service import (
     SHANGHAI_TZ,
     YaoScoutService,
@@ -84,6 +84,16 @@ def test_missing_future_sessions_are_deferred_not_failure() -> None:
     outcome = evaluate_outcome_labels(_history(20, end=date(2026, 8, 27)), code="600127", observation_date=date(2026, 8, 27))
     assert outcome["maturity_status"] == "deferred"
     assert outcome["ignition_3d"] is None
+
+
+def test_five_day_continuation_does_not_use_sixth_to_tenth_day_highs() -> None:
+    days = pd.bdate_range("2026-08-20", periods=11)
+    rows = [{"date": day, "open": 10, "high": 10.1, "low": 9.9, "close": 10} for day in days]
+    rows[6].update(open=10, high=14, low=9.9, close=10)
+    result = evaluate_outcome_labels(pd.DataFrame(rows), code="600127",
+                                    observation_date=days[0].date(), entry_price=10)
+    assert result["continuation_5d"] is False
+    assert result["strong_10d"] is True
 
 
 def test_cn_calendar_skips_weekends_and_known_holiday() -> None:
@@ -195,6 +205,7 @@ def test_challenger_uses_time_holdout_and_cannot_promote_small_case_sample(tmp_p
             "as_of": (start + timedelta(days=index)).isoformat(),
             "features": features,
             "labels": {
+                "labelSchemaVersion": LABEL_SCHEMA_VERSION,
                 "maturity_status": "mature",
                 "ignition_3d": hit,
                 "continuation_5d": hit,
@@ -207,3 +218,17 @@ def test_challenger_uses_time_holdout_and_cannot_promote_small_case_sample(tmp_p
     assert result["gates"]["coverage_gate"] is False
     assert result["gates"]["qualified"] is False
     assert Path(result["artifact_path"]).is_file()
+
+
+def test_legacy_champion_and_old_label_records_cannot_validate_fixed_labels(tmp_path: Path) -> None:
+    import json
+    champion = tmp_path / "champion.json"
+    champion.write_text(json.dumps({"model_version": "old", "gates": {"qualified": True}}), encoding="utf-8")
+    probabilities, status, version = predict_probabilities({}, champion_path=champion)
+    assert status == "withheld_incompatible_label_schema" and version == "old"
+    assert all(value is None for value in probabilities.values())
+    result = train_challenger([{"labels": {"maturity_status": "mature"}}] * 200,
+                             symbol_count=1000, years=5, output_dir=tmp_path)
+    assert result["metrics"]["sample_count"] == 0
+    assert result["labelSchemaVersion"] == LABEL_SCHEMA_VERSION
+    assert json.loads(champion.read_text(encoding="utf-8"))["model_version"] == "old"
