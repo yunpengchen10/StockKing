@@ -29,7 +29,7 @@ func Collect(page func(uint32, uint16) ([]proto.MACSymbolBar, error), count int,
 			return nil, fmt.Errorf("invalid historical minute cutoff")
 		}
 	}
-	seen := map[string]bool{}
+	seen := map[string]proto.MACSymbolBar{}
 	selected := map[string]proto.MACSymbolBar{}
 	var offset uint32
 	for requests := 0; requests < 80 && len(selected) < count; requests++ {
@@ -47,9 +47,13 @@ func Collect(page func(uint32, uint16) ([]proto.MACSymbolBar, error), count int,
 		newRows := 0
 		for _, row := range rows {
 			stamp := row.DateTime.Format("20060102150405")
-			if !seen[stamp] {
+			previous, exists := seen[stamp]
+			if exists && (previous.Open != row.Open || previous.High != row.High || previous.Low != row.Low || previous.Close != row.Close) {
+				return nil, fmt.Errorf("conflicting MAC prices across pages at %s", stamp)
+			}
+			if !exists {
 				newRows++
-				seen[stamp] = true
+				seen[stamp] = row
 				if end == "" || stamp <= end {
 					selected[stamp] = row
 				}
@@ -100,8 +104,25 @@ func FetchContext(ctx context.Context, client *gotdx.Client, market uint8, code 
 		if err != nil {
 			return nil, err
 		}
+		if err := ValidateReply(reply, market, code, period, start); err != nil {
+			return nil, err
+		}
 		return reply.List, nil
 	}, count, end)
+}
+
+// ValidateReply checks the provider's echoed identity before any prices can be
+// attributed to a requested symbol. A nonempty, well-formed OHLC page is not
+// evidence that the provider answered the requested security or cursor.
+func ValidateReply(reply *proto.MACSymbolBarsReply, market uint8, code string, period uint16, start uint32) error {
+	if reply == nil {
+		return fmt.Errorf("missing MAC reply")
+	}
+	normalize := func(value string) string { return strings.ToUpper(strings.Trim(value, " \x00\t\r\n")) }
+	if reply.Market != uint16(market) || normalize(reply.Code) != normalize(code) || uint16(reply.Period) != period || reply.Start != start {
+		return fmt.Errorf("MAC response identity mismatch: requested market=%d code=%s period=%d start=%d; received market=%d code=%s period=%d start=%d", market, code, period, start, reply.Market, normalize(reply.Code), reply.Period, reply.Start)
+	}
+	return nil
 }
 
 func minuteCutoff(end string, started time.Time) string {

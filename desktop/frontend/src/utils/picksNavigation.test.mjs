@@ -4,6 +4,8 @@ import { readFileSync } from 'node:fs'
 import { compileScript, parse } from '@vue/compiler-sfc'
 import * as vue from 'vue'
 import * as ledger from './pickLedger.mjs'
+import * as recordRead from './recordRead.mjs'
+import * as learningStatus from './learningStatus.mjs'
 
 const flush = async () => { for (let n = 0; n < 12; n++) await Promise.resolve(); await vue.nextTick() }
 
@@ -11,15 +13,24 @@ const flush = async () => { for (let n = 0; n < 12; n++) await Promise.resolve()
 function mountLedger(api, initialMode = 'records') {
   const source = readFileSync(new URL('../components/PicksLedger.vue', import.meta.url), 'utf8')
   const { descriptor } = parse(source)
-  const modules = { vue, '../../wailsjs/go/main/App': api, '../utils/pickLedger.mjs': ledger }
+  const modules = { vue, '../../wailsjs/go/main/App': api, '../utils/pickLedger.mjs': ledger, '../utils/recordRead.mjs': recordRead, '../utils/learningStatus.mjs': learningStatus }
   const compiled = compileScript(descriptor, { id: 'ledger-persistence-test' }).content
     .replace(/^import\s+(.+?)\s+from\s+['"](.+?)['"];?$/gm, (_, bindings, path) => `const ${bindings.replace(/\bas\b/g, ':')} = modules[${JSON.stringify(path)}]`)
     .replace('export default', 'return')
   const timers = new Map()
   let nextTimer = 0, instance
+  // Model browser receiver checks: copying a native timer into a plain object
+  // and invoking it as that object's method throws, unlike Node's timers.
+  function setBrowserTimeout(callback, delay) {
+    if (this !== undefined) throw new TypeError('Illegal invocation')
+    const id = ++nextTimer; timers.set(id, { callback, delay }); return id
+  }
+  function clearBrowserTimeout(id) {
+    if (this !== undefined) throw new TypeError('Illegal invocation')
+    timers.delete(id)
+  }
   const component = new Function('modules', 'setTimeout', 'clearTimeout', 'document', compiled)(modules,
-    (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id },
-    id => timers.delete(id), { visibilityState: 'visible' })
+    setBrowserTimeout, clearBrowserTimeout, { visibilityState: 'visible' })
   component.render = function () { instance = vue.getCurrentInstance(); return null }
   const active = vue.ref(true)
   const refreshToken = vue.ref(0)
@@ -47,17 +58,19 @@ test('returning to recommendation records updates only prices and preserves filt
     const state = mounted.state(), original = state.payload
     state.date = '2026-10-08'; state.symbol = '600001'; state.version = 'v1.2'; state.includeControls = true
     await flush()
+    const filtered = state.payload
     mounted.active.value = false; await flush()
     assert.equal(mounted.timers.size, 0)
     mounted.active.value = true; await flush()
-    assert.equal(historyCalls, 1)
+    assert.equal(historyCalls, 2)
     assert.ok(quoteCalls > 1)
-    assert.equal(state.payload, original)
+    assert.notEqual(filtered, original)
+    assert.equal(state.payload, filtered)
     assert.deepEqual(state.payload, saved)
     assert.deepEqual([state.date, state.symbol, state.version, state.includeControls], ['2026-10-08', '600001', 'v1.2', true])
     assert.equal(mounted.timers.size, 1)
     await state.refresh(); await flush()
-    assert.equal(historyCalls, 2)
+    assert.equal(historyCalls, 3)
   } finally { mounted.dispose() }
 })
 
@@ -156,11 +169,57 @@ test('the explicit latest-records action queries once while ordinary returns kee
     assert.deepEqual([mounted.state().date, mounted.state().symbol, mounted.state().version], ['2026-09-01', '600001', 'v1.1'])
     mounted.refreshToken.value++; await flush()
     assert.equal(calls, 2)
-    assert.deepEqual(queries.at(-1), ['', '', ''])
+    assert.deepEqual(queries.at(-1), ['', '', '', false])
     assert.deepEqual([mounted.state().date, mounted.state().symbol, mounted.state().version], ['', '', ''])
     assert.equal(mounted.state().payload.items[0].signalId, 'run-2')
     mounted.active.value = false; await flush()
     mounted.active.value = true; await flush()
     assert.equal(calls, 2)
+  } finally { mounted.dispose() }
+})
+
+test('a pending Wails history call stops spinning and can be retried without accepting its late reply', async () => {
+  let resolveOld, calls = 0
+  const mounted = mountLedger({
+    GetStockKingRecommendationHistory: (...args) => {
+      assert.equal(args[3], false)
+      calls++
+      return calls === 1 ? new Promise(resolve => { resolveOld = resolve }) : Promise.resolve({ items: [{ signalId: 'retry', selected: true }] })
+    },
+    GetStockKingRecordQuotes: async () => ({ quotes: {} }),
+  })
+  try {
+    await flush()
+    assert.equal(mounted.state().loading, true)
+    const deadline = [...mounted.timers.values()].find(timer => timer.delay === 20000)
+    assert.ok(deadline, 'record read must have a browser deadline')
+    deadline.callback(); await flush()
+    assert.equal(mounted.state().loading, false)
+    assert.match(mounted.state().error, /记录读取超时/)
+    await mounted.state().refresh(); await flush()
+    assert.equal(mounted.state().error, '')
+    assert.equal(mounted.state().payload.items[0].signalId, 'retry')
+    resolveOld({ items: [{ signalId: 'late', selected: true }] }); await flush()
+    assert.equal(mounted.state().payload.items[0].signalId, 'retry')
+  } finally { mounted.dispose() }
+})
+
+test('next-day price summaries show selected losses and keep controls separate', async () => {
+  const selected = { version: 'frozen', queue: 'watch', selected: true, signalCount: 1,
+    maturePatterns: 1, priceObservationCount: 1, upCount: 0, downCount: 1,
+    meanObservedReturnFromSignalPct: -3.25, statusCounts: { mature_price_pattern: 1 } }
+  const control = { ...selected, selected: false, downCount: 0, upCount: 1, meanObservedReturnFromSignalPct: 2.5 }
+  const mounted = mountLedger({
+    GetStockKingDelayedReviews: async () => ({ items: [], nextDayReview: { items: [], summary: { groups: [selected, control] } } }),
+    GetStockKingLearningState: async () => ({}),
+  }, 'reviews')
+  try {
+    await flush()
+    assert.equal(mounted.state().nextDaySummaryGroups.length, 1)
+    assert.equal(mounted.state().nextDaySummaryGroups[0].downCount, 1)
+    assert.equal(mounted.state().nextDaySummaryGroups[0].meanObservedReturnFromSignalPct, -3.25)
+    mounted.state().includeControls = true; await flush()
+    assert.equal(mounted.state().nextDaySummaryGroups.length, 2)
+    assert.equal(mounted.state().nextDaySummaryGroups[1].selected, false)
   } finally { mounted.dispose() }
 })

@@ -20,18 +20,20 @@ A local desktop for stock quantitative research and China A-share research: quot
 
 - Charts and picks share the application's Tongdaxin, Eastmoney, Sina and Tencent market services and caches, retaining source and retrieval timestamps. Scans run with the chart closed.
 - Premarket observation at 09:20; independent scans at 09:40, 09:55, 10:30 and 14:55; archiving and due reviews at 15:30; Friday learning at 15:45. All use Asia/Shanghai time and trading-day checks.
-- StockKing V1.1 runs locally. Its research queue covers 10% of the main-board universe rounded up, at least 300 symbols and never more than the available universe. Each round selects at most five, reports actual coverage and gaps, and never calls an LLM for picks, review or learning.
+- Task-specific learning and rule research run locally. Its research queue covers 10% of the main-board universe rounded up, at least 300 symbols and never more than the available universe. Each round selects at most five, reports actual coverage and gaps, and never calls an LLM for picks, review or learning.
 - User data, models and settings are stored locally. No automatic trading.
 - Core workflows need no paid API, cloud server or GitHub Actions. Build and validate on your own computer; AI can use local Ollama or manually imported reports.
 
 AI tools can reuse the same quotes through the [read-only MCP quote service](quote-service/README.md). Python execution is supported on Windows and macOS; the ChatGPT cloud connection still requires remote authorization and end-to-end testing.
 
-## What's new in this source update
+## New in v2.7.0
 
-- **Visible scan progress:** Local picks refresh in a background task with stage updates. Navigation and data-source failures preserve the last valid display.
-- **Complete recommendation records:** Large responses are no longer truncated. Fresh quotes are read separately while original recommendation prices and timestamps remain intact.
-- **Clear research coverage:** A broader queue records stage timings, request budgets and missing evidence, including incomplete verification.
-- **Consistent selection and validation:** An algorithm contract ties admission, ranking and validation to the same rules. Independent daily models remain a separate research view.
+- Verify minute-response identity and independent quotes, quarantine conflicting sessions, and track data dependencies.
+- Fit T+1 net-return and next-session price-event tasks separately using Ridge, Logistic and LightGBM, with chronological calibration, rolling evaluation and forward shadow gates.
+- Apply portfolio budgets, stock and industry caps; retain cash when a validated model finds no edge, while preserving controls for research.
+- Fix recommendation-record `Illegal invocation`, bounded reads and retry; connect automatic review evidence and distinguish checks, completed fits and activation.
+
+Software tests do not establish improved returns. Insufficient samples remain explicitly labeled rule research. See the [algorithm and validation specification](docs/algorithm-v270.md) (Chinese).
 
 <details>
 <summary>Also explore: a recorded-market replay with dates and sources</summary>
@@ -44,7 +46,7 @@ This is a recorded-data walkthrough, not a desktop screen recording. Demonstrati
 
 ## Quick start
 
-Windows v2.6.3 includes a one-click `Stock-King-Setup-x64-v2.6.3.exe` installer with the local engine and offline WebView2. No Python, Go or Node.js installation is needed. It fixes minute-history pagination, critical quote-field merging, financial and sector evidence ingestion, and delayed reviews, while retaining earlier record-display and window-launch fixes. See [installation and fix instructions](docs/WINDOWS_INSTALL.en.md). The wheel below is an optional installation method.
+Windows v2.7.0 provides a [one-click installer](https://github.com/yunpengchen10/StockKing/releases/tag/v2.7.0) with the local engine and offline WebView2. Python, Go and Node.js are not required. See [installation instructions](docs/WINDOWS_INSTALL.en.md). The wheel instructions below apply to existing build artifacts.
 
 1. If you have the Mac package, extract `Stock-King-macos-arm64.zip`, copy `Stock King.app` to `/Applications`, open it, and confirm the interface says “已连接” (Connected). This does not require installing Python, Go or Node.js. Windows users may alternatively use a platform-native wheel. You can also obtain the source from this public repository and follow [local building and distribution](docs/LOCAL_BUILD.en.md); no Actions, paid build platform or cloud server is required.
 2. For native wheels, use Python 3.11+ (3.12 recommended), with a native 64-bit interpreter matching your platform. From the wheel directory, run the following command, substituting the actual filename if its version differs:
@@ -56,10 +58,10 @@ Windows v2.6.3 includes a one-click `Stock-King-Setup-x64-v2.6.3.exe` installer 
 
    Apple Silicon uses `stock_king-2.6.0-py3-none-macosx_15_0_arm64.whl` and requires ARM64 Python. Windows requires WebView2 Runtime. On Mac, you can also use the `.app` archive from the build artifacts.
 3. Add research symbols in “自选”, then select “刷新扫描” in “精选 → 本地精选”. Check quote times, actual history coverage, factors and trigger/invalidation conditions; open “图表” to verify data from the shared market service.
-4. Use “推荐记录”, “延后复盘” and “学习状态” to inspect saved signals, T+1/3/5 results and sample accumulation. Automatic recommendations and learning have separate switches. V1.1 learns from recorded main-board signals and controls without requiring a separate training universe.
+4. Use “推荐记录”, “延后复盘” and “学习状态” to inspect saved signals, T+1/3/5 results and sample accumulation. Automatic recommendations and learning have separate switches. Local models learn from recorded main-board signals and controls without requiring a separate training universe.
 5. Configure a model when you need manual AI research. Independent model research in “策略” still requires a selected universe; account backtesting requires market data and signals recorded before execution.
 
-The project is not published on PyPI and has no public installer download page yet. `pip install stock-king` is not the current installation method for this repository. You can install the research CLI from the public repository:
+The project is not published on PyPI. Windows installers are available from [GitHub Releases](https://github.com/yunpengchen10/StockKing/releases). `pip install stock-king` is not the current installation method for this repository. You can install the research CLI from the public repository:
 
 ```text
 python -m pip install "stock-king[data] @ git+https://github.com/yunpengchen10/StockKing.git@main"
@@ -115,7 +117,7 @@ See the [AI configuration manual](docs/AI_CONFIGURATION.en.md) for examples, loc
 | --- | --- |
 | An old commit still shows failed checks | Historical jobs were blocked by GitHub billing restrictions. Actions is now disabled; no paid allowance is needed. Historical failures do not become passing results. |
 | No installer is available, or a package has expired | Use a maintainer-supplied local build or build again using the local instructions. Installation does not depend on temporary Actions artifacts. |
-| Engine not ready, missing quotes or an empty candidate list | Check network and engine status, quote freshness, trading status and actual coverage. Invalid required data can produce no candidates; missing optional factors use the available weights and display their gaps. |
+| Engine not ready, missing quotes or an empty candidate list | Check network and engine status, quote freshness, trading status and actual coverage. Invalid required data can produce no candidates; missing optional factors retain fixed weights and display their gaps. |
 | Connection test passes but AI still fails | Listing models and generating answers use different endpoints. Check model permissions, balance, exact model ID, reasoning parameters and the actual request error. |
 | pip says the wheel is unsupported | Check Windows x64 / macOS ARM64, Python architecture and the macOS 15+ requirement. Intel Macs are not supported. |
 
@@ -123,25 +125,25 @@ This repository does not use GitHub Actions or require GitHub Pro or paid build 
 
 ## Recommendation algorithms
 
-Picks use **StockKing V1.1**: each round rereads Shanghai/Shenzhen main-board, non-ST snapshots and builds a research queue of `min(universe size, max(300, ceil(universe size × 10%)))`, selecting at most five. Queue size is not completed verification: actual coverage, timeouts and gaps are recorded. A fresh queue allows newly active stocks to enter each round. A symbol outside the deep-verification queue has not been ruled out.
+Picks in software **v2.7.0** use task-specific learning and local rule research: each round rereads Shanghai/Shenzhen main-board, non-ST snapshots and builds a research queue of `min(universe size, max(300, ceil(universe size × 10%)))`, selecting at most five. Queue size is not completed verification: actual coverage, timeouts and gaps are recorded. A fresh queue allows newly active stocks to enter each round. A symbol outside the deep-verification queue has not been ruled out.
 
-The cold-start version is `stockking-v1.1-rules`. It retains Early / MainRise channels and the original manual weights, redistributed across available factors:
+Cold-start rules are `stockking-v1.2-rules`. Observable structure selects Early or MainRise. Weights stay fixed: missing positive factors contribute zero, while missing risk components use their declared upper bound.
 
 ```text
-FinalScore = clip(max(EarlyScore, MainRiseScore) - 0.2 × DistributionRisk, 0, 100)
+FinalScore = clip(StageSelectedScore - 0.2 × DistributionRisk, 0, 100) × ObservedRegimeMultiplier
 ```
 
-`0.2` is an unvalidated initial risk coefficient. The score is neither a probability nor a return promise; probability multiplication and fixed 65/75/85 grades are removed. Untrained MFE/MAE forecasts and main-rise/stage probabilities display “待校准” (Pending calibration). Stage descriptions use observable price structure. See [V1.1 data, scoring and learning definitions (Chinese)](docs/stockking-v11-integration.md).
+The risk coefficient is an unvalidated default. Rule scores are not probabilities. Qualified task models use separate forecasts and ranking; rule percentiles do not become probabilities. See the [v2.7.0 algorithm specification](docs/algorithm-v270.md) and [historical V1.2 rule notes](docs/yao-v12-upgrade.md).
 
 | Stage | Implementation |
 | --- | --- |
 | Shared market data | Charts and Python picks share quotes and caches through an authenticated localhost Go interface, even with charts closed. Security identifiers, minute-end times, volume in shares and amounts in CNY are normalized; source/retrieval timestamps and adjustment definitions are retained. Unknown amounts remain null, not zero. |
 | Factor calculation | Raw data produces momentum, same-time activity, turnover, VWAP, breakout, sector and risk features. The 09:40 scan uses short windows; 15-minute factors activate only when complete. MAD has zero protection, and future or incomplete minutes are excluded. |
-| History coverage and gaps | Twenty same-time trading days provide a full baseline; 5–19 use actual samples with lower confidence; below five, the historical factor is null. Missing flow, catalyst or other optional factors redistribute available weights, with actual history coverage displayed. |
+| History coverage and gaps | Twenty same-time trading days provide a full baseline; 5–19 use actual samples with lower confidence; below five, the historical factor is null. Missing flow, catalyst or other optional factors do not redistribute weights, with actual history coverage displayed. |
 | Required checks | Current quotes, security identity and necessary trading status must be valid. Stale quotes indicate insufficient data; suspended or locked limit-up stocks without sell liquidity are not executable recommendations. 09:20 is observation only; ordinary snapshots are not auction fields. |
 | Save before display | Signals retain unique IDs, algorithm version, scan/quote times, factors, ranks, reasons, risks and trigger/invalidation conditions. Selected signals and deeply verified non-selected controls are retained for each round; daily records group by symbol. Tasks are idempotent and manual refreshes do not duplicate training observations. |
-| Delayed review | After the T+1, T+3 and T+5 closes, the trading calendar determines observed returns, MFE and positive adverse-excursion MAE. Not-yet-due labels stay pending; missing data stays pending completion. Legacy records retain their original definitions and stay outside V1.1 training. |
-| Simulated execution | Observed price changes and simulated returns are stored separately. Simulations enter on the first complete minute after the signal and exit at the horizon close, applying account-backtest fill constraints and costs. Unfillable orders remain unfilled. Simulations are not actual user trades. |
+| Delayed review | After the T+1, T+3 and T+5 closes, the trading calendar determines observed returns, MFE and positive adverse-excursion MAE. Not-yet-due labels stay pending; missing data stays pending completion. Legacy records retain their original definitions and stay outside incompatible task training. |
+| Simulated execution | Observed price changes and simulated returns are stored separately. Simulations enter on the first complete minute after the signal and exit at the horizon close, applying account-backtest fill constraints and costs. Only confirmed unfilled orders receive that label; unknown volume or paths remain pending, and blocked exits stay invested for review. Simulations are not actual user trades. |
 
 ### Local background tasks
 
@@ -157,15 +159,15 @@ Automatic recommendations and automatic learning have separate switches. Windows
 
 ### Automatic learning and promotion
 
-V1.1 uses recorded, confirmed main-board signals and controls with separate model and label versions. Logistic regression is the baseline and LightGBM the candidate. Promotion testing starts only after at least **120 independent mature trading days and 1,000 valid samples**. Training, calibration and test intervals follow time order, with at least five trading days purged at boundaries.
+v2.7.0 models entry-today/T+1 net returns and the two next-session price-event queues independently. Ridge return regression and Logistic event baselines accompany LightGBM candidates, with probability calibration on a separate chronological interval. Software, rule and model versions remain distinct; unvalidated rules do not display invented probabilities.
 
-A candidate enters **20 trading days of prospective shadow validation** only when the **95% lower confidence bounds** of both out-of-sample returns after costs and its return advantage over current rules are positive, with no deterioration in drawdown. It activates automatically only after passing. Insufficient samples or failed gates retain the current rules or a previously qualified version. These are promotion requirements, not claims that a profitable model already exists.
+At least **120 mature signal days and 1,000 valid stock-days** are required, alongside complete cohorts and valid time splits. Final holdout requires at least 60 days and 50 completed trades, followed by at least 20 forward shadow days and 50 completed observations. Label-end and evidence-knowledge times constrain splits. Return, advantage, drawdown and probability gates must pass before activation.
 
-The learned ranking combines executable return and downside risk, mapped to calibration-set percentiles. The previous model is retained, with automatic fallback on inference failure or version incompatibility. Recommendations, review, training and promotion run locally without LLM calls.
+A validated trading model requires positive expected net return and downside-adjusted utility, then ranks by calibrated event probability. It retains cash when no edge is found. Fallback models must still have compatible contracts and valid data dependencies. Everything runs locally without an LLM. These gates do not establish that a profitable model currently exists. See the [algorithm specification](docs/algorithm-v270.md).
 
 ## Quantitative algorithms
 
-These are research modules in the independent “策略” page and strategy groups, with their own training universes and evaluation targets. V1.1 picks use the signal records and promotion process above.
+These are research modules in the independent “策略” page and strategy groups, with their own training universes and evaluation targets. Local picks use the signal records and promotion process above.
 
 | Module | Algorithms and purpose |
 | --- | --- |

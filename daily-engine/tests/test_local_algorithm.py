@@ -3,7 +3,7 @@ from copy import deepcopy
 
 import pytest
 
-from src.services.yao_scout.local_algorithm import algorithm_contract, is_entry_eligible
+from src.services.yao_scout.local_algorithm import algorithm_contract, is_entry_eligible, is_research_eligible
 from src.services.yao_scout.precision_policy import evaluate, V11_VERSION
 from src.services.yao_scout.v11_factors import EARLY_WEIGHTS, MAIN_WEIGHTS, RISK_WEIGHTS, SCORE_VERSION, RISK_PENALTY_COEFFICIENT
 
@@ -17,6 +17,8 @@ def test_contract_freezes_defaults_and_fingerprints_all_parameters(monkeypatch):
     assert before['riskPenaltyCoefficient'] == RISK_PENALTY_COEFFICIENT
     before['weights']['early']['M'] = 999
     assert algorithm_contract()['weights']['early']['M'] != 999
+    before['portfolioParameters']['exposureByRegime']['weak'] = 999
+    assert algorithm_contract()['portfolioParameters']['exposureByRegime']['weak'] == .5
     original = algorithm_contract()['contractId']
     with pytest.raises(TypeError):
         EARLY_WEIGHTS['M'] = 999
@@ -38,6 +40,15 @@ def _eligible_candidate():
 CONTEXT = {'financials': {'profit': 10000, 'eps': 1, 'cashPerShare': .5},
            'coverage': {'financials': True, 'forecast': True, 'unlock': True}}
 DAILY = {'metrics': {'last_close': 9.8, 'ma5': 9.8, 'ma10': 9.7, 'ma20': 9.6, 'atr14': .4}}
+
+
+def test_negative_model_decisions_remain_prospective_training_controls():
+    candidate = _eligible_candidate()
+    candidate['precisionDecision'] = evaluate(candidate, CONTEXT, DAILY)
+    candidate['prediction'] = {'status': 'active', 'entryEligible': False,
+                               'expectedNetReturn': -.02, 'utility': -.04}
+    assert is_research_eligible(candidate)
+    assert not is_entry_eligible(candidate)
 
 
 @pytest.mark.parametrize('change,expected', [({}, True), ({'status': 'premarket'}, False),
@@ -71,3 +82,10 @@ def test_confidence_is_coverage_and_not_an_extra_probability_threshold():
     candidate = {**_eligible_candidate(), 'confidence': .2, 'dataConfidence': .2}
     candidate['precisionDecision'] = evaluate(candidate, CONTEXT, DAILY)
     assert is_entry_eligible(candidate)
+
+
+def test_task_label_change_invalidates_parent_algorithm_contract(monkeypatch):
+    from src.services.yao_scout import task_learning
+    original = algorithm_contract()['contractId']
+    monkeypatch.setattr(task_learning, 'BIG_RETURN_THRESHOLD', .06)
+    assert algorithm_contract()['contractId'] != original

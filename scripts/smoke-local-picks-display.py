@@ -91,6 +91,10 @@ def main():
                 assert learning["algorithm"] == algorithm_contract(), "Frozen validation contract differs from live algorithm"
                 assert learning["effectiveRankSource"] == "rules", "Isolated profile must use rules without a trained model"
                 assert learning["validSamples"] == 0, "Restoring display must not fabricate training samples"
+                assert learning["taskId"] == "entry_today_exit_next_session"
+                assert len(learning["taskStates"]) == 3, "Primary and both next-day queues need independent state"
+                assert learning.get("lastFitCompletedAt") is None, "A check cannot masquerade as fitting"
+                assert learning.get("activatedAt") is None, "Isolated cold start must not activate a model"
                 validated_contract = learning["algorithm"]["contractId"]
                 try:
                     get("/api/v1/stock-king/picks/refresh/tasks/missing")

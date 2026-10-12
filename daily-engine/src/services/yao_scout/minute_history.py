@@ -8,6 +8,7 @@ with optional Tushare access as a further source. Missing sessions stay missing.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from contextlib import closing
 from datetime import date, datetime, time, timedelta
 import json
 import math
@@ -23,6 +24,8 @@ import requests
 
 from .intraday_evidence import SHANGHAI, _datetime, _prior_sessions, METRIC_DEFINITIONS
 from .research_policy import DEFAULT_PARAMETERS
+from .minute_integrity import (DATA_QUALITY_VERSION, canonical_hash, inspect_session,
+                               session_revision, read_archive_lineage, validate_archive_lineage)
 
 FORMAL_HISTORY_DAYS = DEFAULT_PARAMETERS['history']['formalDays']
 MINIMUM_HISTORY_DAYS = DEFAULT_PARAMETERS['history']['minimumScoreDays']
@@ -103,13 +106,17 @@ def _retain_special_session_flags(target, *sources):
     return target
 
 
-def normalize_bars(rows, cutoff, *, conflicts=None):
+def normalize_bars(rows, cutoff, *, conflicts=None, include_tainted=False):
     """Reject conflicting duplicates, malformed bars and future/partial minutes."""
     cutoff = _datetime(cutoff)
+    rows = list(rows)
+    tainted_days = {str(row.get('end', ''))[:10] for row in rows if row.get('data_quality_status') == 'tainted'}
     result, conflicted = {}, set()
     for row in rows:
         try:
             at = _datetime(row['end'])
+            if not include_tainted and at.date().isoformat() in tainted_days:
+                continue
             values = {key: number(row.get(key)) for key in ('open','high','low','close','amount_cny','volume_shares')}
             if at.second or at.microsecond or at > cutoff or not bar_session(at):
                 continue
@@ -133,6 +140,9 @@ def normalize_bars(rows, cutoff, *, conflicts=None):
                 continue
             cleaned = {'end':at.isoformat(), **values, 'source':row.get('source','unknown'),
                        'fetched_at':row.get('fetched_at') or row.get('fetchedAt')}
+            for key in ('identity_evidence', 'integrity_revision', 'raw_data_revision', 'data_quality_version', 'data_quality_status', 'conflicting_observations'):
+                if key in row:
+                    cleaned[key] = row[key]
             if isinstance(row.get('sources'), list):
                 cleaned['sources'] = sorted({str(source) for source in row['sources']})
             _retain_special_session_flags(cleaned, row)
@@ -200,6 +210,7 @@ def supplement_bars(primary, extra, cutoff, *, diagnostics=None):
     """Keep established bars; fill gaps/compatible fields with an audited source."""
     result = normalize_bars(primary, cutoff)
     added = enriched = disagreements = 0
+    tainted_days = set()
     for at, row in normalize_bars(extra, cutoff).items():
         previous = result.get(at)
         if previous is None:
@@ -209,6 +220,8 @@ def supplement_bars(primary, extra, cutoff, *, diagnostics=None):
         compatible = normalize_bars([previous, row], cutoff)
         if at not in compatible:
             disagreements += 1  # Never overwrite a stored source with this disagreement.
+            tainted_days.add(at.date().isoformat())
+            previous['conflicting_observations'] = [*previous.get('conflicting_observations', []), row]
             _retain_special_session_flags(previous, row)
             continue
         merged = compatible[at]
@@ -218,7 +231,57 @@ def supplement_bars(primary, extra, cutoff, *, diagnostics=None):
     if diagnostics is not None:
         diagnostics.update(addedMinutes=added, enrichedMinutes=enriched,
                            conflictingOverlapMinutes=disagreements)
-    return list(result.values())
+    return [{**row, 'data_quality_status':'tainted'} if at.date().isoformat() in tainted_days else row
+            for at, row in result.items()]
+
+
+def read_archive_rows(directory, code, cutoff, *, lookback_days=None):
+    """Read features/label bars without schema writes or bypassing quarantine."""
+    path = Path(directory) / 'minute-bars-v2.sqlite3'
+    if not path.is_file():
+        return []
+    cutoff = _datetime(cutoff)
+    parameters = [code, cutoff.date().isoformat()]
+    where = ' WHERE s.code=? AND s.day<=?'
+    if lookback_days is not None:
+        where += ' AND s.day>=?'
+        parameters.append((cutoff-timedelta(days=max(0,int(lookback_days)))).date().isoformat())
+    with closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=5)) as db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").fetchone():
+            return []
+        quality_exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_quality'").fetchone()
+        query = ('SELECT s.day,s.payload,q.status,q.revision,q.verification_json FROM sessions s LEFT JOIN session_quality q '
+                 'ON q.code=s.code AND q.day=s.day' if quality_exists else
+                 'SELECT s.day,s.payload,NULL,NULL,NULL FROM sessions s')
+        records = db.execute(query+where+' ORDER BY s.day',parameters).fetchall()
+    rows = []
+    for day,payload,status,revision,verification_json in records:
+        if status == 'tainted':
+            continue
+        try:
+            stored = json.loads(zlib.decompress(payload))
+            evidence = json.loads(verification_json) if verification_json else None
+            # Even a legacy conflict after the requested prefix taints the day.
+            if inspect_session(code,day,stored,evidence)['status'] == 'tainted':
+                continue
+            cleaned = list(normalize_bars(stored,cutoff).values())
+            scoped = inspect_session(code,day,cleaned,evidence)
+            if scoped['status'] == 'tainted':
+                continue
+            rows.extend({**row,'raw_data_revision':revision or session_revision(code,day,cleaned),
+                         'data_quality_version':DATA_QUALITY_VERSION,'data_quality_status':scoped['status']}
+                        for row in cleaned)
+        except (KeyError,TypeError,ValueError,zlib.error):
+            continue
+    return list(normalize_bars(rows,cutoff).values())
+
+
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 class MinuteArchive:
@@ -229,46 +292,202 @@ class MinuteArchive:
             db.execute('CREATE TABLE IF NOT EXISTS sessions(code TEXT, day TEXT, payload BLOB, PRIMARY KEY(code,day))')
             db.execute('CREATE TABLE IF NOT EXISTS attempts(code TEXT, day TEXT, source TEXT, status TEXT, PRIMARY KEY(code,day,source))')
             db.execute('CREATE TABLE IF NOT EXISTS attempt_times(code TEXT, day TEXT, source TEXT, attempted_at REAL, PRIMARY KEY(code,day,source))')
+            db.execute('CREATE TABLE IF NOT EXISTS session_quality(code TEXT,day TEXT,revision TEXT,status TEXT,reasons_json TEXT,updated_at TEXT,verification_json TEXT,PRIMARY KEY(code,day))')
+            db.execute('CREATE TABLE IF NOT EXISTS session_evidence(evidence_id TEXT PRIMARY KEY,code TEXT,day TEXT,created_at TEXT,kind TEXT,payload BLOB,metadata_json TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS minute_quality_events(event_id INTEGER PRIMARY KEY AUTOINCREMENT,code TEXT,day TEXT,revision TEXT,event TEXT,created_at TEXT,details_json TEXT)')
 
     def connect(self):
-        return sqlite3.connect(self.path, timeout=30)
+        return sqlite3.connect(self.path, timeout=30, factory=_ClosingConnection)
 
-    def read(self, code, cutoff):
-        start = (_datetime(cutoff)-timedelta(days=65)).date().isoformat()
-        with self.connect() as db:
-            rows = []
-            for record in db.execute('SELECT payload FROM sessions WHERE code=? AND day>=? AND day<=? ORDER BY day',
-                    (code, start, _datetime(cutoff).date().isoformat())):
-                rows.extend(json.loads(zlib.decompress(record[0])))
-            return list(normalize_bars(rows,cutoff).values())
+    def read(self, code, cutoff, *, lookback_days=65):
+        return read_archive_rows(self.path.parent,code,cutoff,lookback_days=lookback_days)
 
-    def save(self, code, rows, cutoff):
-        rows = normalize_bars(rows, cutoff)
+    def read_recent(self, code, cutoff, minutes=20):
+        """Today's cached rows only, with the same whole-session quarantine."""
+        rows = self.read(code, cutoff, lookback_days=0)
+        return rows[-max(1, int(minutes)):]
+
+    @staticmethod
+    def _evidence(db, code, day, rows, kind, metadata=None):
+        digest = canonical_hash([code, day, kind, rows, metadata])
+        db.execute('INSERT OR IGNORE INTO session_evidence VALUES(?,?,?,?,?,?,?)',
+                   (digest, code, day, datetime.now(SHANGHAI).isoformat(), kind,
+                    zlib.compress(json.dumps(rows, ensure_ascii=False, default=str).encode()),
+                    json.dumps(metadata or {}, ensure_ascii=False)))
+        return digest
+
+    @staticmethod
+    def _quality(db, code, day, rows, quality, verification=None, event='ingest'):
+        revision = session_revision(code, day, rows)
+        now = datetime.now(SHANGHAI).isoformat()
+        verification = dict(verification or {})
+        if verification:
+            new_anchor = 'known_at' not in verification
+            verification.setdefault('known_at', now)
+            if new_anchor:
+                MinuteArchive._evidence(db, code, day, [], 'independent_price_anchor',
+                    {'verification':verification, 'integrityRevision':rows[0].get('integrity_revision') if rows else None})
+        previous = db.execute('SELECT revision,status,reasons_json FROM session_quality WHERE code=? AND day=?', (code, day)).fetchone()
+        reasons = json.dumps(quality['reasonCodes'], ensure_ascii=False)
+        db.execute('INSERT OR REPLACE INTO session_quality VALUES(?,?,?,?,?,?,?)',
+                   (code, day, revision, quality['status'], reasons, now, json.dumps(verification or {}, ensure_ascii=False)))
+        if previous != (revision, quality['status'], reasons):
+            db.execute('INSERT INTO minute_quality_events(code,day,revision,event,created_at,details_json) VALUES(?,?,?,?,?,?)',
+                       (code, day, revision, event, now, json.dumps(quality, ensure_ascii=False)))
+        return revision
+
+    def verify_quote(self, code, quote, cutoff):
+        """Check this day's archived identity/price bounds against an independent quote.
+
+        The quote's real source clock bounds its coverage. This does not claim a
+        second complete minute path, repair quarantined data, or bless history.
+        """
+        symbol(code)
+        cutoff = _datetime(cutoff)
+        day = cutoff.date().isoformat()
+        try:
+            source_time = datetime.fromisoformat(str(quote.get('provider_timestamp') or quote.get('source_time') or ''))
+            if (source_time.tzinfo is None or source_time > cutoff or source_time.date() != cutoff.date()
+                    or str(quote.get('code', '')) != code):
+                raise ValueError('invalid quote identity or clock')
+            evidence = {'kind':'quote_prefix', 'code':code, 'day':day, 'source':quote.get('source'),
+                'source_time':source_time.isoformat(), 'observed_at':cutoff.isoformat(),
+                'price_basis':'unadjusted', 'open':quote.get('open_price', quote.get('open')),
+                'high':quote.get('high'), 'low':quote.get('low'), 'close':quote.get('price')}
+            if source_time.hour >= 15:
+                evidence.update(kind='daily_ohlc', complete=True)
+            with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                record = db.execute('SELECT s.payload,q.status,q.verification_json FROM sessions s LEFT JOIN session_quality q '
+                    'ON q.code=s.code AND q.day=s.day WHERE s.code=? AND s.day=?', (code,day)).fetchone()
+                if record and record[1] != 'tainted':
+                    rows = json.loads(zlib.decompress(record[0]))
+                    quality = inspect_session(code, day, rows, evidence)
+                    # Invalid/unusable anchors never displace usable earlier evidence.
+                    if quality['status'] == 'tainted' or quality.get('verifiedThrough'):
+                        old_evidence = json.loads(record[2]) if record[2] else {}
+                        old_quality = inspect_session(code, day, rows, old_evidence)
+                        if (quality['status'] == 'tainted' or not old_quality.get('verifiedThrough')
+                                or quality['verifiedThrough'] >= old_quality['verifiedThrough']):
+                            self._evidence(db,code,day,rows,'independent_quote_verification',evidence)
+                            self._quality(db,code,day,rows,quality,evidence,'quote_verification')
+        except (KeyError, TypeError, ValueError, OverflowError):
+            pass
+        return self.quality(code, cutoff, [day])
+
+    def quality(self, code, cutoff, required_days=None):
+        if required_days is None:
+            start = (_datetime(cutoff)-timedelta(days=65)).date().isoformat()
+            with self.connect() as db:
+                required_days = [row[0] for row in db.execute('SELECT day FROM sessions WHERE code=? AND day>=? AND day<=?',
+                    (code, start, _datetime(cutoff).date().isoformat()))]
+        return read_archive_lineage(self.path.parent, code, required_days, cutoff=_datetime(cutoff))
+
+    def save(self, code, rows, cutoff, *, verification=None):
+        symbol(code)  # Validate storage identity before accepting any payload.
+        if verification:
+            verification = {key:value for key,value in verification.items() if key != 'known_at'}
+        original = list(rows)
+        duplicate_conflicts = set()
+        rows = normalize_bars(original, cutoff, conflicts=duplicate_conflicts, include_tainted=True)
         days = {}
         for at,row in rows.items():
             days.setdefault(at.date().isoformat(),{})[row['end']] = row
         added = enriched = conflicts = 0
+        quarantined = []
+        for at in duplicate_conflicts:
+            days.setdefault(at.date().isoformat(), {})
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             for day,fresh in days.items():
                 old = db.execute('SELECT payload FROM sessions WHERE code=? AND day=?',(code,day)).fetchone()
-                merged = {row['end']:row for row in json.loads(zlib.decompress(old[0]))} if old else {}
+                old_rows = json.loads(zlib.decompress(old[0])) if old else []
+                merged = {row['end']:row for row in old_rows}
+                old_quality = db.execute('SELECT status,verification_json,reasons_json FROM session_quality WHERE code=? AND day=?', (code, day)).fetchone()
+                day_conflicts = sum(at.date().isoformat() == day for at in duplicate_conflicts)
+                day_added = day_enriched = 0
                 for stamp, row in fresh.items():
                     previous = merged.get(stamp)
                     if previous:
                         audit = {}
                         resolved = supplement_bars([previous], [row], cutoff, diagnostics=audit)
                         conflicts += audit['conflictingOverlapMinutes']
-                        enriched += audit['enrichedMinutes']
+                        day_conflicts += audit['conflictingOverlapMinutes']
+                        day_enriched += audit['enrichedMinutes']
                         if resolved:
                             merged[stamp] = resolved[0]
                     else:
                         merged[stamp] = row
-                        added += 1
-                payload = zlib.compress(json.dumps([merged[k] for k in sorted(merged)],separators=(',',':')).encode('utf-8'))
+                        day_added += 1
+                merged_rows = [merged[k] for k in sorted(merged)]
+                anchor = verification if verification and verification.get('day') == day else (json.loads(old_quality[1]) if old_quality else None)
+                quality = inspect_session(code, day, merged_rows, anchor)
+                if day_conflicts:
+                    quality.update(status='tainted', reasonCodes=sorted(set(quality['reasonCodes'] + ['conflicting_minute_observations'])))
+                if old_quality and old_quality[0] == 'tainted':
+                    quality.update(status='tainted', reasonCodes=sorted(set(quality['reasonCodes'] + json.loads(old_quality[2]) + ['explicit_verified_rebuild_required'])))
+                if quality['status'] == 'tainted':
+                    quarantined.append(day)
+                    self._evidence(db, code, day, old_rows, 'before_quarantine')
+                    self._evidence(db, code, day, [row for row in original if str(row.get('end', ''))[:10] == day], 'quarantined_ingest', quality)
+                    # Keep the prior stored payload, never splice a suspect new
+                    # segment into it; both versions are retained as evidence.
+                    merged_rows = old_rows or merged_rows
+                else:
+                    added += day_added
+                    enriched += day_enriched
+                payload = zlib.compress(json.dumps(merged_rows,separators=(',',':')).encode('utf-8'))
                 db.execute('INSERT OR REPLACE INTO sessions VALUES(?,?,?)',(code,day,payload))
-            db.execute('DELETE FROM sessions WHERE code=? AND day<?', (code, (_datetime(cutoff)-timedelta(days=65)).date().isoformat()))
-        return {'addedMinutes': added, 'enrichedMinutes': enriched, 'conflictingOverlapMinutes': conflicts}
+                self._quality(db, code, day, merged_rows, quality, anchor, 'quarantine' if quality['status'] == 'tainted' else 'ingest')
+        return {'addedMinutes': added, 'enrichedMinutes': enriched, 'conflictingOverlapMinutes': conflicts,
+                'quarantinedDays': quarantined, 'data_quality_version': DATA_QUALITY_VERSION}
+
+    def quarantine(self, code, day, reason, *, evidence=None):
+        """Explicit quarantine; preserves bytes and records an invalidation event."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            old = db.execute('SELECT payload FROM sessions WHERE code=? AND day=?', (code, day)).fetchone()
+            if not old:
+                raise ValueError('cannot quarantine a missing session')
+            rows = json.loads(zlib.decompress(old[0]))
+            self._evidence(db, code, day, rows, 'explicit_quarantine', evidence)
+            revision = self._quality(db, code, day, rows, {'status':'tainted', 'reasonCodes':[reason]}, event='quarantine')
+        return {'code':code, 'day':day, 'revision':revision, 'status':'tainted'}
+
+    def rebuild(self, code, day, rows, cutoff, *, verification, expected_revision):
+        """Publish a new full-session version only after independent verification.
+
+        This never fetches data or silently amends an old recommendation. The
+        caller must supply the revision it reviewed, preventing stale repairs.
+        """
+        verification = {key:value for key,value in verification.items() if key != 'known_at'}
+        original = list(rows)
+        conflicts = set()
+        normalized = list(normalize_bars(original, cutoff, conflicts=conflicts).values())
+        if conflicts or any(row['end'][:10] != day for row in normalized):
+            raise ValueError('rebuild requires one nonconflicting complete session')
+        coverage = minute_coverage(normalized, cutoff, [day])
+        if coverage['expectedMinutes'] != 240 or not coverage['pricePathComplete']:
+            raise ValueError('rebuild requires all 240 completed minute prices')
+        quality = inspect_session(code, day, normalized, verification)
+        if quality['status'] != 'verified':
+            raise ValueError('rebuild requires verified identity and independent daily prices')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            old = db.execute('SELECT payload FROM sessions WHERE code=? AND day=?', (code, day)).fetchone()
+            if not old:
+                raise ValueError('repair target session is missing')
+            old_rows = json.loads(zlib.decompress(old[0]))
+            if session_revision(code, day, old_rows) != expected_revision:
+                raise ValueError('repair target revision changed')
+            repair_id = canonical_hash([expected_revision, datetime.now(SHANGHAI).isoformat(), verification])
+            normalized = [{**row, 'integrity_revision': repair_id} for row in normalized]
+            self._evidence(db, code, day, old_rows, 'before_verified_rebuild')
+            self._evidence(db, code, day, original, 'verified_rebuild', verification)
+            db.execute('UPDATE sessions SET payload=? WHERE code=? AND day=?',
+                       (zlib.compress(json.dumps(normalized,separators=(',',':')).encode()), code, day))
+            revision = self._quality(db, code, day, normalized, quality, verification, 'verified_rebuild')
+        return {'code':code, 'day':day, 'revision':revision, 'previousRevision':expected_revision, 'status':'verified'}
 
     def attempted(self, code, day, source):
         with self.connect() as db:
@@ -336,14 +555,18 @@ def fetch_software_bars(code, *, count=8000, client=None, end=None, timeout=12):
     return bars
 
 
-def fetch_recent_bars(code, *, count=240, cutoff=None, required_days=None, diagnostics=None):
+def fetch_recent_bars(code, *, count=240, cutoff=None, required_days=None, diagnostics=None, deadline=None):
     """Supplement a short/incomplete software response without replacing its bars."""
     cutoff = _datetime(cutoff or datetime.now(SHANGHAI))
     audit = diagnostics if diagnostics is not None else {}
     audit.update(sourceFailures=[], sources=[])
+    def remaining(maximum):
+        return maximum if deadline is None else max(0., min(maximum, deadline-monotonic()))
+    if remaining(1) <= 0:
+        raise TimeoutError('minute fetch deadline expired')
     primary = []
     try:
-        primary = list(normalize_bars(fetch_software_bars(code,count=count,timeout=4), cutoff).values())
+        primary = list(normalize_bars(fetch_software_bars(code,count=count,timeout=max(.1,remaining(4))), cutoff).values())
         if not primary:
             raise ValueError('software returned no usable complete minutes')
         audit['sources'].append('software')
@@ -352,9 +575,9 @@ def fetch_recent_bars(code, *, count=240, cutoff=None, required_days=None, diagn
     coverage = minute_coverage(primary, cutoff, required_days) if required_days else None
     needs_more = (len(primary) < count or coverage is not None and
                   (not coverage['pricePathComplete'] or any(coverage['missingFields'].values())))
-    if needs_more:
+    if needs_more and remaining(1) > 0:
         try:
-            public = fetch_sina_bars(code,count=max(count, 1970 if required_days else count))
+            public = fetch_sina_bars(code,count=max(count, 1970 if required_days else count),timeout=max(.1,remaining(5)))
             if not normalize_bars(public, cutoff):
                 raise ValueError('Sina returned no usable complete minutes')
             primary = supplement_bars(primary, public, cutoff, diagnostics=audit)
@@ -402,7 +625,7 @@ def window(rows, end, size):
 def _window_features(rows, end):
     """Completed, contiguous, same-session windows only; returns in percentage points."""
     result = {}
-    for minutes in (1, 3, 5, 15):
+    for minutes in (1, 3, 5, 15, 30):
         prices = window(rows, end, minutes + 1)
         result[f'r{minutes}_pct'] = (prices[-1]['close'] / prices[0]['close'] - 1) * 100 if prices else None
         amounts = window(rows, end, minutes)
@@ -418,6 +641,8 @@ def _window_features(rows, end):
         result['a3_pct_per_min'] = result['r3_pct'] / 3 - result['r15_pct'] / 15
     else:
         result['a3_pct_per_min'] = None
+    result['short_rebound_in_long_weak'] = (float(result['r3_pct'] > 0 and result['r15_pct'] < 0)
+        if result['r3_pct'] is not None and result['r15_pct'] is not None else None)
     return result
 
 
@@ -437,6 +662,7 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
     current = {at:row for at,row in rows.items() if at.date() == cutoff.date()}
     result = {'metrics':dict.fromkeys(METRIC_DEFINITIONS), 'source':'dated 1min bars', 'asOf':None,
               'gaps':[], 'historyDays':0, 'priceHistoryDays':0, 'featureHistoryDays':{},
+              'dependencyDays':[cutoff.date().isoformat()],
               'baselineReady':False, 'baselineDates':[], 'missingHistoryDates':[],
               'sourceTimePrecision':'bar_end', 'metricDefinitions':METRIC_DEFINITIONS.copy(),
               'v11Inputs':{}, 'v11Coverage':{'status':'insufficient','days':0,'requiredDays':FORMAL_HISTORY_DAYS}}
@@ -481,6 +707,8 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
                 vwap_series[at] = cumulative_amount/cumulative_volume
     dates = list(expected_dates) if expected_dates is not None else list(_prior_sessions(end.date()))
     dates = sorted({datetime.fromisoformat(str(d)).date() for d in dates if str(d) < end.date().isoformat()})[-FORMAL_HISTORY_DAYS:]
+    if len(dates) == FORMAL_HISTORY_DAYS:
+        result['dependencyDays'] = [day.isoformat() for day in dates] + [end.date().isoformat()]
     samples = []
     feature_history = {key: [] for key in current_features}
     if len(dates) == FORMAL_HISTORY_DAYS:
@@ -526,7 +754,7 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
             and current[end]['close'] <= prior_high else 0.)
         recent_highs = [row['high'] for row in previous_five[-2:]] + [current[end]['high']]
         v11['lower_high_risk'] = (100. if recent_highs[0] > recent_highs[1] > recent_highs[2] else 0.)
-    for key in ('r1_pct','r3_pct','r5_pct','r15_pct','a1_pct_per_min','a3_pct_per_min'):
+    for key in ('r1_pct','r3_pct','r5_pct','r15_pct','r30_pct','a1_pct_per_min','a3_pct_per_min'):
         v11['z_'+key] = _robust_z(current_features[key],feature_history[key],floor=MINUTE_PARAMS['priceMadFloor'])
     for minutes in (3,5,15):
         key = f'amount_{minutes}m'
@@ -564,9 +792,17 @@ def _formal_history_ready(evidence):
 
 
 def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, backfill=True, software_count=8000,
-                       required_days=None):
+                       required_days=None, deadline=None):
     cutoff = _datetime(cutoff)
     archive = MinuteArchive(cache_dir)
+    def remaining(maximum):
+        return maximum if deadline is None else max(0., min(maximum, deadline-monotonic()))
+    if deadline is not None and remaining(1) <= 0:
+        result = compute_bar_evidence(archive.read(code, cutoff), cutoff)
+        result.update(code=code, archivePath=str(archive.path),
+                      dataLineage=archive.quality(code, cutoff, required_days or result['dependencyDays']))
+        result['gaps'].append('分钟采集已到截止时间，仅读缓存，未追加历史回填')
+        return result
     archived = archive.read(code, cutoff)
     # Once history is warm, merge the current session into that archive. Do not
     # call an old or incomplete archive current, or reduce cold-start coverage.
@@ -581,8 +817,8 @@ def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, bac
     if getter is None:
         from src.services.software_market import SoftwareMarketClient
         client = SoftwareMarketClient.from_environment()
-        client.read_timeout = 12
-        if client.available:
+        client.read_timeout = max(.1, remaining(12))
+        if client.available and remaining(1) > 0:
             try:
                 bars = fetch_software_bars(code,count=software_count,client=client)
                 normalized = normalize_bars(bars,cutoff)
@@ -598,10 +834,10 @@ def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, bac
     needs_supplement = backfill and (not required_coverage['pricePathComplete'] or
         any(required_coverage['missingFields'].values()) or
         software_count > 240 and not _formal_history_ready(compute_bar_evidence(cached_after_software, cutoff)))
-    if not software_fetched or needs_supplement:
+    if (not software_fetched or needs_supplement) and remaining(1) > 0:
         supplemental['attempted'] = True
         try:
-            public_rows = fetch_sina_bars(code,getter=getter)
+            public_rows = fetch_sina_bars(code,getter=getter,count=1970 if backfill else 240,timeout=max(.1,remaining(5)))
             if not normalize_bars(public_rows, cutoff):
                 raise ValueError('Sina returned no usable complete minutes')
             supplemental.update(archive.save(code, public_rows, cutoff))
@@ -614,11 +850,14 @@ def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, bac
     day = cutoff.date().isoformat()
     history_backfill = {'status':'not_needed' if _formal_history_ready(result) else 'not_available',
                         'pages':0,'newBars':0,'requestedEnds':[], 'pageCoverage': []}
-    if (backfill and not _formal_history_ready(result) and client is not None and client.available
+    if (backfill and remaining(1) > 0 and not _formal_history_ready(result) and client is not None and client.available
             and rows and archive.claim_attempt(code,day,'software_history',retry_incomplete=True)):
         history_backfill['status'] = 'empty'
         try:
             for _ in range(2):
+                if remaining(1) <= 0:
+                    break
+                client.read_timeout = max(.1, remaining(12))
                 oldest = min(_datetime(row['end']) for row in rows)
                 before = (oldest-timedelta(minutes=1)).strftime('%Y%m%d%H%M%S')
                 history_backfill['requestedEnds'].append(before)
@@ -644,11 +883,11 @@ def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, bac
         archive.record(code,day,'software_history',history_backfill['status'])
     elif backfill and not _formal_history_ready(result) and archive.attempted(code,day,'software_history'):
         history_backfill['status'] = 'already_attempted_today'
-    if backfill and (not result['baselineReady'] or not _formal_history_ready(result)):
+    if backfill and remaining(1) > 0 and (not result['baselineReady'] or not _formal_history_ready(result)):
         if ((os.getenv('TUSHARE_TOKEN') or os.getenv('TUSHARE_API_TOKEN'))
                 and archive.claim_attempt(code,day,'tushare',retry_incomplete=True)):
             try:
-                archive.save(code, fetch_tushare_bars(code,cutoff,poster=poster), cutoff)
+                archive.save(code, fetch_tushare_bars(code,cutoff,poster=poster,timeout=max(.1,remaining(8))), cutoff)
                 archive.record(code,day,'tushare','fetched')
                 result = compute_bar_evidence(archive.read(code,cutoff),cutoff)
             except (requests.RequestException,ValueError,TypeError,KeyError) as exc:
@@ -661,6 +900,7 @@ def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, bac
         result['requiredCoverage'] = minute_coverage(archive.read(code, cutoff), cutoff, required_days)
     result['gaps'].extend(errors)
     result['softwareMarketUsed'] = software_fetched
+    result['dataLineage'] = archive.quality(code, cutoff, required_days or result['dependencyDays'])
     result['historyAccess'] = 'configured' if os.getenv('TUSHARE_TOKEN') or os.getenv('TUSHARE_API_TOKEN') else 'public_archive_warming'
     return result
 

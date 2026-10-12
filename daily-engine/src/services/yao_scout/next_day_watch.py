@@ -15,8 +15,8 @@ from .labels import calculate_limit_price
 from .research_factors import _sessions
 
 TZ = ZoneInfo('Asia/Shanghai')
-VERSION = 'next-day-limit-watch-v2'
-SUPPORTED_VERSIONS = frozenset({VERSION, 'next-day-limit-watch-v1'})
+VERSION = 'next-day-limit-watch-v3'
+SUPPORTED_VERSIONS = frozenset({VERSION, 'next-day-limit-watch-v2', 'next-day-limit-watch-v1'})
 MEANING = '未触板潜伏与已触板延续独立排序；未校准为涨停概率，观察入选不代表通过买入或成交检查'
 FIRST_BOARD_POLICY = {'minChangePct': -3., 'maxChangePct': 5., 'minLimitDistancePct': 4.,
                       'maxAtrExtension': 2.5, 'todayLimitTouchAllowed': False,
@@ -83,6 +83,7 @@ def build_next_day_watchlist(candidates, now, top_n=5, *, calendar_provider=None
     now = timestamp(now)
     calendar = calendar_provider or _sessions
     exclusions, research = Counter(), []
+    calendar_cache = {}
     population = Counter()
     seen = set()
     for candidate in candidates:
@@ -102,7 +103,9 @@ def build_next_day_watchlist(candidates, now, top_n=5, *, calendar_provider=None
                 or not 0 <= (decision-at).total_seconds() <= 30 or not 0 <= (now-at).total_seconds() <= 30):
             exclusions['quote_identity_or_timestamp'] += 1
             continue
-        sessions = session_dates(calendar, at.date()-timedelta(days=35), at.date()+timedelta(days=25))
+        if at.date() not in calendar_cache:
+            calendar_cache[at.date()] = session_dates(calendar, at.date()-timedelta(days=35), at.date()+timedelta(days=25))
+        sessions = calendar_cache[at.date()]
         if not sessions:
             exclusions['calendar_unavailable'] += 1
             continue
@@ -235,10 +238,19 @@ def build_next_day_watchlist(candidates, now, top_n=5, *, calendar_provider=None
                           'vwapSupport': 15*clip((p/vwap-1)*100/2),
                           'minuteStrength': 15*clip((speed or 0)/1)}
             penalty = min(20., max(0., extension-3)*5) + min(15., (high/p-1)*100*3)
-        score = round(max(0., sum(components.values())-penalty), 2)
+        # Known fading momentum used to be indistinguishable from an unknown
+        # minute factor: both contributed zero while daily pattern points could
+        # keep the stock at the top. Apply the opposite of the declared minute
+        # strength scale to fresh observed weakness; missing evidence stays zero.
+        minute_weight = (FIRST_BOARD_WEIGHTS if queue == 'first_board' else CONTINUATION_WEIGHTS)['minuteStrength']
+        minute_scale = .5 if queue == 'first_board' else 1.
+        weakness_penalty = minute_weight * clip(-speed/minute_scale) if speed is not None else 0.
+        score = round(max(0., sum(components.values())-penalty-weakness_penalty), 2)
         reasons = [f'结构：{" / ".join(branches)}',
                    f'价格处于当日区间{location*100:.0f}%位置，距此前20日高点{(proximity-1)*100:+.2f}%',
                    f'价格较累计VWAP {(p/vwap-1)*100:+.2f}%，日线趋势条件{round(trend*3)}/3']
+        if weakness_penalty:
+            reasons.append(f'最新完整5分钟涨速{speed:+.2f}%，已观察转弱扣{weakness_penalty:.2f}分；等待重新转强')
         if queue == 'first_board':
             reasons.insert(0, f'截至源时间当日涨跌{change:+.2f}%，盘中尚未触及10%模式价，距该价{distance:.2f}%；不与已触板股票争抢潜伏名额')
             reasons.append(f'较MA5延伸{extension:.2f}个ATR；优先观察未过度延伸的平台或修复结构')
@@ -253,6 +265,7 @@ def build_next_day_watchlist(candidates, now, top_n=5, *, calendar_provider=None
                   'previousSessionPattern': yesterday,
                   'executionState': candidate.get('status'), 'sourceTime': at.isoformat(),
                   'priceLimitBasis': '主板10%价格结构；未核验目标日ST/除权制度，复盘独立标记价格模式',
+                  'referencePrice': p,
                   'trigger': '下一交易日观察突破与承接；交易前重新核验报价、盘口及风险',
                   'invalidation': '回落跌破支撑、无法成交或新披露利空时重新评估',
                   'features': {'rangePosition': location, 'high20Ratio': proximity, 'trendConditions': trend*3,
@@ -263,7 +276,8 @@ def build_next_day_watchlist(candidates, now, top_n=5, *, calendar_provider=None
                                'limitDistancePct': distance, 'todayLimitPrice': limit,
                                'todayHigh': high, 'touchedLimitToday': touched,
                                'previousSessionCloseAtLimit': yesterday['closeAtLimit']},
-                  'components': components, 'extensionAndRetreatPenalty': penalty}
+                  'components': components, 'extensionAndRetreatPenalty': penalty,
+                  'observedWeaknessPenalty': weakness_penalty}
         research.append({**candidate, 'nextDaySignal': signal})
     research.sort(key=lambda row: (-row['nextDaySignal']['score'], row['code']))
     first_board = [row for row in research if row['nextDaySignal']['queue'] == 'first_board']
@@ -283,6 +297,7 @@ def build_next_day_watchlist(candidates, now, top_n=5, *, calendar_provider=None
                'populationCounts': dict(population), 'firstBoardPolicy': dict(FIRST_BOARD_POLICY),
                'snapshotPolicy': '快照时间未核实的量比、换手及涨幅只安排初筛队列，不进入T+1分数；未深研股票不作排除结论',
                'weights': {'first_board': FIRST_BOARD_WEIGHTS, 'continuation': CONTINUATION_WEIGHTS}}
+    summary['weaknessPolicy'] = '新鲜5分钟转弱按同队列minuteStrength权重与尺度反向扣分；缺失不伪装成无风险，旧推荐不重排'
     return {'nextDayWatchlist': selected, 'nextDayContinuationWatchlist': continuation_selected,
             'nextDayResearch': summary, 'researchCandidates': research}
 
@@ -336,7 +351,17 @@ def next_day_outcome(signal, bars, as_of, *, calendar_provider=None):
     # Archived minute OHLC does not prove historical ST status or ex-right limits.
     # Keep the measurable 10% pattern separate from exchange-confirmed outcomes.
     limit = calculate_limit_price(previous, signal['code'], target)
+    closing_price = number(target_rows[-1]['close'])
+    highest = max(number(row['high']) for row in target_rows)
+    lowest = min(number(row['low']) for row in target_rows)
+    reference = number(signal.get('referencePrice'))
     return {**result, 'status': 'mature_price_pattern', 'previousSessionClose': previous,
+            'targetClose': closing_price, 'targetHigh': highest, 'targetLow': lowest,
+            'targetDayChangePct': (closing_price/previous-1)*100,
+            'observedReturnFromSignalPct': (closing_price/reference-1)*100 if reference and reference > 0 else None,
+            'observedMfeFromSignalPct': max(0., (highest/reference-1)*100) if reference and reference > 0 else None,
+            'observedMaeFromSignalPct': max(0., (1-lowest/reference)*100) if reference and reference > 0 else None,
+            'returnMeaning': '目标日及信号参考价之间的价格观察，非成交收益；不把盘中触及当收盘获利',
             'limitPrice': limit, 'limitBasis': '主板10%分币四舍五入价格模式；未核验目标日除权/ST状态',
             'touchLimit': max(row['high'] for row in target_rows) >= limit-.005,
             'closeAtLimit': abs(target_rows[-1]['close']-limit) <= .005,
@@ -344,48 +369,135 @@ def next_day_outcome(signal, bars, as_of, *, calendar_provider=None):
             'labelEndAt': datetime.combine(target, time(15, 1), TZ).isoformat()}
 
 
+def _review_calendar(provider):
+    """Reuse each frozen signal session's calendar across its entire queue."""
+    cached = {}
+    def calendar(start, end):
+        key = (start, end)
+        if key not in cached:
+            cached[key] = session_dates(provider, start, end)
+        return cached[key]
+    return calendar
+
+
+def _review_summary(items):
+    """Keep comparable selected/control cohorts and unknown observations visible."""
+    groups = {}
+    record_counts = Counter((item.get('version'), item.get('queue', 'legacy_mixed'), bool(item.get('selected')))
+                            for item in items)
+    distinct = {}
+    for item in sorted(items, key=lambda row: (str(row.get('decisionAt') or ''), str(row.get('reviewedAt') or ''))):
+        key = (item.get('code'), item.get('signalDate') or item.get('signalSession') or item.get('signalId'),
+               item.get('version'), item.get('queue', 'legacy_mixed'), bool(item.get('selected')))
+        distinct[key] = item
+    for item in distinct.values():
+        key = (item.get('version'), item.get('queue', 'legacy_mixed'), bool(item.get('selected')))
+        group = groups.setdefault(key, {'version': key[0], 'queue': key[1], 'selected': key[2],
+            'recordCount': record_counts[key],
+            'signalCount': 0, 'maturePatterns': 0, 'touchPatterns': 0, 'closePatterns': 0,
+            'statusCounts': {}, 'priceObservationCount': 0, 'upCount': 0, 'downCount': 0, 'flatCount': 0,
+            'observedReturnSum': 0., 'targetDayObservationCount': 0, 'targetDayChangeSum': 0.})
+        group['signalCount'] += 1
+        status = item.get('status', 'unknown')
+        group['statusCounts'][status] = group['statusCounts'].get(status, 0) + 1
+        if status == 'mature_price_pattern':
+            group['maturePatterns'] += 1
+            group['touchPatterns'] += int(item.get('touchLimit') is True)
+            group['closePatterns'] += int(item.get('closeAtLimit') is True)
+            change = number(item.get('observedReturnFromSignalPct'))
+            if change is not None:
+                group['priceObservationCount'] += 1
+                group['observedReturnSum'] += change
+                group['upCount' if change > 0 else 'downCount' if change < 0 else 'flatCount'] += 1
+            day_change = number(item.get('targetDayChangePct'))
+            if day_change is not None:
+                group['targetDayObservationCount'] += 1
+                group['targetDayChangeSum'] += day_change
+    for group in groups.values():
+        count = group['priceObservationCount']
+        group['meanObservedReturnFromSignalPct'] = group.pop('observedReturnSum') / count if count else None
+        count = group['targetDayObservationCount']
+        group['meanTargetDayChangePct'] = group.pop('targetDayChangeSum') / count if count else None
+    return {'groups': list(groups.values()),
+            'dedupe': '同代码、信号交易日、冻结规则版本、队列及入选/对照；重复轮次保留最新决策的观察',
+            'scope': '当前筛选与页内记录；recordCount为原始记录条数，signalCount为独立信号数',
+            'meaning': '分母仅完整价格模式样本；待成熟、未执行、缺数据分别保留；未验证成交收益或规则胜率'}
+
+
 def review_next_day_signals(service, as_of, cache=None):
     """Append independent labels for prospectively frozen T+1 signals and controls."""
     cache = cache if cache is not None else {}
     changed = []
+    calendar = _review_calendar(service.calendar_provider)
+    versions = sorted(SUPPORTED_VERSIONS)
     with service._connect() as db:
         db.execute('CREATE TABLE IF NOT EXISTS next_day_outcomes(signal_id TEXT PRIMARY KEY, reviewed_at TEXT NOT NULL, result_json TEXT NOT NULL)')
-        rows = db.execute('SELECT e.signal_id,e.code,e.selected,e.snapshot_json FROM signal_events e '
-                          'JOIN signal_runs r ON r.run_id=e.run_id WHERE r.trading_day<=?', (as_of.date().isoformat(),)).fetchall()
-        for row in rows:
-            snap = json.loads(row['snapshot_json'])
-            signal = snap.get('nextDaySignal') or {}
-            if signal.get('version') not in SUPPORTED_VERSIONS:
+        rows = db.execute("SELECT e.signal_id,e.code,e.signal_price,e.decision_at,r.trading_day,"
+                          "json_extract(e.snapshot_json,'$.referencePrice') reference_price,"
+                          "json_extract(e.snapshot_json,'$.nextDaySignal') signal_json,"
+                          "o.result_json,o.reviewed_at FROM signal_events e JOIN signal_runs r ON r.run_id=e.run_id "
+                          "LEFT JOIN next_day_outcomes o ON o.signal_id=e.signal_id WHERE r.trading_day<=? "
+                          "AND json_extract(e.snapshot_json,'$.nextDaySignal.version') IN ("
+                          + ','.join('?' for _ in versions) + ') '
+                          "ORDER BY json_extract(e.snapshot_json,'$.nextDaySignal.selected') DESC,e.code,r.trading_day",
+                          (as_of.date().isoformat(), *versions)).fetchall()
+    for row in rows:
+        signal = json.loads(row['signal_json'])
+        signal = {**signal, 'code': row['code'], 'referencePrice':
+                  signal.get('referencePrice') or row['reference_price'] or row['signal_price']}
+        old = json.loads(row['result_json']) if row['result_json'] else {}
+        old_mature = old.get('status') == 'mature_price_pattern'
+        if old_mature and old.get('targetDayChangePct') is not None:
+            continue
+        # Do not load long minute paths for a T+1 label that has not matured.
+        due = next_day_outcome(signal, [], as_of, calendar_provider=calendar)
+        if due['status'] == 'pending':
+            continue
+        if row['code'] not in cache:
+            try:
+                cache[row['code']] = service._bar_rows(service.bar_fetcher(row['code'], as_of), as_of)
+            except Exception:
+                cache[row['code']] = []
+        outcome = next_day_outcome(signal, cache[row['code']], as_of,
+                                   calendar_provider=calendar)
+        if outcome.get('labelEndAt') and hasattr(service, '_label_lineage'):
+            outcome['dataLineage'] = service._label_lineage(row['code'], row['decision_at'], outcome['labelEndAt'])
+        if old_mature:
+            # Supplement only measured prices from the original archived path.
+            # Preserve the frozen version, queue and all prior pattern labels.
+            if outcome.get('status') != 'mature_price_pattern':
                 continue
-            old = db.execute('SELECT result_json FROM next_day_outcomes WHERE signal_id=?', (row['signal_id'],)).fetchone()
-            if old and json.loads(old[0]).get('status') == 'mature_price_pattern':
-                continue
-            if row['code'] not in cache:
-                try:
-                    cache[row['code']] = service._bar_rows(service.bar_fetcher(row['code'], as_of), as_of)
-                except Exception:
-                    cache[row['code']] = []
-            outcome = next_day_outcome({**signal, 'code': row['code']}, cache[row['code']], as_of,
-                                       calendar_provider=service.calendar_provider)
-            if outcome['status'] == 'pending':
-                continue
-            outcome.update(signalId=row['signal_id'], code=row['code'], selected=bool(signal.get('selected')))
+            price_keys = ('targetClose', 'targetHigh', 'targetLow', 'targetDayChangePct',
+                          'observedReturnFromSignalPct', 'observedMfeFromSignalPct',
+                          'observedMaeFromSignalPct', 'returnMeaning', 'dataLineage')
+            outcome = {**old, **{key: outcome.get(key) for key in price_keys},
+                       'priceObservationSupplementedAt': as_of.isoformat()}
+        outcome.update(signalId=row['signal_id'], code=row['code'], selected=bool(signal.get('selected')),
+                       signalDate=signal.get('signalSession') or row['trading_day'], decisionAt=row['decision_at'])
+        # Commit every signal after its I/O, preserving completed work on an
+        # interrupted review and leaving the ledger available to history reads.
+        with service._connect() as db:
             db.execute('INSERT INTO next_day_outcomes VALUES(?,?,?) ON CONFLICT(signal_id) DO UPDATE '
                        'SET reviewed_at=excluded.reviewed_at,result_json=excluded.result_json',
-                       (row['signal_id'], as_of.isoformat(), json.dumps(outcome, ensure_ascii=False)))
-            changed.append(outcome)
+                       (row['signal_id'], row['reviewed_at'] if old_mature else as_of.isoformat(),
+                        json.dumps(outcome, ensure_ascii=False)))
+        changed.append(outcome)
     mature = [row for row in changed if row['status'] == 'mature_price_pattern']
     return {'version': VERSION, 'items': changed, 'updated': len(changed), 'maturePatterns': len(mature),
+            'summary': _review_summary(changed),
             'meaning': '独立T+1触及/收盘涨停价格模式复盘；未验证交易所涨停制度，不等于成交或收益；缺失不记失败'}
 
 
 def read_next_day_reviews(service, filters=None):
     filters = filters or {}
     as_of = timestamp(service.clock())
+    calendar = _review_calendar(service.calendar_provider)
     versions = sorted(SUPPORTED_VERSIONS)
     where = ["json_extract(e.snapshot_json,'$.nextDaySignal.version') IN ("
              + ','.join('?' for _ in versions) + ')']
     args = list(versions)
+    if filters.get('include_controls') is False:
+        where.append("json_extract(e.snapshot_json,'$.nextDaySignal.selected')=1")
     for key, column in (('date', 'r.trading_day'), ('symbol', 'e.code'), ('version', 'r.version')):
         if filters.get(key):
             where.append(column+'=?')
@@ -393,7 +505,7 @@ def read_next_day_reviews(service, filters=None):
     with service._connect() as db:
         exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='next_day_outcomes'").fetchone()
         result_columns = 'o.reviewed_at,o.result_json' if exists else 'NULL reviewed_at,NULL result_json'
-        query = ('SELECT e.signal_id,e.code,e.snapshot_json,r.trading_day,' + result_columns
+        query = ("SELECT e.signal_id,e.code,e.decision_at,json_extract(e.snapshot_json,'$.nextDaySignal') signal_json,r.trading_day," + result_columns
                  + ' FROM signal_events e JOIN signal_runs r ON r.run_id=e.run_id')
         if exists:
             query += ' LEFT JOIN next_day_outcomes o ON o.signal_id=e.signal_id'
@@ -403,13 +515,13 @@ def read_next_day_reviews(service, filters=None):
         rows = db.execute(query, (*args, max(1, min(int(filters.get('limit') or 1000), 5000)))).fetchall()
     items = []
     for row in rows:
-        signal = json.loads(row['snapshot_json']).get('nextDaySignal') or {}
+        signal = json.loads(row['signal_json'])
         if row['result_json']:
             outcome = json.loads(row['result_json'])
         else:
             try:
                 outcome = next_day_outcome({**signal, 'code': row['code']}, [], as_of,
-                                           calendar_provider=service.calendar_provider)
+                                           calendar_provider=calendar)
             except (KeyError, TypeError, ValueError):
                 outcome = {'version': signal.get('version'), 'queue': signal.get('queue'),
                            'status': 'calendar_unavailable', 'targetSession': None,
@@ -422,8 +534,10 @@ def read_next_day_reviews(service, filters=None):
             else:
                 outcome.update(status='review_not_run', reason='已到下一交易日收盘，尚无复盘执行记录')
         items.append({**outcome, 'signalId': row['signal_id'], 'code': row['code'],
-                      'selected': bool(signal.get('selected')), 'signalDate': row['trading_day'],
+                      'selected': bool(signal.get('selected')), 'signalDate': signal.get('signalSession') or row['trading_day'],
+                      'decisionAt': row['decision_at'],
                       'reviewedAt': row['reviewed_at']})
     return {'version': VERSION, 'items': items, 'count': len(items), 'asOf': as_of.isoformat() if as_of else None,
             'statusCounts': dict(Counter(item['status'] for item in items)), 'validationStatus': 'unvalidated_rules',
+            'summary': _review_summary(items),
             'meaning': '主板10%价格模式观测，非已核实涨停命中率或交易收益；保留未完成样本'}

@@ -117,6 +117,38 @@ def test_next_session_touch_and_close_are_separate_and_use_final_close():
     assert next_day_outcome(signal(), rows, cutoff, calendar_provider=calendar)['closeAtLimit'] is True
 
 
+def test_known_fading_minutes_rank_below_the_same_unknown_structure():
+    fading = candidate('600001')
+    fading['indicatorEvidence'][-1]['value'] = -.5
+    unknown = candidate('600002')
+    unknown['indicatorEvidence'][-1]['status'] = 'missing'
+    result = build_next_day_watchlist([fading,unknown],NOW,calendar_provider=calendar)
+    assert result['nextDayWatchlist'][0]['code']=='600002'
+    assert result['nextDayWatchlist'][1]['nextDaySignal']['observedWeaknessPenalty']==5
+    assert result['nextDayWatchlist'][0]['nextDaySignal']['observedWeaknessPenalty']==0
+
+
+def test_calendar_is_queried_once_per_signal_day_not_once_per_stock():
+    calls = []
+    def counted(start,end):
+        calls.append((start,end))
+        return calendar(start,end)
+    build_next_day_watchlist([candidate('600001'),candidate('600002')],NOW,calendar_provider=counted)
+    assert len(calls)==1
+
+
+def test_next_day_review_records_losing_close_even_after_touch():
+    rows = bars()
+    rows[-1].update(open=10.,high=10.,low=9.9,close=10.)
+    outcome = next_day_outcome({**signal(),'referencePrice':10.5},rows,
+        datetime(2026,9,21,15,1,tzinfo=TZ),calendar_provider=calendar)
+    assert outcome['touchLimit']
+    assert outcome['targetDayChangePct'] < 0
+    assert outcome['observedReturnFromSignalPct'] < 0
+    assert outcome['observedMaeFromSignalPct'] > 0
+    assert not outcome['executionVerified']
+
+
 def test_missing_minutes_and_incomplete_target_do_not_become_negative_labels():
     before_close = datetime(2026, 9, 21, 14, 59, tzinfo=TZ)
     assert next_day_outcome(signal(), bars(), before_close, calendar_provider=calendar)['status'] == 'pending'
@@ -141,7 +173,9 @@ def test_frozen_t1_ledger_is_independent_of_entry_training_and_review_is_idempot
     with service._connect() as db:
         saved = db.execute('SELECT training_eligible,snapshot_json FROM signal_events').fetchone()
         assert not saved['training_eligible']
-        assert json.loads(saved['snapshot_json'])['nextDaySignal'] == signal()
+        frozen = json.loads(saved['snapshot_json'])['nextDaySignal']
+        assert {key:frozen[key] for key in signal()} == signal()
+        assert frozen['trainingEligibleAtSignal'] is False  # unknown at publication remains observation only
         assert json.loads(saved['snapshot_json'])['dailyPreviousSession'] == row['dailyPreviousSession']
     assert service.reviews()['nextDayReview']['items'][0]['status'] == 'mature_price_pattern'
 

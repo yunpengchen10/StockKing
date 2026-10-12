@@ -12,7 +12,7 @@ from src.services.yao_scout.v11_factors import SCORE_VERSION
 from .research_policy import DEFAULT_PARAMETERS, VALIDATION_STATUS
 
 VERSION = "king-precision-v1"
-V11_VERSION = "king-precision-v1.2"
+V11_VERSION = "king-precision-v1.2-r2"
 
 
 def execution_quote_data(candidate):
@@ -108,6 +108,8 @@ def evaluate(candidate, context, daily=None):
             waiting.append('正式候选须20/20日量价基准、M/V/W/B关键因子及新鲜完整分钟结构；5—19日仅观察')
         if current_rules and execution_data['status'] != 'complete':
             waiting.append('推荐时点前收盘及供应商涨跌停价必须完整导入且一致，才能形成可复盘的正式候选')
+        if current_rules and number((candidate.get('v11Inputs') or {}).get('failed_breakout_risk')) == 100:
+            blocked.append('最近完整分钟已出现突破失败，等待新的完整分钟确认承接；短反抽不恢复正式准入')
         if not candidate.get("evidenceEligible"):
             waiting.append("独立价量、行业或资金证据尚未通过")
         if candidate.get("status") in {"expired", "data_insufficient", "windvane"}:

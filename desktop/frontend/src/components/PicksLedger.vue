@@ -1,18 +1,21 @@
 <script setup>
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { GetStockKingRecommendationHistory, GetStockKingDelayedReviews, GetStockKingLearningState, GetStockKingRecordQuotes } from '../../wailsjs/go/main/App'
-import { groupSignals, ledgerPercent, ledgerPrice, ledgerSigned, statusLabel, reviewStatusLabel, reviewReasonLabel, visibleReviews, reviewProgress, learningEffect, reviewReturn, learningProgress, recordQuoteCode, signalPriceComparison, createRecordQuoteLoader, nextDaySignalOf, isNextDaySelection, signalSelectionLabel, nextDayPatternValue, nextDayQueueLabel, nextDayTouchLabel } from '../utils/pickLedger.mjs'
+import { groupSignals, ledgerPercent, ledgerPrice, ledgerSigned, priceObservationPercent, statusLabel, reviewStatusLabel, reviewReasonLabel, visibleReviews, reviewProgress, learningEffect, reviewReturn, learningProgress, recordQuoteCode, signalPriceComparison, createRecordQuoteLoader, nextDaySignalOf, isNextDaySelection, signalSelectionLabel, nextDayPatternValue, nextDayQueueLabel, nextDayTouchLabel } from '../utils/pickLedger.mjs'
+import { withRecordReadTimeout } from '../utils/recordRead.mjs'
+import { learningTimeline, learningTaskLabel } from '../utils/learningStatus.mjs'
 
 // A separate, retained instance owns each ledger tab. Activation updates quotes only.
 const props = defineProps({ mode: { type: String, required: true }, active: { type: Boolean, default: true }, refreshToken: { type: Number, default: 0 } })
 defineEmits(['open-chart'])
 const date = ref(''), symbol = ref(''), version = ref(''), includeControls = ref(false)
 const loading = ref(false), error = ref(''), payload = ref({ items: [] })
+const visibleGroupCount = ref(30), expandedSignals = ref(new Set())
 const queriedAt = ref(''), reviewLearning = ref({}), learningError = ref('')
 const quotesLoading = ref(false), quotesError = ref(''), quotes = ref({})
 let requestId = 0, disposed = false, initialized = false, quoteTimer = null, quoteUpdateGeneration = 0
 const groups = computed(() => groupSignals(payload.value, { includeControls: includeControls.value }))
-const displayGroups = computed(() => groups.value.map(group => ({
+const displayGroups = computed(() => groups.value.slice(0, visibleGroupCount.value).map(group => ({
   ...group,
   signals: group.signals.map(signal => ({ ...signal, nextDay: isNextDaySelection(signal) ? nextDaySignalOf(signal) : null, priceComparison: signalPriceComparison(signal, quotes.value[recordQuoteCode(signal.code)]) })),
 })))
@@ -22,11 +25,14 @@ const quoteLoader = createRecordQuoteLoader({
 })
 const reviews = computed(() => visibleReviews(payload.value.items, { includeControls: includeControls.value }))
 const nextDayReviews = computed(() => visibleReviews(payload.value.nextDayReview?.items, { includeControls: includeControls.value }))
+const nextDaySummaryGroups = computed(() => (payload.value.nextDayReview?.summary?.groups || []).filter(group => includeControls.value || group.selected === true))
 const reviewSummaries = computed(() => [
   { label: '次日价格模式', ...reviewProgress(nextDayReviews.value) },
   { label: '交易模拟', ...reviewProgress(reviews.value) },
 ])
 const learning = computed(() => payload.value || {})
+const learningTimes = computed(() => learningTimeline(learning.value))
+const learningTasks = computed(() => Array.isArray(learning.value.taskStates) ? learning.value.taskStates : [])
 const effectiveLearning = computed(() => learningEffect(props.mode === 'reviews' ? reviewLearning.value : learning.value))
 const minimumDays = computed(() => learning.value.minimumMatureDays ?? 120)
 const minimumSamples = computed(() => learning.value.minimumValidSamples ?? 1000)
@@ -50,6 +56,21 @@ function gateValue(gate) {
 function candidate(signal) { return signal.snapshot || signal.features?.candidate || signal.candidate || signal.features || {} }
 function factors(signal) { return candidate(signal).factorScores || signal.factorScores || {} }
 function researchScore(value) { return value != null && value !== '' && Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '未记录' }
+function signalKey(signal) { return signal.signalId || `${signal.runId}-${signal.decisionAt}` }
+function toggleSignal(signal, event) {
+  const expanded = new Set(expandedSignals.value)
+  if (event.target.open) expanded.add(signalKey(signal))
+  else expanded.delete(signalKey(signal))
+  expandedSignals.value = expanded
+}
+function readRecord(request) {
+  // Browser timers require Window as their receiver. Wrappers keep these calls
+  // global when the timeout helper invokes them through its timer adapter.
+  return withRecordReadTimeout(request, 20000, {
+    setTimeout: (callback, delay) => setTimeout(callback, delay),
+    clearTimeout: timer => clearTimeout(timer),
+  })
+}
 function refreshQuotes() {
   if (!disposed && props.active && props.mode === 'records' && !loading.value) return quoteLoader.load(groups.value.map(group => group.code))
 }
@@ -77,7 +98,7 @@ async function refresh() {
     let result
     if (props.mode === 'reviews') {
       const [reviewResult, learningResult] = await Promise.allSettled([
-        GetStockKingDelayedReviews(...args), Promise.resolve().then(() => GetStockKingLearningState()),
+        readRecord(GetStockKingDelayedReviews(...args)), readRecord(Promise.resolve().then(() => GetStockKingLearningState())),
       ])
       if (!disposed && current === requestId) {
         reviewLearning.value = learningResult.status === 'fulfilled' ? learningResult.value || {} : {}
@@ -85,8 +106,8 @@ async function refresh() {
       }
       if (reviewResult.status === 'rejected') throw reviewResult.reason
       result = reviewResult.value
-    } else result = props.mode === 'learning' ? await GetStockKingLearningState() : await GetStockKingRecommendationHistory(...args)
-    if (!disposed && current === requestId) { payload.value = result || { items: [] }; queriedAt.value = new Date().toISOString() }
+    } else result = await readRecord(props.mode === 'learning' ? GetStockKingLearningState() : GetStockKingRecommendationHistory(...args, includeControls.value))
+    if (!disposed && current === requestId) { payload.value = result || { items: [] }; queriedAt.value = new Date().toISOString(); visibleGroupCount.value = 30 }
   } catch (failure) { if (!disposed && current === requestId) error.value = failure?.message || String(failure) }
   finally { if (!disposed && current === requestId) loading.value = false }
   if (!disposed && current === requestId) void updateQuotes()
@@ -96,7 +117,7 @@ watch(() => props.active, active => {
   if (!initialized) void refresh()
   else void updateQuotes()
 }, { immediate: true })
-watch(includeControls, () => { void refreshQuotes() })
+watch(includeControls, () => { if (props.mode === 'records' && initialized) void refresh(); else void refreshQuotes() })
 watch(() => props.refreshToken, () => {
   if (props.mode !== 'records') return
   date.value = ''; symbol.value = ''; version.value = ''
@@ -121,26 +142,29 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
     <n-spin :show="loading">
       <template v-if="mode === 'records'">
         <p class="ledger-note">默认显示已落盘的交易候选、未触板潜伏和单列延续观察；按信号编号保留当时评分、目标日和队列。研究观察不代表通过买入检查，手动刷新不重复计入训练。</p>
-        <p class="ledger-note">记录、筛选和展开位置保留，点击“查询记录”才更新名单。可见时每30秒更新报价；参考盈亏按标注行情时间比较，未计费用，不会重新选股。</p>
+        <p class="ledger-note">记录、筛选和展开位置保留，点击“查询记录”或切换对照样本时读取名单。可见时每30秒更新报价；参考盈亏按标注行情时间比较，未计费用，不会重新选股。</p>
         <p v-if="quotesLoading" class="ledger-note" role="status">正在取得最新报价，已载入的历史记录可继续查看…</p>
         <n-alert v-if="quotesError" type="warning" :show-icon="false" class="quote-alert">报价提示：{{ quotesError }}</n-alert>
         <div v-if="groups.length" class="ledger-groups">
           <article v-for="group in displayGroups" :key="group.key" class="ledger-group">
             <header><div><b>{{ group.name }}</b><code>{{ group.code }}</code><span>{{ group.date }} · {{ group.signals.length }} 轮信号</span></div><n-button size="small" secondary @click="$emit('open-chart', group)">图表</n-button></header>
             <small>算法 {{ group.modelVersion || '原记录未保存' }}</small>
-            <details v-for="signal in group.signals" :key="signal.signalId || `${signal.runId}-${signal.decisionAt}`" class="signal-row">
+            <details v-for="signal in group.signals" :key="signalKey(signal)" :open="expandedSignals.has(signalKey(signal))" class="signal-row" @toggle="toggleSignal(signal, $event)">
               <summary><span>{{ time(signal.decisionAt) }} · {{ signal.slot || '即时' }}</span><n-tag size="small" :type="signal.selected ? 'info' : signal.nextDay ? 'warning' : 'default'">{{ signalSelectionLabel(signal) }}</n-tag><n-tag v-if="signal.selected && signal.nextDay" size="small" type="warning">{{ nextDayQueueLabel(signal.nextDay) }}</n-tag><span>{{ signal.official ? '定时扫描' : '手动观察' }}</span><span>{{ statusLabel(signal.reviewStatus) }}</span><span v-if="signal.nextDay">目标 {{ signal.nextDay.targetSession || '未记录' }} · 冲板观察分 {{ researchScore(signal.nextDay.score) }}</span>
                 <span class="signal-price-change"><span>{{ signal.nextDay ? '观察参考' : signal.selected ? '精选参考' : '对照参考' }} ¥{{ ledgerPrice(signal.priceComparison.baseline) }} → 最新 ¥{{ ledgerPrice(signal.priceComparison.latest) }}</span><b v-if="signal.priceComparison.available" :class="signal.priceComparison.direction">参考盈亏 {{ ledgerSigned(signal.priceComparison.delta) }} 元/股（{{ ledgerSigned(signal.priceComparison.percent * 100) }}%）</b><span v-else class="comparison-unavailable">参考盈亏 — · {{ signal.priceComparison.reason }}</span><small>行情时间 {{ time(signal.priceComparison.sourceTime) }}<template v-if="signal.priceComparison.source"> · {{ signal.priceComparison.source }}</template></small></span>
               </summary>
+              <template v-if="expandedSignals.has(signalKey(signal))">
               <dl><dt>信号编号</dt><dd>{{ signal.signalId || signal.signal_id || '未记录' }}</dd><dt>信号行情时间</dt><dd>{{ time(signal.sourceTime) }}</dd><dt>信号参考价</dt><dd>{{ ledgerPrice(signal.signalPrice) }}</dd><dt>最新报价</dt><dd>{{ ledgerPrice(signal.priceComparison.latest) }} · 行情时间 {{ time(signal.priceComparison.sourceTime) }}</dd><dt>每股参考盈亏</dt><dd v-if="signal.priceComparison.available" :class="signal.priceComparison.direction">{{ ledgerSigned(signal.priceComparison.delta) }} 元/股 · {{ ledgerSigned(signal.priceComparison.percent * 100) }}%</dd><dd v-else>— · {{ signal.priceComparison.reason }}</dd><dt>首次可成交价</dt><dd>{{ ledgerPrice(signal.firstTradablePrice) }}</dd>
                 <template v-if="signal.nextDay"><dt>观察队列</dt><dd>{{ nextDayQueueLabel(signal.nextDay) }} · 扫描时{{ nextDayTouchLabel(signal.nextDay) }}</dd><dt>目标交易日</dt><dd>{{ signal.nextDay.targetSession || '未记录' }}</dd><dt>冲板观察分</dt><dd>{{ researchScore(signal.nextDay.score) }} · {{ signal.nextDay.scoreMeaning || '研究排序，不是涨停概率' }}</dd><dt>观察规则版本</dt><dd>{{ signal.nextDay.version || '未记录' }}</dd><dt>观察依据</dt><dd>{{ text(signal.nextDay.reasons) }}</dd><dt>待确认缺口</dt><dd>{{ text(signal.nextDay.gaps) }}</dd></template>
                 <template v-else><dt>当轮排序</dt><dd>{{ signal.rank ?? candidate(signal).rank ?? '未记录' }}</dd><dt>当轮排序版本</dt><dd>{{ candidate(signal).learningRankVersion || '原记录未保存' }}</dd><dt>入选原因</dt><dd>{{ text(signal.reason || candidate(signal).selectionReasons) }}</dd></template>
                 <dt>风险</dt><dd>{{ text(candidate(signal).riskReasons || signal.risks) }}</dd><dt>触发条件</dt><dd>{{ text(signal.nextDay?.trigger || candidate(signal).triggerConditions || candidate(signal).entryPlan?.trigger) }}</dd><dt>失效条件</dt><dd>{{ text(signal.nextDay?.invalidation || candidate(signal).invalidationConditions || candidate(signal).entryPlan?.invalidations) }}</dd></dl>
               <div v-if="!signal.nextDay && Object.keys(factors(signal)).length" class="factor-list"><span v-for="(value, key) in factors(signal)" :key="key">{{ key }} <b>{{ value == null ? '未取得' : Number(value).toFixed(1) }}</b></span></div>
+              </template>
             </details>
           </article>
         </div>
-        <n-empty v-else :description="error ? '记录暂不可用' : '此范围暂无已保存记录'" />
+        <n-button v-if="groups.length > visibleGroupCount" secondary @click="visibleGroupCount += 30">继续显示 {{ Math.min(30, groups.length - visibleGroupCount) }} 组 · 共 {{ groups.length }} 组</n-button>
+        <n-empty v-if="!groups.length" :description="error ? '记录暂不可用' : '此范围暂无已保存记录'" />
       </template>
 
       <template v-else-if="mode === 'reviews'">
@@ -152,8 +176,9 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
           <h3>次日冲板观察 · T+1价格模式复盘</h3>
           <p class="ledger-note">次日观察使用独立、尚未验证的人工研究规则；交易候选模型的训练与启用状态不代表次日观察规则已学习。本节只记录价格模式结果，不会自动调整次日评分。</p>
           <p class="ledger-note">以信号日实际收盘价计算主板10%价格模式，分别观察下一交易日是否触及、收盘达到及全天处于该价位。尚未核验目标日除权、ST与实际涨停制度，不作为已核实涨停命中率，也不代表成交或收益；证据不完整显示待补。</p>
+          <div v-if="nextDaySummaryGroups.length" class="review-progress"><article v-for="group in nextDaySummaryGroups" :key="`${group.version}-${group.queue}-${group.selected}`"><b>{{ group.version || '版本未记录' }} · {{ nextDayQueueLabel({ queue: group.queue }) }} · {{ group.selected ? '入选' : '对照' }}</b><p>成熟 {{ group.maturePatterns ?? 0 }} / {{ group.signalCount ?? 0 }} 条 · 待补 {{ group.statusCounts?.incomplete ?? 0 }} · 未到期 {{ group.statusCounts?.pending ?? 0 }} · 到期待执行 {{ group.statusCounts?.review_not_run ?? 0 }}</p><p>信号至目标收盘：上涨 {{ group.upCount ?? 0 }} · 下跌 {{ group.downCount ?? 0 }} · 持平 {{ group.flatCount ?? 0 }} · 平均价格变化 {{ priceObservationPercent(group.meanObservedReturnFromSignalPct) }}</p><small>均值仅包含可核验价格的 {{ group.priceObservationCount ?? 0 }} 条；未计交易费用，不是成交收益。</small></article></div>
           <div v-if="nextDayReviews.length" class="review-table-wrap"><table class="review-table"><thead><tr><th>股票 / 信号</th><th>观察类别</th><th>目标交易日</th><th>证据状态</th><th>触及模式价</th><th>收盘模式价</th><th>全天模式价</th><th>模式价 / 依据</th></tr></thead><tbody>
-            <tr v-for="review in nextDayReviews" :key="review.signalId"><td><button @click="$emit('open-chart', { code: review.code, name: review.name })">{{ review.name || review.code }}</button><small>{{ review.signalDate }} · {{ review.code }}</small><small>{{ review.signalId }}</small></td><td>{{ review.selected ? '次日观察' : '次日对照' }}</td><td>{{ review.targetSession || '未确定' }}</td><td>{{ reviewStatusLabel(review.status, { nextDay: true }) }}<small>检查 {{ time(review.reviewedAt) }}</small></td><td>{{ nextDayPatternValue(review, 'touchLimit') }}</td><td>{{ nextDayPatternValue(review, 'closeAtLimit') }}</td><td>{{ nextDayPatternValue(review, 'onePriceLimit') }}</td><td><details><summary>¥{{ ledgerPrice(review.limitPrice) }} · 依据</summary><p v-if="review.reason">价格证据：{{ reviewReasonLabel(review.reason) }}</p><p v-if="review.limitBasis">{{ review.limitBasis }}</p><p>信号日收盘 ¥{{ ledgerPrice(review.previousSessionClose) }}</p><p>观察截止 {{ time(review.labelEndAt) }}</p><p>交易所涨停制度与可成交性未核验。</p></details></td></tr>
+            <tr v-for="review in nextDayReviews" :key="review.signalId"><td><button @click="$emit('open-chart', { code: review.code, name: review.name })">{{ review.name || review.code }}</button><small>{{ review.signalDate }} · {{ review.code }}</small><small>{{ review.signalId }}</small></td><td>{{ review.selected ? '次日观察' : '次日对照' }}</td><td>{{ review.targetSession || '未确定' }}</td><td>{{ reviewStatusLabel(review.status, { nextDay: true }) }}<small>检查 {{ time(review.reviewedAt) }}</small></td><td>{{ nextDayPatternValue(review, 'touchLimit') }}</td><td>{{ nextDayPatternValue(review, 'closeAtLimit') }}</td><td>{{ nextDayPatternValue(review, 'onePriceLimit') }}</td><td><details><summary>¥{{ ledgerPrice(review.limitPrice) }} · 价格复盘</summary><p>目标日收盘 {{ review.targetClose == null ? '未取得' : `¥${ledgerPrice(review.targetClose)}` }} · 目标日涨跌 {{ priceObservationPercent(review.targetDayChangePct) }}</p><p>信号至目标收盘价格变化 {{ priceObservationPercent(review.observedReturnFromSignalPct) }}</p><p>目标日最大有利 / 不利变化（相对信号价）{{ priceObservationPercent(review.observedMfeFromSignalPct) }} / {{ priceObservationPercent(review.observedMaeFromSignalPct) }}</p><p v-if="review.reason">价格证据：{{ reviewReasonLabel(review.reason) }}</p><p v-if="review.limitBasis">{{ review.limitBasis }}</p><p>信号日收盘 ¥{{ ledgerPrice(review.previousSessionClose) }}</p><p>观察截止 {{ time(review.labelEndAt) }}</p><p>以上价格观察未计费用；交易所涨停制度与可成交性未核验。</p></details></td></tr>
           </tbody></table></div>
           <p v-else class="ledger-note">{{ includeControls ? '此查询范围没有已冻结的次日观察记录。' : '此查询范围没有已入选的次日观察记录，可勾选对照样本查看。' }}</p>
         </section>
@@ -168,9 +193,11 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
 
       <template v-else-if="mode === 'learning'">
         <n-alert :type="effectiveLearning.type" :show-icon="false" class="review-learning"><b>{{ effectiveLearning.label }}</b><p>{{ effectiveLearning.detail }}</p><p v-if="learning.rankingFallbackReason">{{ learning.rankingFallbackReason }}</p></n-alert>
-        <div class="learning-header"><div><span>当前阶段</span><h3>{{ statusLabel(learning.stage) }}</h3><p>{{ learning.reason || '等待后台学习检查' }}</p></div><div><span>当前版本</span><b>{{ learning.effectiveRankVersion || learning.championVersion || '本地人工规则' }}</b><small>上次训练 {{ time(learning.lastTrainingAt) }}</small></div></div>
+        <div class="learning-header"><div><span>当前阶段</span><h3>{{ statusLabel(learning.stage) }}</h3><p>{{ learning.reason || '等待后台学习检查' }}</p></div><div><span>当前版本</span><b>{{ learning.effectiveRankVersion || learning.championVersion || '本地人工规则' }}</b><small v-for="item in learningTimes" :key="item.key">{{ item.label }} {{ item.at ? time(item.at) : '尚未完成' }}</small></div></div>
         <div class="learning-metrics"><article><span>独立成熟交易日</span><strong>{{ learning.matureDays ?? '—' }} <small>/ {{ minimumDays }}</small></strong><n-progress type="line" :percentage="learningProgress(learning.matureDays, minimumDays)" :show-indicator="false" /></article><article><span>有效成熟样本</span><strong>{{ learning.validSamples ?? '—' }} <small>/ {{ minimumSamples }}</small></strong><n-progress type="line" :percentage="learningProgress(learning.validSamples, minimumSamples)" :show-indicator="false" /></article><article><span>前瞻影子验证</span><strong>{{ learning.shadowDays ?? '—' }} <small>/ {{ learning.shadowRequiredDays ?? 20 }} 日</small></strong><small>{{ learning.shadowVersion || '尚无待晋升版本' }}</small></article></div>
         <p class="ledger-note">训练仅使用本版本的主板信号与对照样本。按时间划分训练、校准和检验，边界隔离至少5个交易日。历史版本记录保留原口径。</p>
+        <div v-if="learningTasks.length" class="review-progress"><article v-for="task in learningTasks" :key="`${task.taskId}-${task.queue || ''}`"><b>{{ learningTaskLabel(task.taskId, task.queue) }}</b><p>{{ statusLabel(task.stage) }} · {{ task.validSamples ?? 0 }} 条有效样本 / {{ task.matureDays ?? 0 }} 个成熟交易日</p><p>{{ task.reason || '按本任务独立复盘、训练和验证' }}</p></article></div>
+        <p class="ledger-note">交易收益与次日行情事件分别训练。行情触板不等于可成交盈利；下一交易日标签成熟即可供本任务使用，无须等待其他期限。</p>
         <h4>晋升检查</h4><p class="ledger-note">样本外扣费收益与相对当前规则的收益优势，其95%置信下界均须大于零，且回撤不恶化；随后完成20个交易日前瞻影子验证才可启用。推理失败或版本不兼容时自动回退。</p>
         <dl v-if="gates.length" class="learning-gates"><template v-for="gate in gates" :key="gate.key"><dt>{{ gate.label || gateLabels[gate.key] || gate.key }}</dt><dd>{{ gateValue(gate) }}</dd></template></dl><p v-else class="ledger-note">尚无模型晋升检验结果。</p>
       </template>

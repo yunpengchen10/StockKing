@@ -1,4 +1,4 @@
-"""Independent, point-in-time ledger and release gate for King V1.1 signals.
+"""Independent, point-in-time ledger and task-specific release gate for King signals.
 
 This is deliberately separate from ``yao_outcomes`` and the three daily-bar
 tiers.  A saved scan is immutable; subsequent reviews append *simulated* order
@@ -6,7 +6,7 @@ and path observations.  Neither a quote nor a minute OHLC bar is a broker fill.
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
@@ -18,12 +18,12 @@ import sqlite3
 from time import monotonic
 from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
-import zlib
 
 import numpy as np
 
 from src.quant.executable_backtest import AccountConfig, _fees, _lot
 from src.services.yao_scout.minute_history import bar_session, normalize_bars
+from .task_learning import scoped_lineage_validation
 from src.services.yao_scout.research_policy import DEFAULT_PARAMETERS
 
 
@@ -44,6 +44,20 @@ MAX_HISTORY = 500
 _ARTIFACT_PROBES: dict[str, tuple[float, bool]] = {}
 
 
+class _ReviewBarCache(OrderedDict):
+    """Bound the minute-path working set while reviewing a whole stock pool."""
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > 8:
+            self.popitem(last=False)
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+
 def _at(value: datetime | str) -> datetime:
     parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -61,6 +75,18 @@ def _number(value: Any, *, positive: bool = False) -> float | None:
     if not math.isfinite(output) or (positive and output <= 0):
         return None
     return output
+
+
+def _quantity_with_fees(code: str, price: float, budget: float, day: date, config: AccountConfig) -> tuple[int, float]:
+    """One conservative lot/fee sizing function for labels and account replay."""
+    minimum, step = _lot(code)
+    quantity = minimum + max(0, int((budget / price - minimum) // step)) * step
+    while quantity >= minimum:
+        fee = _fees(quantity * price, 'buy', day, config)['total']
+        if quantity * price + fee <= budget:
+            return quantity, fee
+        quantity -= step
+    return 0, 0.
 
 
 def _json(value: Any) -> str:
@@ -101,6 +127,37 @@ def _feature_values(candidate: Mapping[str, Any]) -> dict[str, float]:
         parsed = _number(candidate.get(name))
         if parsed is not None:
             result[name] = parsed
+    # Optional, signal-time features keep missingness; future/backfilled
+    # indicators never enter a frozen training vector.
+    decision = candidate.get('decision_at')
+    wanted = {'speed_5m_pct', 'speed_15m_pct', 'speed_30m_pct', 'atr14',
+              'sector_relative_5m_pct', 'sector_return_5m_pct', 'vwap_slope_5m_pct',
+              'bias_ma5_pct', 'atr_extension', 'spread_pct', 'ask_depth_notional'}
+    for row in candidate.get('indicatorEvidence') or []:
+        if not isinstance(row, Mapping):
+            continue
+        key, value = row.get('key'), _number(row.get('value'))
+        if key not in wanted or value is None or row.get('status') not in {'observed', None}:
+            continue
+        try:
+            stamp = str(row.get('asOf') or '')
+            legal = (bool(decision) and bool(stamp) and
+                     (stamp < str(decision)[:10] if len(stamp) == 10 else _at(stamp) <= _at(decision)))
+        except (ValueError, TypeError):
+            legal = False
+        if legal:
+            result['observed_' + key] = value
+    for key in ('biasMa5Pct', 'atrExtension'):
+        value = _number(((candidate.get('precisionDecision') or {}).get('metrics') or {}).get(key))
+        if value is not None:
+            result[key] = value
+    book = candidate.get('tradability') or {}
+    for key in ('askDepthNotionalCny', 'bidAskSpreadPct'):
+        value = _number(book.get(key))
+        if value is not None:
+            result[key] = value
+    if 'r3_pct' in result and 'r15_pct' in result:
+        result['short_rebound_in_long_weak'] = float(result['r3_pct'] > 0 and result['r15_pct'] < 0)
     return result
 
 
@@ -118,8 +175,43 @@ def _snapshot(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "researchFactors", "dataEligibility", "priceHistoricalCoverageDays",
         "factorCoverage", "missingFactors", "scoreStage", "selectedScoreBranch",
         "nextDaySignal", "dailyLastClose", "dailyPreviousSession", "nextDaySelected", "nextDayContinuationSelected", "recommendationKinds",
+        "rawStructureRewardRisk", "entryRiskDistance", "entryRiskFloorAtr", "entryRiskBasis",
+        "prediction", "learningDecision", "learningTaskContractId", "dataLineage",
+        "portfolioWeight", "portfolioWeightKind", "portfolioPolicy", "plannedWeight",
+        "factorCutoffAt", "factorAvailability", "marketRegime", "learningDataEligibility",
     )
     return {key: candidate[key] for key in keys if key in candidate}
+
+
+_COMPACT_KEYS = (
+    "code", "name", "decision_at", "signalPrice", "referencePrice", "sourceTime", "quote",
+    "entryPlan", "status", "evidenceEligible", "precisionDecision", "risks", "tradability",
+    "factorScores", "v11Inputs", "earlyScore", "mainRiseScore", "finalScore", "distributionRisk",
+    "dataConfidence", "baselineHistoryDays", "scoreVersion", "selectionReasons", "riskReasons",
+    "triggerConditions", "invalidationConditions", "algorithmContractId", "learningRankVersion",
+    "learningRankScore", "rank", "rankingTieBreakOrder", "dataEligibility", "factorCoverage",
+    "missingFactors", "scoreStage", "selectedScoreBranch", "nextDaySignal", "nextDaySelected",
+    "nextDayContinuationSelected", "recommendationKinds",
+    "rawStructureRewardRisk", "entryRiskDistance", "entryRiskFloorAtr", "entryRiskBasis",
+    "prediction", "learningDecision", "learningTaskContractId", "dataLineage",
+    "portfolioWeight", "portfolioWeightKind", "portfolioPolicy", "plannedWeight", "marketRegime",
+)
+
+
+def _json_projection(column: str, keys: Iterable[str]) -> str:
+    """Project known fields inside SQLite; never transport raw minute evidence."""
+    return "json_object(" + ",".join(
+        f"'{key}',json_extract({column},'$.{key}')" for key in keys) + ")"
+
+
+def _compact_features(payload: Mapping[str, Any]) -> dict[str, float]:
+    # Old releases accidentally persisted the whole candidate here. Current
+    # releases persist the already flattened numeric feature vector.
+    if any(isinstance(value, Mapping) for value in payload.values()):
+        return _feature_values(payload)
+    return {str(key): value for key, raw in payload.items()
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", str(key))
+            and (value := _number(raw)) is not None}
 
 
 def _source_time(candidate: Mapping[str, Any]) -> str | None:
@@ -168,10 +260,13 @@ def _scan_records(result: Mapping[str, Any]):
 
 
 def _current_entry_eligible(candidate: Mapping[str, Any]) -> bool:
-    from .local_algorithm import algorithm_contract, is_entry_eligible
+    from .local_algorithm import algorithm_contract, is_research_eligible
+    # Training controls are defined before the learned admission decision. A
+    # model rejecting an otherwise tradable candidate cannot erase its label.
+    prior = {key: value for key, value in candidate.items() if key not in {'prediction', 'learningDecision'}}
     return bool(isinstance(candidate, Mapping)
                 and candidate.get("algorithmContractId") == algorithm_contract()["contractId"]
-                and is_entry_eligible(candidate))
+                and is_research_eligible(prior))
 
 
 def _signal_preflight(candidate: Mapping[str, Any], published_at: datetime) -> bool:
@@ -302,6 +397,7 @@ class SignalLearningService:
                 db.execute("ALTER TABLE signal_events ADD COLUMN review_eligible INTEGER NOT NULL DEFAULT 0")
                 db.execute("UPDATE signal_events SET review_eligible=training_eligible")
 
+    @scoped_lineage_validation
     def persist_scan(self, result: Mapping[str, Any], slot: str, as_of: datetime | str, official: bool) -> dict[str, Any]:
         """First official run for a slot/day wins; manual runs are audit only."""
         timestamp = _at(as_of)
@@ -349,6 +445,15 @@ class SignalLearningService:
                     artifact = self._model_artifact(version)
                     if artifact:
                         forward_models[version] = artifact
+            from .task_learning import TaskLearner, NEXT_DAY_TASK_ID
+            for queue in ('first_board', 'continuation'):
+                task = TaskLearner(self, NEXT_DAY_TASK_ID, queue)
+                task_registry = task.registry()
+                for key in ('championVersion', 'shadowVersion', 'rollbackVersion'):
+                    version = task_registry.get(key)
+                    artifact = self._model_artifact(version) if version else None
+                    if artifact:
+                        forward_models[version] = artifact
         existing = False
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -360,6 +465,12 @@ class SignalLearningService:
                      str(result.get("status") or "unknown"), _json(scan_meta), published_at.isoformat()),
                 )
                 for code, item in records.items():
+                    quality = self._learning_quality(item, published_at)
+                    item = {**item,'learningDataEligibility':quality}
+                    if item.get('nextDaySignal'):
+                        item['nextDaySignal'] = {**item['nextDaySignal'],
+                            'trainingEligibleAtSignal':bool(quality['eligible'] and item['nextDaySignal'].get('sourceUsableAtCompletion') is not False),
+                            'qualityKnownAt':quality.get('qualityKnownAt')}
                     supplied_decision = item.get("decision_at")
                     try:
                         decision = _at(supplied_decision or timestamp)
@@ -372,7 +483,7 @@ class SignalLearningService:
                         eligible = False
                     else:
                         eligible = bool(code in execution_sources and official and run_usable and slot in ENTRY_SLOTS
-                                        and _signal_preflight(item, published_at))
+                                        and _signal_preflight(item, published_at) and quality['eligible'])
                     signal_id = sha256(f"{run_id}:{code}".encode()).hexdigest()[:32]
                     snap = _snapshot(item)
                     db.execute(
@@ -385,11 +496,19 @@ class SignalLearningService:
                          int(eligible), int(reviewable_run and code in execution_sources), _json(_feature_values(item)), _json(snap),
                          "pending" if reviewable_run and code in execution_sources else "observation_only"),
                     )
-                    if eligible:
+                    if eligible or official and run_usable and slot in ENTRY_SLOTS and item.get('nextDaySignal'):
                         for version, artifact in forward_models.items():
                             try:
+                                from .task_learning import ENTRY_TASK_ID, lineage_valid
+                                is_entry = artifact.get('taskId') == ENTRY_TASK_ID
+                                signal = item.get('nextDaySignal') or {}
+                                if (is_entry and not eligible or not is_entry and
+                                        (signal.get('learningTaskContractId') != artifact.get('taskContractId')
+                                         or signal.get('trainingEligibleAtSignal') is not True
+                                         or not lineage_valid(self, item.get('dataLineage')))):
+                                    continue
                                 score, _ = self._predict_artifact(
-                                    artifact, [{"features": _feature_values(item)}])
+                                    artifact, [{"features": _feature_values(item) if is_entry else self._next_features(item)}])
                                 db.execute("INSERT INTO forward_predictions VALUES(?,?,?,?)",
                                            (signal_id, version, float(score[0]), _at(self.clock()).isoformat()))
                             except (ImportError, ValueError):
@@ -411,19 +530,18 @@ class SignalLearningService:
         }
         return output
 
+    def _learning_quality(self, candidate, published_at):
+        from .task_learning import lineage_known_at
+        known = lineage_known_at(self,candidate.get('dataLineage'))
+        eligible = bool(known and _at(known) <= published_at)
+        return {'eligible':eligible,'qualityKnownAt':known,'checkedAt':published_at.isoformat(),
+                'reason': 'verified_at_publication' if eligible else 'lineage_not_verified_at_publication',
+                'immutable':True}
+
     def _archive_bars(self, code: str, cutoff: datetime) -> list[dict[str, Any]]:
         """Read existing minute archive without constructing its mutating helper."""
-        path = self.data_dir / "minute_history" / "minute-bars-v2.sqlite3"
-        if not path.is_file():
-            return []
-        rows: list[dict[str, Any]] = []
-        with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5) as db:
-            for (payload,) in db.execute(
-                "SELECT payload FROM sessions WHERE code=? AND day<=? ORDER BY day",
-                (code, cutoff.date().isoformat()),
-            ):
-                rows.extend(json.loads(zlib.decompress(payload)))
-        return list(normalize_bars(rows, cutoff).values())
+        from .minute_history import read_archive_rows
+        return read_archive_rows(self.data_dir / 'minute_history', code, cutoff)
 
     def review_codes(self, as_of: datetime | str) -> list[str]:
         return list(self.review_requirements(as_of))
@@ -492,6 +610,8 @@ class SignalLearningService:
 
     def history(self, filters: Mapping[str, Any] | None = None) -> dict[str, Any]:
         filters = dict(filters or {})
+        if filters.get("compact"):
+            return self._compact_history(filters)
         limit = max(1, min(int(filters.get("limit") or 30), MAX_HISTORY))
         where, args = [], []
         if filters.get("date"):
@@ -581,7 +701,119 @@ class SignalLearningService:
                     "status": run["status"], "signals": signals,
                     "scan": scan,
                 })
+                if filters.get("include_controls") is False:
+                    items[-1]["signals"] = [item for item in signals if item["recommendationKinds"]]
         return {"items": items, "count": len(items)}
+
+    def _compact_history(self, filters: Mapping[str, Any]) -> dict[str, Any]:
+        """Read a bounded ledger page without decoding each full scan result.
+
+        Older watch selections omitted from signal_events are projected from
+        their frozen scan arrays. This remains a read: no historical eligibility
+        or selection is reconstructed with today's algorithm.
+        """
+        limit = max(1, min(int(filters.get("limit") or 30), MAX_HISTORY))
+        include_controls = filters.get("include_controls") is not False
+        where, args = [], []
+        for key, column in (("date", "r.trading_day"), ("version", "r.version")):
+            if filters.get(key):
+                where.append(column + "=?")
+                args.append(str(filters[key]))
+        code_filter = _code(filters.get("symbol")) if filters.get("symbol") else None
+        if filters.get("symbol") and code_filter is None:
+            return {"items": [], "count": 0, "compact": True}
+        if code_filter:
+            where.append("(EXISTS(SELECT 1 FROM signal_events x WHERE x.run_id=r.run_id AND x.code=?) "
+                         "OR EXISTS(SELECT 1 FROM json_each(r.scan_json,'$.result.nextDayWatchlist') x "
+                         "WHERE substr(json_extract(x.value,'$.code'),1,6)=?) "
+                         "OR EXISTS(SELECT 1 FROM json_each(r.scan_json,'$.result.nextDayContinuationWatchlist') x "
+                         "WHERE substr(json_extract(x.value,'$.code'),1,6)=?))")
+            args.extend([code_filter] * 3)
+        clause = " WHERE " + " AND ".join(where) if where else ""
+        snapshot_sql = _json_projection("e.snapshot_json", _COMPACT_KEYS)
+        frozen_sql = _json_projection("w.value", _COMPACT_KEYS)
+        # Numeric vectors are small. For legacy whole-candidate vectors, select
+        # just the fields from which the numeric signal-time vector is derived.
+        feature_sql = ("CASE WHEN json_type(e.features_json,'$.v11Inputs')='object' "
+                       "OR json_type(e.features_json,'$.factorScores')='object' THEN "
+                       + _json_projection("e.features_json", (
+                           "v11Inputs", "factorScores", "earlyScore", "mainRiseScore", "finalScore",
+                           "distributionRisk", "dataConfidence")) + " ELSE e.features_json END")
+        items = []
+        with self._connect() as db:
+            runs = db.execute(
+                "SELECT r.run_id,r.slot,r.as_of,r.trading_day,r.official,r.version,r.status "
+                "FROM signal_runs r" + clause + " ORDER BY r.as_of DESC LIMIT ?", (*args, limit)).fetchall()
+            for run in runs:
+                frozen_rows = db.execute(
+                    "SELECT x.key queue," + frozen_sql + " payload FROM signal_runs r,"
+                    "json_each(json_extract(r.scan_json,'$.result.nextDayWatchlist',"
+                    "'$.result.nextDayContinuationWatchlist')) x,json_each(x.value) w WHERE r.run_id=?",
+                    (run["run_id"],)).fetchall()
+                frozen, next_day, continuation = {}, set(), set()
+                for row in frozen_rows:
+                    candidate = {key: value for key, value in json.loads(row["payload"]).items() if value is not None}
+                    if code := _code(candidate.get("code")):
+                        frozen[code] = candidate
+                        (continuation if row["queue"] == 1 else next_day).add(code)
+                event_where, event_args = ["e.run_id=?"], [run["run_id"]]
+                if code_filter:
+                    event_where.append("e.code=?")
+                    event_args.append(code_filter)
+                if not include_controls:
+                    chosen = sorted(next_day | continuation)
+                    watch_clause = " OR e.code IN (" + ",".join("?" for _ in chosen) + ")" if chosen else ""
+                    event_where.append("(e.selected=1 OR json_extract(e.snapshot_json,'$.nextDaySignal.selected')=1"
+                                       + watch_clause + ")")
+                    event_args.extend(chosen)
+                events = db.execute(
+                    "SELECT e.signal_id,e.code,e.name,e.selected,e.decision_at,e.source_time,e.signal_price,"
+                    "e.review_status,e.training_eligible,e.review_eligible," + snapshot_sql + " snapshot_json,"
+                    + feature_sql + " features_json FROM signal_events e WHERE " + " AND ".join(event_where)
+                    + " ORDER BY e.selected DESC,e.decision_at,e.code", event_args).fetchall()
+                signals = []
+                for event in events:
+                    snapshot = {key: value for key, value in json.loads(event["snapshot_json"]).items() if value is not None}
+                    if "nextDaySignal" not in snapshot and frozen.get(event["code"], {}).get("nextDaySignal"):
+                        snapshot["nextDaySignal"] = frozen[event["code"]]["nextDaySignal"]
+                    signal = snapshot.get("nextDaySignal") or {}
+                    recorded = signal.get("selected") is True
+                    watch = event["code"] in next_day or recorded and signal.get("queue") != "continuation"
+                    follow = event["code"] in continuation or recorded and signal.get("queue") == "continuation"
+                    if (watch or follow) and signal:
+                        snapshot["nextDaySignal"] = {**signal, "selected": True}
+                    signals.append({"signalId": event["signal_id"], "code": event["code"], "name": event["name"],
+                        "selected": bool(event["selected"]), "decisionAt": event["decision_at"],
+                        "nextDaySelected": bool(watch), "nextDayContinuationSelected": bool(follow),
+                        "recommendationKinds": (["execution"] if event["selected"] else [])
+                            + (["next_day_watch"] if watch else []) + (["next_day_continuation"] if follow else []),
+                        "sourceTime": event["source_time"], "signalPrice": event["signal_price"],
+                        "firstTradablePrice": None, "reviewStatus": event["review_status"],
+                        "trainingEligible": bool(event["training_eligible"]), "reviewEligible": bool(event["review_eligible"]),
+                        "features": _compact_features(json.loads(event["features_json"])),
+                        "reason": snapshot.get("selectionReasons") or [], "snapshot": snapshot})
+                recorded_codes = {row[0] for row in db.execute("SELECT code FROM signal_events WHERE run_id=?", (run["run_id"],))}
+                for code in sorted((next_day | continuation) - recorded_codes):
+                    if code_filter and code != code_filter:
+                        continue
+                    candidate = frozen[code]
+                    signals.append({"signalId": sha256(f"{run['run_id']}:{code}".encode()).hexdigest()[:32],
+                        "code": code, "name": str(candidate.get("name") or code), "selected": False,
+                        "nextDaySelected": code in next_day, "nextDayContinuationSelected": code in continuation,
+                        "recommendationKinds": (["next_day_watch"] if code in next_day else [])
+                            + (["next_day_continuation"] if code in continuation else []),
+                        "decisionAt": candidate.get("decision_at") or run["as_of"], "sourceTime": _source_time(candidate),
+                        "signalPrice": _number(candidate.get("signalPrice") or candidate.get("referencePrice"), positive=True),
+                        "firstTradablePrice": None, "reviewStatus": "observation_only", "trainingEligible": False,
+                        "reviewEligible": False, "features": _feature_values(candidate),
+                        "reason": candidate.get("selectionReasons") or [], "snapshot": candidate,
+                        "ledgerRecordOrigin": "saved_scan_projection"})
+                items.append({"runId": run["run_id"], "slot": run["slot"], "asOf": run["as_of"],
+                    "tradingDay": run["trading_day"], "official": bool(run["official"]), "modelVersion": run["version"],
+                    "status": run["status"], "signals": signals, "scan": {"status": run["status"],
+                        "selectedCodes": [row["code"] for row in signals if row["selected"]],
+                        "nextDaySelectedCodes": sorted(next_day), "nextDayContinuationSelectedCodes": sorted(continuation)}})
+        return {"items": items, "count": len(items), "compact": True}
 
     def reviews(self, filters: Mapping[str, Any] | None = None) -> dict[str, Any]:
         filters = dict(filters or {})
@@ -672,9 +904,11 @@ class SignalLearningService:
         return [value for _, value in sorted(normalize_bars(rows, cutoff).items())]
 
     def _simulate_event(self, event: Mapping[str, Any], horizon: int, as_of: datetime,
-                        cached_bars: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+                        cached_bars: dict[str, list[dict[str, Any]]],
+                        sessions: list[date] | None = None) -> dict[str, Any] | None:
         decision = max(_at(event["decision_at"]), _at(event["published_at"]))
-        sessions = self._sessions(self.calendar_provider, decision.date(), as_of.date())
+        if sessions is None:
+            sessions = self._sessions(self.calendar_provider, decision.date(), as_of.date())
         if decision.date() not in sessions:
             return None
         index = sessions.index(decision.date())
@@ -816,9 +1050,16 @@ class SignalLearningService:
         if bar.get("no_price_limit") or bar.get("corporate_action"):
             return {**base, "reason": "price_limit_or_corporate_action_unverifiable"}
         proposed = round(bar["open"] * (1 + self.execution_config.slippage_bps / 10000), 2)
-        min_lot, lot_step = _lot(event["code"])
-        budget = self.execution_config.initial_cash * self.execution_config.position_weight
-        quantity = min_lot + max(0, int((budget / proposed - min_lot) // lot_step)) * lot_step
+        cap = _number(snapshot.get('portfolioWeight'))
+        cap = min(self.execution_config.position_weight, max(0., cap)) if cap is not None else self.execution_config.position_weight
+        budget = self.execution_config.initial_cash * cap
+        quantity, _ = _quantity_with_fees(event['code'], proposed, budget, decision.date(), self.execution_config)
+        details.update(labelPositionCap=cap,labelQuantity=quantity,labelBudget=budget,
+                       labelSizingPolicy='frozen_single_name_cap_including_buy_fee')
+        base['details_json'] = _json(details)
+        if _number(bar.get('volume_shares')) is None:
+            return {**base,'status':'pending_data','reason':'entry_volume_unknown',
+                    'fill_status':'unknown'}
         if (bar.get("suspended") is True or not _number(bar.get("volume_shares"), positive=True)
                 or bar["open"] >= up_limit - 0.005
                 or proposed > min(bar["high"], up_limit) + 1e-8
@@ -912,25 +1153,56 @@ class SignalLearningService:
                                        "deferredExitSessions": sessions.index(exit_day) - (index + horizon)})}
 
     def review_due(self, as_of: datetime | str) -> dict[str, Any]:
-        """Mature each official label only after that horizon's complete trading day."""
+        """Checkpoint each stock outside slow I/O; use one frozen calendar per pass."""
         timestamp = _at(as_of)
-        cache: dict[str, list[dict[str, Any]]] = {}
+        cache = _ReviewBarCache()
         changed: list[dict[str, Any]] = []
+        waiting = calendar_gaps = 0
+        outcomes = defaultdict(dict)
         with self._connect() as db:
             events = db.execute(
-                "SELECT e.*, r.trading_day, r.created_at published_at "
+                "SELECT e.signal_id,e.code,e.name,e.selected,e.decision_at,e.source_time,e.signal_price,"
+                "e.review_status," + _json_projection("e.snapshot_json", ("quote", "tradability", "portfolioWeight", "portfolioPolicy"))
+                + " snapshot_json,r.version,r.trading_day,r.created_at published_at "
                 "FROM signal_events e JOIN signal_runs r ON r.run_id=e.run_id "
-                "WHERE e.review_eligible=1 AND r.trading_day<=? ORDER BY r.trading_day,e.decision_at",
+                "WHERE e.review_eligible=1 AND r.trading_day<=? ORDER BY e.selected DESC,e.code,r.trading_day,e.decision_at",
                 (timestamp.date().isoformat(),),
             ).fetchall()
-            for event in events:
-                for horizon in HORIZONS:
-                    old = db.execute("SELECT status,reason,details_json FROM signal_outcomes WHERE signal_id=? AND horizon=?",
-                                     (event["signal_id"], horizon)).fetchone()
-                    if old and old["status"] in {"mature", "no_fill", "unverified"} and not _needs_observation(old):
-                        continue
-                    result = self._simulate_event(event, horizon, timestamp, cache)
-                    if result is None:
+            for row in db.execute("SELECT signal_id,horizon,status,reason,details_json FROM signal_outcomes"):
+                outcomes[row["signal_id"]][row["horizon"]] = row
+        earliest = min((max(_at(row["decision_at"]), _at(row["published_at"])).date() for row in events),
+                       default=timestamp.date())
+        sessions = self._sessions(self.calendar_provider, earliest, timestamp.date())
+        for event in events:
+            results = []
+            for horizon in HORIZONS:
+                old = outcomes[event["signal_id"]].get(horizon)
+                if old and old["status"] in {"mature", "no_fill", "unverified"} and not _needs_observation(old):
+                    continue
+                result = self._simulate_event(event, horizon, timestamp, cache, sessions)
+                if result is None:
+                    decision_day = max(_at(event["decision_at"]), _at(event["published_at"])).date()
+                    if decision_day not in sessions:
+                        calendar_gaps += 1
+                    else:
+                        waiting += 1
+                    continue
+                details = json.loads(result['details_json'])
+                target_at = result.get('exit_at') or (details.get('targetDay') or '') + 'T15:01:00+08:00'
+                if details.get('targetDay') or result.get('exit_at'):
+                    details['dataLineage'] = self._label_lineage(event['code'], event['decision_at'], target_at,sessions=sessions)
+                    result['details_json'] = _json(details)
+                results.append((horizon, result))
+            if not results:
+                continue
+            # The fetcher, calendar and simulation never run under a write lock.
+            # Commit this event's horizons before moving to the next stock, so
+            # interruption preserves the reviews already completed.
+            with self._connect() as db:
+                for horizon, result in results:
+                    latest = db.execute("SELECT status,reason,details_json FROM signal_outcomes "
+                                        "WHERE signal_id=? AND horizon=?", (event["signal_id"], horizon)).fetchone()
+                    if latest and latest["status"] in {"mature", "no_fill", "unverified"} and not _needs_observation(latest):
                         continue
                     db.execute(
                         "INSERT INTO signal_outcomes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
@@ -946,19 +1218,8 @@ class SignalLearningService:
                          result["mfe"], result["mae"], result["reason"], timestamp.isoformat(),
                          result["details_json"]),
                     )
-                    changed.append({"signalId": event["signal_id"], "code": event["code"],
-                                    "signalDate": event["trading_day"], "horizon": horizon,
-                                    "modelVersion": LEDGER_VERSION,
-                                    "status": result["status"], "fillStatus": result["fill_status"],
-                                    "evidenceGrade": result["evidence_grade"],
-                                    "entryAt": result["entry_at"], "entryPrice": result["entry_price"],
-                                    "exitAt": result["exit_at"], "exitPrice": result["exit_price"],
-                                    "simulatedNetReturn": result["simulated_net_return"],
-                                    "mfe": result["mfe"], "mae": result["mae"],
-                                    "observedReturn": json.loads(result["details_json"]).get("observedReturn"),
-                                    "observedMfe": json.loads(result["details_json"]).get("observedMfe"),
-                                    "observedMae": json.loads(result["details_json"]).get("observedMae"),
-                                    "reason": result["reason"], "reviewedAt": timestamp.isoformat()})
+                    changed.append(self._outcome_dict({**dict(event), **result, "horizon": horizon,
+                                                      "reviewed_at": timestamp.isoformat()}))
                 states = [row[0] for row in db.execute(
                     "SELECT status FROM signal_outcomes WHERE signal_id=? ORDER BY horizon", (event["signal_id"],))]
                 review_status = ("mature" if len(states) == 3 and all(state == "mature" for state in states)
@@ -969,75 +1230,63 @@ class SignalLearningService:
         from .next_day_watch import review_next_day_signals
         next_day = review_next_day_signals(self, timestamp, cache)
         return {"items": changed, "updated": len(changed), "asOf": timestamp.isoformat(),
-                "nextDayReview": next_day}
+                "nextDayReview": next_day, "statusCounts": dict(Counter(row["status"] for row in changed)),
+                "waitingHorizons": waiting, "calendarUnavailableHorizons": calendar_gaps,
+                "scope": "按交易日历分别结算T+1/T+3/T+5；缺数据保持待补，无法成交保持原拒绝；不改变历史训练资格"}
 
     def _dataset(self, as_of: datetime, *, dedupe: bool = True) -> list[dict[str, Any]]:
-        """Point-in-time signals; no-fill remains a zero-return cash decision."""
+        """Primary labels are T+1; unrelated T+3/T+5 maturity cannot delay them."""
+        from .local_algorithm import algorithm_contract
         with self._connect() as db:
             rows = db.execute(
-                "SELECT e.*,r.trading_day,r.slot,r.version scan_version,o1.status h1,o3.status h3,o5.status h5,"
-                "o5.simulated_net_return net,o5.mfe mfe,o5.mae mae,o5.exit_at exit_at,"
-                "o5.entry_at entry_at,o5.entry_price entry_price,o5.exit_price exit_price,"
-                "o5.details_json details_json,o1.exit_at h1_exit_at,o3.exit_at h3_exit_at,"
-                "o1.reviewed_at h1_reviewed_at,o3.reviewed_at h3_reviewed_at,o5.reviewed_at h5_reviewed_at "
+                "SELECT e.*,r.trading_day,r.slot,r.version scan_version,o.status outcome_status,"
+                "o.simulated_net_return net,o.mfe mfe,o.mae mae,o.exit_at exit_at,"
+                "o.entry_at entry_at,o.entry_price entry_price,o.exit_price exit_price,"
+                "o.details_json details_json,o.reviewed_at label_known_at "
                 "FROM signal_events e JOIN signal_runs r ON r.run_id=e.run_id "
-                "JOIN signal_outcomes o1 ON o1.signal_id=e.signal_id AND o1.horizon=1 "
-                "JOIN signal_outcomes o3 ON o3.signal_id=e.signal_id AND o3.horizon=3 "
-                "JOIN signal_outcomes o5 ON o5.signal_id=e.signal_id AND o5.horizon=5 "
+                "JOIN signal_outcomes o ON o.signal_id=e.signal_id AND o.horizon=1 "
                 "WHERE e.training_eligible=1 AND r.trading_day<=? "
-                "ORDER BY r.trading_day,e.code,e.selected DESC,e.decision_at",
-                (as_of.date().isoformat(),),
-            ).fetchall()
-        result, seen = [], set()
-        from .local_algorithm import algorithm_contract
+                "AND json_extract(e.snapshot_json,'$.algorithmContractId')=? "
+                "ORDER BY r.trading_day,e.code,e.decision_at,e.selected DESC",
+                (as_of.date().isoformat(),algorithm_contract()['contractId'])).fetchall()
         contract = algorithm_contract()
+        result, seen = [], set()
         for row in rows:
-            try:
-                snapshot = json.loads(row["snapshot_json"])
-            except (TypeError, ValueError):
+            snapshot = json.loads(row['snapshot_json'])
+            if row['scan_version'] != contract['scoreVersion'] or not _current_entry_eligible(snapshot):
                 continue
-            if row["scan_version"] != contract["scoreVersion"] or not _current_entry_eligible(snapshot):
-                continue
-            key = (row["trading_day"], row["code"])
+            key = (row['trading_day'], row['code'])
             if dedupe and key in seen:
                 continue
-            states = (row["h1"], row["h3"], row["h5"])
-            if any(state not in {"mature", "no_fill"} for state in states):
+            if row['outcome_status'] not in {'mature', 'no_fill'}:
                 continue
-            features = json.loads(row["features_json"])
-            if not features or row["h5"] == "mature" and row["net"] is None:
+            details = json.loads(row['details_json'])
+            filled = row['outcome_status'] == 'mature'
+            if filled and (row['net'] is None or not details.get('dailyCloseMarks')):
                 continue
-            details = json.loads(row["details_json"])
-            if row["h5"] == "mature" and not details.get("dailyCloseMarks"):
+            target = details.get('targetDay')
+            label_end = row['exit_at'] or (datetime.combine(date.fromisoformat(target), time(15,1), TZ).isoformat() if target else None)
+            if not label_end or _at(label_end) > as_of or _at(row['label_known_at']) > as_of:
                 continue
-            target_day = details.get("targetDay")
-            label_ends = [value for value in (row["h1_exit_at"], row["h3_exit_at"], row["exit_at"]) if value]
-            if target_day:
-                label_ends.append(datetime.combine(date.fromisoformat(target_day), time(15, 1), TZ).isoformat())
-            if not label_ends:
-                continue
-            label_end = max(_at(value) for value in label_ends)
-            if label_end > as_of or any(_at(row[key]) > as_of for key in (
-                    "h1_reviewed_at", "h3_reviewed_at", "h5_reviewed_at")):
+            features = json.loads(row['features_json'])
+            if not features:
                 continue
             seen.add(key)
-            result.append({"day": row["trading_day"], "code": row["code"], "runId": row["run_id"],
-                           "signalId": row["signal_id"], "features": features,
-                           "net": float(row["net"] or 0.0), "filled": row["h5"] == "mature",
-                           "mfe": float(row["mfe"] or 0.0),
-                           "mae": float(row["mae"] or 0.0), "exitAt": row["exit_at"],
-                           "entryAt": row["entry_at"], "entryPrice": row["entry_price"],
-                           "exitPrice": row["exit_price"], "marks": details.get("dailyCloseMarks") or {},
-                           "entryMinuteVolume": details.get("entryMinuteVolume"),
-                           "exitMinuteVolume": details.get("exitMinuteVolume"),
-                           "labelEndAt": label_end.isoformat(),
-                           "deferredExitSessions": details.get("deferredExitSessions", 0),
-                           "selected": bool(row["selected"]), "decisionAt": row["decision_at"],
-                           "slot": row["slot"], "algorithmContractId": contract["contractId"],
-                           "entryEligibleAtSignal": True,
-                           "selectionRank": _number(snapshot.get("rank"), positive=True),
-                           "recordedRankScore": _number(snapshot.get("learningRankScore")),
-                           "rankingTieBreakOrder": _number(snapshot.get("rankingTieBreakOrder"))})
+            result.append({'day':row['trading_day'],'code':row['code'],'runId':row['run_id'],
+                'signalId':row['signal_id'],'features':features,'net':float(row['net']) if filled else 0.,
+                'filled':filled,'mfe':float(row['mfe'] or 0),'mae':float(row['mae'] or 0),
+                'exitAt':row['exit_at'],'entryAt':row['entry_at'],'entryPrice':row['entry_price'],
+                'exitPrice':row['exit_price'],'marks':details.get('dailyCloseMarks') or {},
+                'entryMinuteVolume':details.get('entryMinuteVolume'),'exitMinuteVolume':details.get('exitMinuteVolume'),
+                'labelEndAt':label_end,'labelKnownAt':row['label_known_at'],
+                'deferredExitSessions':details.get('deferredExitSessions',0),'selected':bool(row['selected']),
+                'decisionAt':row['decision_at'],'slot':row['slot'],'algorithmContractId':contract['contractId'],
+                'entryEligibleAtSignal':True,'selectionRank':_number(snapshot.get('rank'),positive=True),
+                'recordedRankScore':_number(snapshot.get('learningRankScore')),
+                'rankingTieBreakOrder':_number(snapshot.get('rankingTieBreakOrder')),
+                'dataLineage':snapshot.get('dataLineage'),'labelDataLineage':details.get('dataLineage'),
+                'portfolioWeight':snapshot.get('portfolioWeight'),'portfolioPolicy':snapshot.get('portfolioPolicy'),
+                'portfolioWeightKind':snapshot.get('portfolioWeightKind')})
         return result
 
     def _registry(self) -> dict[str, Any]:
@@ -1056,78 +1305,13 @@ class SignalLearningService:
                 "ON CONFLICT(registry_key) DO UPDATE SET payload_json=excluded.payload_json,"
                 "updated_at=excluded.updated_at", (_json(registry), at.isoformat()))
 
+    @scoped_lineage_validation
     def learning_state(self, as_of: datetime | str | None = None) -> dict[str, Any]:
-        as_of = _at(as_of or self.clock())
-        samples = self._dataset(as_of)
-        registry = self._registry()
-        from .local_algorithm import algorithm_contract
-        contract = algorithm_contract()
-        effective_version, effective_source, fallback = "rules_v1.2", "rules", None
-        for key, source in (("championVersion", "champion"), ("rollbackVersion", "rollback")):
-            version = registry.get(key)
-            if not version:
-                continue
-            artifact = self._model_artifact(version, active_only=True)
-            if artifact is None:
-                fallback = "排序模型缺失、损坏或与当前算法契约不一致，使用可用后备排序"
-                continue
-            try:
-                # The median-feature row only verifies the frozen artifact can
-                # execute. It never becomes a signal, sample or reported return.
-                fingerprint = sha256(_json(artifact).encode()).hexdigest()
-                probe = _ARTIFACT_PROBES.get(fingerprint)
-                if probe is None or monotonic()-probe[0] >= 30:
-                    try:
-                        self._predict_artifact(artifact, [{"features": {}}])
-                    except Exception:
-                        _ARTIFACT_PROBES[fingerprint] = (monotonic(), False)
-                        raise
-                    if len(_ARTIFACT_PROBES) > 32:
-                        _ARTIFACT_PROBES.clear()
-                    _ARTIFACT_PROBES[fingerprint] = (monotonic(), True)
-                elif not probe[1]:
-                    raise ValueError("cached_artifact_probe_failed")
-            except Exception:
-                fallback = "排序模型执行校验失败，使用可用后备排序"
-                continue
-            effective_version, effective_source = version, source
-            break
-        valid_shadow = registry.get("shadowVersion") if self._model_artifact(registry.get("shadowVersion")) else None
-        validation_matches = registry.get("algorithmContractId") == contract["contractId"]
-        days = len({sample["day"] for sample in samples})
-        stage = ("active" if effective_source != "rules" else
-                 "shadow" if valid_shadow else "rules_cold_start")
-        reason = registry.get("reason")
-        if days < MIN_MATURE_DAYS or len(samples) < MIN_VALID_SAMPLES:
-            reason = (f"待积累独立成熟交易日/有效样本：{days}/{MIN_MATURE_DAYS} 天，"
-                      f"{len(samples)}/{MIN_VALID_SAMPLES} 条")
-        return {
-            "stage": stage, "championVersion": effective_version if effective_source != "rules" else None,
-            "shadowVersion": valid_shadow,
-            "algorithm": contract, "effectiveRankVersion": effective_version,
-            "effectiveRankSource": effective_source, "rankingFallbackReason": fallback,
-            "configuredChampionVersion": registry.get("championVersion"),
-            "configuredShadowVersion": registry.get("shadowVersion"),
-            "shadowDays": registry.get("shadowDays", 0) if valid_shadow and validation_matches else 0,
-            "shadowRequiredDays": SHADOW_DAYS,
-            "minimumHoldoutDays": MIN_HOLDOUT_DAYS, "minimumHoldoutCompletedTrades": MIN_HOLDOUT_TRADES,
-            "validationRequirements": {"holdout": {"independentSignalDays": MIN_HOLDOUT_DAYS,
-                "completedAccountTrades": MIN_HOLDOUT_TRADES},
-                "forwardShadow": {"independentSignalDays": SHADOW_DAYS},
-                "purge": "actual_label_end_before_next_split_and_minimum_five_session_gap"},
-            "matureDays": days, "validSamples": len(samples),
-            "minimumMatureDays": MIN_MATURE_DAYS, "minimumValidSamples": MIN_VALID_SAMPLES,
-            "gates": (registry.get("gates") or {}) if validation_matches else {},
-            "validationContractId": contract["contractId"] if validation_matches else None,
-            "historicalValidationAvailable": bool(registry.get("gates") and not validation_matches
-                                                  or (registry.get("priorValidation") or {}).get("gates")),
-            "lastTrainingAt": registry.get("lastTrainingAt"),
-            "reason": reason, "rollbackVersion": registry.get("rollbackVersion"),
-            "lastEvaluatedThrough": registry.get("lastEvaluatedThrough"),
-            "cohortAudit": registry.get("cohortAudit") if validation_matches else None,
-            "splitAudit": registry.get("splitAudit") if validation_matches else None,
-            "validationAttempts": len(registry.get("validationHistory") or []),
-        }
+        from .task_learning import TaskLearner, NEXT_DAY_TASK_ID
+        now = _at(as_of or self.clock())
+        states = [TaskLearner(self).state(now)] + [TaskLearner(self, NEXT_DAY_TASK_ID, queue).state(now)
+                    for queue in ('first_board', 'continuation')]
+        return {**states[0], 'taskStates': states}
 
     @staticmethod
     def _matrix(samples: list[dict[str, Any]], features: list[str], medians: list[float]) -> np.ndarray:
@@ -1139,9 +1323,9 @@ class SignalLearningService:
                      config: AccountConfig, calendar_days: list[str] | None = None) -> dict[str, Any]:
         """A daily marked account with five simultaneous positions and actual cash use.
 
-        A scan may attempt at most five signals. The official selected set is the
+        A scan may allocate at most five signals. The official selected set is the
         current rule/champion comparator; model alternatives rank the same scan
-        queue. A no-fill leaves its allocation in cash. A blocked T+5 sell keeps
+        queue. A no-fill leaves its allocation in cash. A blocked T+1 sell keeps
         its position until the first evidenced exit, including intraday exits.
         """
         if scores is not None and len(scores) != len(samples):
@@ -1183,7 +1367,7 @@ class SignalLearningService:
                 if not slots:
                     continue
                 pool = ([(score, item) for score, item in group if item["selected"]]
-                        if scores is None else group)
+                        if scores is None else [(score, item) for score, item in group if score > 0])
                 def selection_order(pair):
                     score, item = pair
                     tie = _number(item.get("rankingTieBreakOrder"))
@@ -1197,34 +1381,59 @@ class SignalLearningService:
                     # Calibrated percentiles often tie. Live sorting is stable
                     # over the original rules/evidence queue, frozen at scanning.
                     return (0, -score, tie, item["code"])
-                choices = sorted(pool, key=selection_order)[:slots]
+                choices = sorted(pool, key=selection_order)
+                allocated = 0
+                unfilled_reserved = 0.
+                unfilled_sectors = defaultdict(float)
                 for _, item in choices:
-                    attempts += 1
+                    if allocated >= slots:
+                        break
                     key = (day, item["code"])
                     if key in traded_codes or any(position["code"] == item["code"] for position in positions):
                         continue
-                    traded_codes.add(key)
-                    if not item["filled"]:
-                        continue
-                    if (not item["entryAt"] or not item["exitAt"] or item["entryAt"][:10] != day
+                    if item['filled'] and (not item["entryAt"] or not item["exitAt"] or item["entryAt"][:10] != day
                             or item["exitAt"][:10] not in item["marks"]):
                         return {"valid": False, "reason": "entry_exit_timestamp_missing"}
+                    policy = item.get('portfolioPolicy') or {}
+                    cap = _number(item.get('portfolioWeight'))
+                    cap = min(config.position_weight, cap) if cap is not None else config.position_weight
+                    total_cap = _number(policy.get('totalExposureCap'))
+                    industry_cap = _number(policy.get('maxIndustryWeight'))
+                    industry = policy.get('industry') or '__unknown__'
+                    # Do not use today's future close to size an intraday order.
+                    # Value existing holdings at their latest prior-day close or
+                    # entry proxy and preserve them across every scan in the day.
+                    def committed(position):
+                        prior = [key for key in position['marks'] if key < day]
+                        mark = position['marks'][max(prior)] if prior else position['entryPrice']
+                        return position['quantity'] * mark
+                    exposure = sum(committed(position) for position in positions)
+                    sector_exposure = sum(committed(position) for position in positions
+                                          if position.get('industry') == industry)
+                    allocation = min(cash, previous_nav * cap,
+                        max(0., previous_nav * (total_cap if total_cap is not None else 1.)-exposure-unfilled_reserved),
+                        max(0., previous_nav * (industry_cap if industry_cap is not None else 1.)-sector_exposure-unfilled_sectors[industry]))
+                    if allocation <= 0:
+                        continue
+                    # Allocate before examining the outcome: an evidenced
+                    # no-fill consumes this scan's planned slot and leaves cash.
+                    if not item['filled']:
+                        allocated += 1
+                        attempts += 1
+                        traded_codes.add(key)
+                        unfilled_reserved += allocation
+                        unfilled_sectors[industry] += allocation
+                        continue
                     entry_price = _number(item["entryPrice"], positive=True)
                     exit_price = _number(item["exitPrice"], positive=True)
                     if entry_price is None or exit_price is None:
                         return {"valid": False, "reason": "entry_exit_price_missing"}
-                    allocation = min(cash, previous_nav * config.position_weight)
-                    min_lot, step = _lot(item["code"])
-                    quantity = min_lot + max(0, int((allocation / entry_price - min_lot) // step)) * step
-                    if quantity < min_lot:
+                    quantity, fee = _quantity_with_fees(item['code'],entry_price,allocation,date.fromisoformat(day),config)
+                    if quantity <= 0 or quantity * entry_price + fee > cash:
                         continue
-                    fee = _fees(quantity * entry_price, "buy", date.fromisoformat(day), config)["total"]
-                    while quantity >= min_lot and quantity * entry_price + fee > allocation:
-                        quantity -= step
-                        fee = (_fees(quantity * entry_price, "buy", date.fromisoformat(day), config)["total"]
-                               if quantity >= min_lot else 0)
-                    if quantity < min_lot or quantity * entry_price + fee > cash:
-                        continue
+                    allocated += 1
+                    attempts += 1
+                    traded_codes.add(key)
                     volume = _number(item.get("entryMinuteVolume"), positive=True)
                     if volume is None or quantity > volume * 0.1:
                         return {"valid": False, "reason": "entry_participation_evidence_missing_or_exceeded"}
@@ -1234,7 +1443,8 @@ class SignalLearningService:
                     cash -= quantity * entry_price + fee
                     positions.append({"code": item["code"], "quantity": quantity,
                                       "exitAt": item["exitAt"], "exitPrice": exit_price,
-                                      "marks": item["marks"], "buyCost": quantity * entry_price + fee})
+                                      "marks": item["marks"], "buyCost": quantity * entry_price + fee,
+                                      "industry": industry, "entryPrice": entry_price})
                     trade_count += 1
             settle_due(datetime.combine(date.fromisoformat(day), time(15, 0), TZ))
             equity = cash
@@ -1296,10 +1506,12 @@ class SignalLearningService:
         indices = np.clip(indices, 0, len(returns) - 1)
         sampled_net = np.prod(1 + returns[indices], axis=1) - 1
         sampled_current = np.prod(1 + current_returns[indices], axis=1) - 1
+        sampled_baseline = np.prod(1 + extra['daily'][indices], axis=1) - 1
         net_lower = float(np.quantile(sampled_net, 0.05))
         advantage_lower = float(np.quantile(sampled_net - sampled_current, 0.05))
+        baseline_advantage_lower = float(np.quantile(sampled_net - sampled_baseline, 0.05))
         drawdown_ok = candidate["maxDrawdown"] <= current["maxDrawdown"] + 1e-12
-        passed = net_lower > 0 and advantage_lower > 0 and drawdown_ok
+        passed = net_lower > 0 and advantage_lower > 0 and baseline_advantage_lower > 0 and drawdown_ok
         periods = []
         for start in range(0, len(returns), SHADOW_DAYS):
             end = min(len(returns), start + SHADOW_DAYS)
@@ -1314,6 +1526,7 @@ class SignalLearningService:
             "currentPolicyAccountNet": current["net"],
             "logisticAccountNet": extra["net"],
             "net95Lower": net_lower, "advantage95Lower": advantage_lower,
+            "ridgeLogisticAdvantage95Lower": baseline_advantage_lower,
             "maxDrawdown": candidate["maxDrawdown"],
             "currentPolicyMaxDrawdown": current["maxDrawdown"],
             "drawdownNotWorse": bool(drawdown_ok), "filledPicks": candidate["filledPicks"],
@@ -1328,47 +1541,13 @@ class SignalLearningService:
 
     @staticmethod
     def _predict_artifact(artifact: Mapping[str, Any], samples: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarray]:
-        from lightgbm import Booster
-        x = SignalLearningService._matrix(samples, artifact["features"], artifact["medians"])
-        net = np.asarray(Booster(model_str=artifact["netRegressor"]).predict(x, num_threads=1), dtype=float)
-        mae = np.maximum(0.0, np.asarray(Booster(model_str=artifact["maeRegressor"])
-                                         .predict(x, num_threads=1), dtype=float))
-        utility = net - float(artifact["riskCoefficient"]) * mae
-        candidate = np.interp(utility, artifact["calibrationKnots"],
-                              artifact["calibrationPercentiles"]).astype(float)
-        z = (x - np.asarray(artifact["logisticMean"])) / np.asarray(artifact["logisticScale"])
-        linear = z @ np.asarray(artifact["logisticCoef"]) + float(artifact["logisticIntercept"])
-        baseline = 1 / (1 + np.exp(-np.clip(linear, -30, 30)))
-        if (len(candidate) != len(samples) or not np.all(np.isfinite(candidate))
-                or not np.all(np.isfinite(baseline)) or np.any(candidate < 0)
-                or np.any(candidate > 100)):
-            raise ValueError("model_prediction_invalid")
-        return candidate, baseline
+        from .task_learning import predict_model
+        result = predict_model(artifact, samples)
+        return result['rank'], result['baselineRank']
 
     def _model_artifact(self, version: str, *, active_only: bool = False) -> dict[str, Any] | None:
-        if not version:
-            return None
-        with self._connect() as db:
-            row = db.execute("SELECT artifact_json,stage,gates_json FROM model_versions WHERE version=?", (version,)).fetchone()
-        if not row:
-            return None
-        try:
-            artifact = json.loads(row[0])
-            from .local_algorithm import algorithm_contract
-            gates = json.loads(row[2])
-            if (row[1] not in ({"active"} if active_only else {"active", "shadow"})
-                    or not isinstance(gates, dict) or gates.get("passed") is not True
-                    or not isinstance(artifact, dict) or artifact.get("version") != version
-                    or artifact.get("executionModel") != MODEL_VERSION
-                    or artifact.get("algorithmContractId") != algorithm_contract()["contractId"]
-                    or not all(key in artifact for key in (
-                        "features", "medians", "netRegressor", "maeRegressor",
-                        "calibrationKnots", "calibrationPercentiles", "riskCoefficient",
-                        "logisticMean", "logisticScale", "logisticCoef", "logisticIntercept"))):
-                return None
-            return artifact
-        except (TypeError, ValueError):
-            return None
+        from .task_learning import load_artifact
+        return load_artifact(self, version, active_only)
 
     def _evaluation_days(self, as_of: datetime) -> list[str]:
         """Freeze the date cohort from recorded scans, never from surviving labels.
@@ -1381,7 +1560,7 @@ class SignalLearningService:
         contract = algorithm_contract()
         with self._connect() as db:
             rows = db.execute(
-                "SELECT trading_day,created_at,slot,status,scan_json FROM signal_runs "
+                "SELECT trading_day,created_at,slot,status,json_extract(scan_json,'$.algorithmContractId') contract_id FROM signal_runs "
                 "WHERE official=1 AND version=? AND trading_day<=? ORDER BY trading_day",
                 (contract["scoreVersion"], as_of.date().isoformat())).fetchall()
         recorded = set()
@@ -1392,7 +1571,7 @@ class SignalLearningService:
                                  "skipped_non_trading_day", "retired_slot", "audit_only"}:
                 continue
             try:
-                if json.loads(row["scan_json"]).get("algorithmContractId") == contract["contractId"]:
+                if row['contract_id'] == contract['contractId']:
                     recorded.add(row["trading_day"])
             except (ValueError, TypeError):
                 continue
@@ -1401,8 +1580,8 @@ class SignalLearningService:
         sessions = self._sessions(self.calendar_provider, date.fromisoformat(min(recorded)), as_of.date())
         result = []
         for index, day in enumerate(sessions):
-            if (day.isoformat() in recorded and index + max(HORIZONS) < len(sessions)
-                    and datetime.combine(sessions[index + max(HORIZONS)], time(15, 1), TZ) <= as_of):
+            if (day.isoformat() in recorded and index + 1 < len(sessions)
+                    and datetime.combine(sessions[index + 1], time(15, 1), TZ) <= as_of):
                 result.append(day.isoformat())
         return result
 
@@ -1430,7 +1609,7 @@ class SignalLearningService:
                 tuple(sorted(days)),
             ).fetchall()
             runs = db.execute(
-                f"SELECT trading_day,scan_json,version FROM signal_runs WHERE official=1 AND trading_day IN ({placeholders})",
+                f"SELECT trading_day,json_extract(scan_json,'$.algorithmContractId') contract_id,version FROM signal_runs WHERE official=1 AND trading_day IN ({placeholders})",
                 tuple(sorted(days))).fetchall()
         from .local_algorithm import algorithm_contract
         contract = algorithm_contract()
@@ -1438,7 +1617,7 @@ class SignalLearningService:
         for run in runs:
             try:
                 if (run["version"] == contract["scoreVersion"]
-                        and json.loads(run["scan_json"]).get("algorithmContractId") == contract["contractId"]):
+                        and run['contract_id'] == contract['contractId']):
                     recorded_days.add(run["trading_day"])
             except (TypeError, ValueError):
                 continue
@@ -1488,290 +1667,112 @@ class SignalLearningService:
         available = {day.isoformat() for day in sessions}
         return sorted(available) if sessions and required <= available else []
 
-    def train_and_evaluate(self, as_of: datetime | str | None = None) -> dict[str, Any]:
-        """Chronological, purged challenger gate; shadow and rollback are independent of old tiers."""
+    @scoped_lineage_validation
+    def train_and_evaluate(self, as_of: datetime | str | None = None, *, task_id=None, queue=None) -> dict[str, Any]:
+        from .task_learning import TaskLearner, NEXT_DAY_TASK_ID
         now = _at(as_of or self.clock())
-        samples = self._dataset(now)
-        all_samples = self._dataset(now, dedupe=False)
-        days = self._evaluation_days(now)
-        samples = [sample for sample in samples if sample["day"] in set(days)]
-        all_samples = [sample for sample in all_samples if sample["day"] in set(days)]
-        registry = self._registry()
-        from .local_algorithm import algorithm_contract
-        current_contract = algorithm_contract()["contractId"]
-        if registry.get("algorithmContractId") != current_contract:
-            # Preserve old audit results, but never relabel their pass/fail or
-            # returns as validation of newly changed rules or entry eligibility.
-            registry["priorValidation"] = {
-                "algorithmContractId": registry.get("algorithmContractId"),
-                "gates": registry.get("gates") or {},
-                "lastTrainingAt": registry.get("lastTrainingAt"),
-            }
-            registry.update(algorithmContractId=current_contract, gates={}, shadowDays=0)
-            registry.pop("lastCandidateTrainThrough", None)
-            registry.pop("lastEvaluatedThrough", None)
-        registry["lastTrainingAt"] = now.isoformat()
-        complete_cohort = self._complete_universe(set(days), all_samples) if days else False
-        registry["cohortAudit"] = {"frozenSignalDays": days,
-            "completedSignalCount": len(all_samples), "completeQueue": complete_cohort,
-            "cohortSource": "immutable_official_scan_ledger_not_surviving_outcomes",
-            "knownThrough": now.isoformat()}
-        if len(days) < MIN_MATURE_DAYS or len(samples) < MIN_VALID_SAMPLES:
-            registry["reason"] = "insufficient_independent_mature_days_or_samples"
-            self._save_registry(registry, now)
-            return self.learning_state(now)
-        if not complete_cohort:
-            registry["reason"] = "incomplete_frozen_cohort_pending_or_missing_outcomes"
-            self._save_registry(registry, now)
-            return self.learning_state(now)
-        active_version = registry.get("championVersion")
-        if active_version and self._model_artifact(active_version) is None:
-            prior = registry.get("rollbackVersion")
-            registry["championVersion"] = prior if self._model_artifact(prior) else None
-            registry["rollbackVersion"] = None
-            registry["activeAfterDay"] = now.date().isoformat()
-            registry["reason"] = "active_artifact_invalid_automatic_rollback"
-            self._save_registry(registry, now)
-            return self.learning_state(now)
-        if active_version and registry.get("lastEvaluatedThrough") != days[-1]:
-            artifact = self._model_artifact(active_version)
-            forward_days = sorted(day for day in days if day > registry.get("activeAfterDay", "9999"))
-            if artifact and len(forward_days) >= SHADOW_DAYS:
-                recent_days = set(forward_days[-SHADOW_DAYS:])
-                recent = [sample for sample in all_samples if sample["day"] in recent_days]
-                active_scores = self._forward_scores(active_version, recent)
-                if active_scores is None:
-                    gates = {"passed": False, "reason": "active_forward_predictions_missing"}
-                else:
-                    try:
-                        _, logistic_scores = self._predict_artifact(artifact, recent)
-                        rule_scores = np.asarray([float(item["features"].get("finalScore", 0))
-                                                  for item in recent], dtype=float)
-                        gates = self._gates(recent, active_scores, logistic_scores, seed=917,
-                                            config=self.execution_config,
-                                            complete_universe=self._complete_universe(recent_days, recent),
-                                            current_scores=rule_scores,
-                                            calendar_days=self._gate_calendar(recent, recent_days),
-                                            evaluation_days=sorted(recent_days), minimum_days=SHADOW_DAYS,
-                                            minimum_completed_trades=_VALIDATION["minimumShadowTrades"])
-                    except Exception:
-                        gates = {"passed": False, "reason": "active_prediction_or_nav_invalid"}
-                registry["gates"] = {**registry.get("gates", {}), "liveRolling": gates}
-                registry["lastEvaluatedThrough"] = days[-1]
-                if not gates["passed"]:
-                    registry["championVersion"] = registry.get("rollbackVersion")
-                    registry["rollbackVersion"] = None
-                    registry["activeAfterDay"] = now.date().isoformat()
-                    registry["reason"] = "active_gate_failed_automatic_rollback"
-                    with self._connect() as db:
-                        db.execute("UPDATE model_versions SET stage='rolled_back' WHERE version=?", (active_version,))
-                    self._save_registry(registry, now)
-                    return self.learning_state(now)
-        shadow_version = registry.get("shadowVersion")
-        if shadow_version:
-            artifact = self._model_artifact(shadow_version)
-            if artifact is None:
-                registry["shadowVersion"] = None
-                registry["shadowDays"] = 0
-                registry["reason"] = "shadow_artifact_invalid_rejected"
-                self._save_registry(registry, now)
-                return self.learning_state(now)
-            future_days = {day for day in days if day > registry.get("shadowAfterDay", "9999")}
-            future = [sample for sample in all_samples if sample["day"] in future_days]
-            shadow_days = len(future_days)
-            registry["shadowDays"] = shadow_days
-            if artifact and shadow_days >= SHADOW_DAYS:
-                candidate = self._forward_scores(shadow_version, future)
-                if candidate is None:
-                    gates = {"passed": False, "reason": "shadow_forward_predictions_missing"}
-                else:
-                    try:
-                        _, logistic = self._predict_artifact(artifact, future)
-                        gates = self._gates(future, candidate, logistic, seed=617,
-                                            config=self.execution_config,
-                                            complete_universe=self._complete_universe(future_days, future),
-                                            calendar_days=self._gate_calendar(future, future_days),
-                                            evaluation_days=sorted(future_days), minimum_days=SHADOW_DAYS,
-                                            minimum_completed_trades=_VALIDATION["minimumShadowTrades"])
-                    except Exception:
-                        gates = {"passed": False, "reason": "shadow_prediction_or_nav_invalid"}
-                registry["gates"] = {"holdout": registry.get("gates", {}).get("holdout"), "shadow": gates}
-                if gates["passed"]:
-                    registry["rollbackVersion"] = registry.get("championVersion")
-                    registry["championVersion"] = shadow_version
-                    registry["activeAfterDay"] = now.date().isoformat()
-                    registry["reason"] = "shadow_passed_promoted"
-                    with self._connect() as db:
-                        db.execute("UPDATE model_versions SET stage='active' WHERE version=?", (shadow_version,))
-                else:
-                    registry["reason"] = "shadow_failed_kept_rules_or_prior_champion"
-                    with self._connect() as db:
-                        db.execute("UPDATE model_versions SET stage='rejected' WHERE version=?", (shadow_version,))
-                registry["shadowVersion"] = None
-                registry["shadowDays"] = 0
-            else:
-                registry["reason"] = "shadow_collecting_forward_mature_days"
-            self._save_registry(registry, now)
-            return self.learning_state(now)
-        if registry.get("lastCandidateTrainThrough") == days[-1]:
-            self._save_registry(registry, now)
-            return self.learning_state(now)
-        # Reserve a real sixty-day untouched holdout even during cold start.
-        # With a longer history this converges to the previous 60/20/20 split.
-        test_start = len(days) - max(MIN_HOLDOUT_DAYS, math.ceil(len(days) * _VALIDATION["holdoutFraction"]))
-        calibration_start = min(int(test_start * _VALIDATION["preHoldoutTrainFraction"]),
-                                test_start - (_VALIDATION["minimumCalibrationDays"] + PURGE_DAYS))
-        train_days = set(days[:max(0, calibration_start - PURGE_DAYS)])
-        calibration_days = set(days[calibration_start:max(calibration_start, test_start - PURGE_DAYS)])
-        holdout_days = set(days[test_start:])
-        raw_train = [sample for sample in samples if sample["day"] in train_days]
-        raw_calibration = [sample for sample in samples if sample["day"] in calibration_days]
-        train = self._purge_before(raw_train, days[calibration_start])
-        calibration = self._purge_before(raw_calibration, days[test_start])
-        holdout = [sample for sample in all_samples if sample["day"] in holdout_days]
-        if (len(train) < _VALIDATION["minimumTrainSamples"]
-                or len({item["day"] for item in calibration}) < _VALIDATION["minimumCalibrationDays"]
-                or len(holdout_days) < MIN_HOLDOUT_DAYS):
-            registry["reason"] = "train_calibration_test_split_too_small"
-            self._save_registry(registry, now)
-            return self.learning_state(now)
-        registry["splitAudit"] = {
-            "trainDays": sorted(train_days), "calibrationDays": sorted(calibration_days),
-            "holdoutDays": sorted(holdout_days), "trainSamples": len(train),
-            "calibrationSamples": len(calibration), "holdoutSamples": len(holdout),
-            "purgedByActualLabelEnd": {"train": len(raw_train) - len(train),
-                                       "calibration": len(raw_calibration) - len(calibration)},
-            "holdoutSignalIds": sorted(sample["signalId"] for sample in holdout),
-            "minimumGapSessions": PURGE_DAYS, "splitPolicy": _VALIDATION["splitPolicy"]}
-        present = defaultdict(int)
-        for sample in train:
-            for key in sample["features"]:
-                present[key] += 1
-        features = sorted(key for key, count in present.items() if count >= len(train) * 0.6)
-        if not features:
-            registry["reason"] = "features_insufficient"
-            self._save_registry(registry, now)
-            return self.learning_state(now)
-        medians = [float(np.median([sample["features"][key] for sample in train
-                                    if key in sample["features"]])) for key in features]
-        x_train = self._matrix(train, features, medians)
-        x_calibration = self._matrix(calibration, features, medians)
-        x_test = self._matrix(holdout, features, medians)
-        target = np.asarray([sample["net"] > 0 for sample in train], dtype=int)
-        if len(set(target)) != 2:
-            registry["reason"] = "single_class_training_labels"
-            self._save_registry(registry, now)
-            return self.learning_state(now)
-        try:
-            from sklearn.linear_model import LogisticRegression
-            from sklearn.preprocessing import StandardScaler
-            from lightgbm import LGBMRegressor
-            scaler = StandardScaler().fit(x_train)
-            logistic = LogisticRegression(max_iter=500, class_weight="balanced", random_state=23)
-            logistic.fit(scaler.transform(x_train), target)
-            baseline_score = logistic.predict_proba(scaler.transform(x_test))[:, 1]
-            model_args = dict(n_estimators=80, num_leaves=7, min_child_samples=30,
-                              learning_rate=0.04, max_depth=4, random_state=23,
-                              verbosity=-1, n_jobs=1)
-            net_model = LGBMRegressor(**model_args).fit(
-                x_train, np.asarray([sample["net"] for sample in train], dtype=float))
-            risk_model = LGBMRegressor(**model_args).fit(
-                x_train, np.asarray([sample["mae"] for sample in train], dtype=float))
-            risk_coefficient = 1.0
-            cal_utility = (net_model.predict(x_calibration)
-                           - risk_coefficient * np.maximum(0.0, risk_model.predict(x_calibration)))
-            ordered_utility = np.sort(np.asarray(cal_utility, dtype=float))
-            if len(ordered_utility) < 2 or not np.all(np.isfinite(ordered_utility)):
-                raise ValueError("calibration_utility_invalid")
-            knots = np.unique(ordered_utility)
-            percentiles = (np.searchsorted(ordered_utility, knots, side="right")
-                           / len(ordered_utility) * 100).astype(float)
-            if len(knots) == 1:
-                knots = np.asarray([knots[0] - 1e-9, knots[0] + 1e-9])
-                percentiles = np.asarray([50.0, 50.0])
-            test_utility = (net_model.predict(x_test)
-                            - risk_coefficient * np.maximum(0.0, risk_model.predict(x_test)))
-            challenger_score = np.interp(test_utility, knots, percentiles)
-        except (ImportError, ValueError) as exc:
-            registry["reason"] = f"model_training_unavailable:{type(exc).__name__}"
-            self._save_registry(registry, now)
-            return self.learning_state(now)
-        gates = self._gates(holdout, challenger_score, baseline_score, seed=317,
-                            config=self.execution_config,
-                            complete_universe=self._complete_universe(holdout_days, holdout),
-                            calendar_days=self._gate_calendar(holdout, holdout_days),
-                            evaluation_days=sorted(holdout_days))
-        registry["lastCandidateTrainThrough"] = days[-1]
-        registry["gates"] = {"holdout": gates}
-        registry.setdefault("validationHistory", []).append({
-            "at": now.isoformat(), "contractId": current_contract, "gates": gates,
-            "splitAudit": registry["splitAudit"], "modelParameters": model_args,
-            "riskCoefficient": risk_coefficient})
-        if not gates["passed"]:
-            registry["reason"] = "challenger_holdout_gate_failed"
-            self._save_registry(registry, now)
-            return self.learning_state(now)
-        version = f"king-v1.2-lgbm-{now.strftime('%Y%m%d%H%M%S')}-{sha256(str(days[-1]).encode()).hexdigest()[:6]}"
-        artifact = {
-            "version": version, "features": features, "medians": medians,
-            "netRegressor": net_model.booster_.model_to_string(),
-            "maeRegressor": risk_model.booster_.model_to_string(),
-            "riskCoefficient": risk_coefficient,
-            "calibrationKnots": knots.tolist(),
-            "calibrationPercentiles": percentiles.tolist(),
-            "logisticCoef": logistic.coef_[0].tolist(),
-            "logisticIntercept": float(logistic.intercept_[0]),
-            "logisticMean": scaler.mean_.tolist(), "logisticScale": scaler.scale_.tolist(),
-            "trainedThrough": max(train_days), "calibrationThrough": max(calibration_days),
-            "holdoutThrough": days[-1], "purgeTradingDays": PURGE_DAYS,
-            "purgePolicy": _VALIDATION["purgePolicy"],
-            "validationRequirements": {"holdoutDays": MIN_HOLDOUT_DAYS,
-                "holdoutCompletedTrades": MIN_HOLDOUT_TRADES, "shadowDays": SHADOW_DAYS},
-            "rankMeaning": "net_return_minus_MAE_calibrated_percentile_not_probability",
-            "priceBasis": "unadjusted_minute_bar",
-            "executionModel": MODEL_VERSION,
-        }
-        from .local_algorithm import algorithm_contract
-        artifact["algorithmContractId"] = algorithm_contract()["contractId"]
-        with self._connect() as db:
-            db.execute("INSERT INTO model_versions VALUES(?,?,?,?,?)",
-                       (version, "shadow", _json(artifact), _json(gates), now.isoformat()))
-        registry["shadowVersion"] = version
-        # Forecasts cannot exist before this artifact did. Begin the next full
-        # official day, not at the latest already-mature signal date (T-5).
-        registry["shadowAfterDay"] = now.date().isoformat()
-        registry["shadowStartedAt"] = now.isoformat()
-        registry["shadowDays"] = 0
-        registry["reason"] = "holdout_passed_shadow_started"
-        self._save_registry(registry, now)
-        return self.learning_state(now)
+        if task_id is not None:
+            return TaskLearner(self, task_id, queue).train(now)
+        states = [TaskLearner(self).train(now)] + [TaskLearner(self, NEXT_DAY_TASK_ID, item).train(now)
+                  for item in ('first_board', 'continuation')]
+        return {**states[0], 'taskStates': states}
 
+    @scoped_lineage_validation
     def rank_candidates(self, candidates: Iterable[Mapping[str, Any]],
-                        as_of: datetime | str | None = None) -> list[dict[str, Any]]:
-        """Use only an active champion; otherwise keep the transparent V1.1 rule ranking."""
-        rows = [dict(candidate) for candidate in candidates]
+                        as_of: datetime | str | None = None, *, task_id=None, queue=None) -> list[dict[str, Any]]:
+        from .task_learning import TaskLearner, ENTRY_TASK_ID, NEXT_DAY_TASK_ID, predict_model, lineage_valid
+        if task_id == NEXT_DAY_TASK_ID:
+            return self.rank_next_day_candidates(candidates, as_of)
+        learner = TaskLearner(self, task_id or ENTRY_TASK_ID, queue)
+        artifact = learner.artifact(learner.registry())
+        rows = [dict(row) for row in candidates]
         for index, row in enumerate(rows):
-            row["rankingTieBreakOrder"] = index
-        registry = self._registry()
+            row['rankingTieBreakOrder'] = index
+            row['learningTaskContractId'] = learner.contract['taskContractId']
+            tainted = (row.get('dataLineage') or {}).get('status') == 'tainted'
+            row['learningRankVersion'] = 'rules_v1.2'
+            row['prediction'] = {'status':'data_rejected' if tainted else 'rules_unvalidated',
+                'taskId':learner.task_id,'expectedNetReturn':None,'bigMoveProbability':None,
+                'lowerReturnQuantile':None,'utility':None,'entryEligible':False if tainted else None,
+                'modelVersion':None,'probabilityMeaning':'T+1 simulated net return at least 5%; not an assured fill'}
         eligible = [row for row in rows if _current_entry_eligible(row)]
-        excluded = [row for row in rows if not _current_entry_eligible(row)]
-        for version in (registry.get("championVersion"), registry.get("rollbackVersion")):
-            artifact = self._model_artifact(version, active_only=True) if version else None
-            if artifact and eligible:
-                sample_rows = [{"features": _feature_values(row)} for row in eligible]
+        if artifact and eligible:
+            usable = [row for row in eligible if lineage_valid(self,row.get('dataLineage'))]
+            for row in eligible:
+                if row not in usable:
+                    row['prediction'].update(status='data_rejected',entryEligible=False)
+            if usable:
                 try:
-                    scores, _ = self._predict_artifact(artifact, sample_rows)
-                    if len(scores) != len(eligible) or not np.all(np.isfinite(scores)):
-                        raise ValueError("model_rank_invalid")
-                    for row, score in zip(eligible, scores):
-                        # Calibrated percentile ranking, never a main-rise probability.
-                        row["learningRankScore"] = float(score)
-                        row["learningRankVersion"] = version
-                    for row in excluded:
-                        row["learningRankVersion"] = "rules_v1.2"
-                    return sorted(eligible, key=lambda item: item["learningRankScore"], reverse=True) + excluded
-                except Exception:
-                    continue
+                    predictions = predict_model(artifact,[{'features':_feature_values(row)} for row in usable])
+                    for index,row in enumerate(usable):
+                        row['learningRankVersion'] = artifact['version']
+                        row['learningRankScore'] = float(predictions['rank'][index])
+                        row['prediction'].update(status='active',modelVersion=artifact['version'],
+                            expectedNetReturn=float(predictions['net'][index]),
+                            bigMoveProbability=float(predictions['probability'][index]),
+                            lowerReturnQuantile=float(predictions['tail'][index]),
+                            utility=float(predictions['utility'][index]),entryEligible=bool(predictions['eligible'][index]))
+                except (ValueError,KeyError,ImportError):
+                    for row in usable:
+                        row['prediction'].update(status='prediction_failed',entryEligible=False)
         for row in rows:
-            row["learningRankVersion"] = "rules_v1.2"
-        return sorted(rows, key=lambda item: _number(item.get("finalScore")) or -1e9, reverse=True)
+            row['learningDecision'] = {'selectionEligible':row['prediction']['entryEligible'],**row['prediction']}
+        eligible_ids = {id(row) for row in eligible}
+        def rank_value(row):
+            value = _number(row.get('learningRankScore'))
+            if value is None:
+                value = _number(row.get('finalScore'))
+            return value if value is not None else -1e9
+        return sorted(rows,key=lambda row:(id(row) not in eligible_ids,row['prediction']['entryEligible'] is False,
+            -rank_value(row)))
+
+    @scoped_lineage_validation
+    def rank_next_day_candidates(self, candidates, as_of=None):
+        from .task_learning import TaskLearner, NEXT_DAY_TASK_ID, predict_model, lineage_valid
+        rows = [{**row,'nextDaySignal':dict(row.get('nextDaySignal') or {})} for row in candidates]
+        for queue in ('first_board','continuation'):
+            learner = TaskLearner(self,NEXT_DAY_TASK_ID,queue)
+            artifact = learner.artifact(learner.registry())
+            group = [row for row in rows if row['nextDaySignal'].get('queue') == queue]
+            for row in group:
+                signal = row['nextDaySignal']
+                tainted = (row.get('dataLineage') or {}).get('status') == 'tainted'
+                signal.update(learningTaskId=NEXT_DAY_TASK_ID,learningTaskContractId=learner.contract['taskContractId'],
+                    learningRankVersion='next_day_rules_unvalidated',learningStatus='data_rejected' if tainted else 'rules_unvalidated',
+                    learningRankScore=signal.get('score'),probability=None,expectedPriceReturn=None,returnQ10=None,
+                    selectionEligible=not tainted,selected=False,
+                    probabilityMeaning='下一交易日收盘10%价格模式概率；非成交收益，非交易所已核实涨停')
+            if artifact and group:
+                usable = [row for row in group if lineage_valid(self,row.get('dataLineage'))]
+                for row in group:
+                    if row not in usable:
+                        row['nextDaySignal'].update(learningStatus='data_rejected',selectionEligible=False)
+                if usable:
+                    try:
+                        prediction = predict_model(artifact,[{'features':self._next_features(row)} for row in usable])
+                        for index,row in enumerate(usable):
+                            row['nextDaySignal'].update(learningStatus='active',learningRankVersion=artifact['version'],
+                                learningRankScore=float(prediction['rank'][index]),probability=float(prediction['probability'][index]),
+                                expectedPriceReturn=float(prediction['net'][index]),returnQ10=float(prediction['tail'][index]),
+                                selectionEligible=bool(prediction['eligible'][index]),utility=float(prediction['utility'][index]))
+                    except (ValueError,KeyError,ImportError):
+                        for row in usable:
+                            row['nextDaySignal'].update(learningStatus='prediction_failed',selectionEligible=False)
+        return sorted(rows,key=lambda row:(row['nextDaySignal'].get('queue',''),
+            row['nextDaySignal'].get('selectionEligible') is False,-float(row['nextDaySignal'].get('learningRankScore') or 0),row.get('code','')))
+
+    @staticmethod
+    def _next_features(candidate):
+        signal = candidate.get('nextDaySignal') or {}
+        features = _feature_values(candidate)
+        features.update({'next_'+key:float(value) for key,value in (signal.get('features') or {}).items()
+                         if _number(value) is not None})
+        features['ruleScore'] = _number(signal.get('score')) or 0.
+        return features
+
+    def _label_lineage(self, code, decision_at, target_at, *, sessions=None):
+        from .minute_history import read_archive_lineage
+        start,end = _at(decision_at).date(),_at(target_at).date()
+        days = ([day for day in sessions if start <= day <= end] if sessions is not None
+                else self._sessions(self.calendar_provider,start,end))
+        return read_archive_lineage(self.data_dir/'minute_history',code=code,days=[day.isoformat() for day in days],cutoff=target_at)

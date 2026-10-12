@@ -98,3 +98,42 @@ func TestPagedMACBarsPreserveTurnoverCalculation(t *testing.T) {
 		t.Fatalf("turnover lost: %v %v", result, err)
 	}
 }
+
+func TestMACReplyIdentityAndCursorMustMatchRequest(t *testing.T) {
+	good := proto.MACSymbolBarsReply{Market: 0, Code: "000692\x00", Period: 8, Start: 700}
+	if err := ValidateReply(&good, 0, "000692", 8, 700); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*proto.MACSymbolBarsReply){
+		func(r *proto.MACSymbolBarsReply) { r.Code = "001336" },
+		func(r *proto.MACSymbolBarsReply) { r.Market = 1 },
+		func(r *proto.MACSymbolBarsReply) { r.Period = 9 },
+		func(r *proto.MACSymbolBarsReply) { r.Start = 0 },
+	} {
+		reply := good
+		mutate(&reply)
+		if ValidateReply(&reply, 0, "000692", 8, 700) == nil {
+			t.Fatalf("accepted mismatched reply: %+v", reply)
+		}
+	}
+	if ValidateReply(nil, 0, "000692", 8, 0) == nil {
+		t.Fatal("accepted nil reply")
+	}
+}
+
+func TestMACPagesRejectConflictingOverlaps(t *testing.T) {
+	rows := fixture(3)
+	calls := 0
+	_, err := Collect(func(uint32, uint16) ([]proto.MACSymbolBar, error) {
+		calls++
+		if calls == 1 {
+			return rows[:2], nil
+		}
+		bad := rows[1]
+		bad.Close = 122.43
+		return []proto.MACSymbolBar{bad, rows[2]}, nil
+	}, 3, "")
+	if err == nil {
+		t.Fatal("accepted conflicting price at a repeated page timestamp")
+	}
+}

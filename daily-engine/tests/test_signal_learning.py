@@ -2,9 +2,19 @@
 from datetime import date, datetime, timedelta
 
 import numpy as np
+import pytest
 
 from src.services.yao_scout.signal_learning import SignalLearningService, TZ
 from src.services.yao_scout.local_algorithm import algorithm_contract
+
+
+@pytest.fixture(autouse=True)
+def verified_ledger_quality(monkeypatch):
+    """These are execution/ledger unit tests; quality is tested separately."""
+    original = SignalLearningService._learning_quality
+    monkeypatch.setattr(SignalLearningService,'_learning_quality',lambda self,candidate,published:
+        {'eligible':True,'qualityKnownAt':published.isoformat(),'checkedAt':published.isoformat(),'immutable':True})
+    return original
 
 
 def _clock(day: date, hour: int = 9, minute: int = 40, second: int = 35) -> datetime:
@@ -210,6 +220,7 @@ def test_corrupt_or_nonfinite_champion_falls_back_to_rule_rank(tmp_path, monkeyp
 
 
 def test_training_uses_separate_calibration_and_test_without_publishing(tmp_path, monkeypatch):
+    from src.services.yao_scout import task_learning
     training_at = _clock(date(2026, 12, 31), 15, 45)
     service = SignalLearningService(tmp_path, clock=lambda: training_at)
     start = date(2026, 1, 5)
@@ -218,39 +229,44 @@ def test_training_uses_separate_calibration_and_test_without_publishing(tmp_path
         day = (start + timedelta(days=index)).isoformat()
         for number in range(10):
             x = ((index * 7 + number * 13) % 31) / 30
-            net = 0.06 * x - 0.026 + 0.002 * ((index + number) % 3)
+            net = 0.18 * x - 0.075 + 0.002 * ((index + number) % 3)
             samples.append({"day": day, "code": f"{number:06d}",
                             "signalId": f"{day}:{number}",
-                            "labelEndAt": _clock(start + timedelta(days=index + 5), 15, 0).isoformat(),
+                            "labelEndAt": _clock(start + timedelta(days=index + 1), 15, 0).isoformat(),
+                            "labelKnownAt": _clock(start + timedelta(days=index + 1), 15, 30).isoformat(),
+                            "dataLineage": {}, "labelDataLineage": {},
+                            "portfolioWeight": .2, "portfolioPolicy": {'version':'test'},
                             "features": {"x": x, "finalScore": 60 + 20 * x},
                             "net": net, "mae": 0.02 + 0.03 * (1 - x),
                             "marks": {day: 10.0}})
     monkeypatch.setattr(service, "_dataset", lambda now, dedupe=True: samples)
     monkeypatch.setattr(service, "_evaluation_days", lambda now: sorted({sample["day"] for sample in samples}))
     monkeypatch.setattr(service, "_complete_universe", lambda days, rows: True)
-    observed = {}
+    monkeypatch.setattr(task_learning, "lineage_known_at", lambda *_: '2026-01-01T00:00:00+08:00')
+    observed = []
 
     def capture(test, challenger, logistic, **kwargs):
-        observed["test_days"] = len({item["day"] for item in test})
-        observed["calibrated_range"] = (float(min(challenger)), float(max(challenger)))
-        observed["logistic_finite"] = bool(np.all(np.isfinite(logistic)))
-        return {"passed": False, "reason": "test_gate_rejected"}
+        observed.append({'test_days':len({item['day'] for item in test}),
+            'calibrated_range':(float(min(challenger)),float(max(challenger))),
+            'logistic_finite':bool(np.all(np.isfinite(logistic)))})
+        return {"passed": len(observed) == 1, "reason": "test_gate_rejected"}
 
     monkeypatch.setattr(service, "_gates", capture)
     state = service.train_and_evaluate(training_at)
-    assert observed["test_days"] == 60
-    assert 0 <= observed["calibrated_range"][0] <= observed["calibrated_range"][1] <= 100
-    assert observed["logistic_finite"]
+    assert len(observed) == 2  # complete 60-day rolling development then 60-day sealed holdout
+    assert all(item['test_days'] == 60 for item in observed)
+    assert all(0 <= item['calibrated_range'][0] <= item['calibrated_range'][1] <= 100 for item in observed)
+    assert all(item['logistic_finite'] for item in observed)
     assert state["shadowVersion"] is None and state["championVersion"] is None
     assert state["reason"] == "challenger_holdout_gate_failed"
     registry = service._registry()
-    registry.pop("lastCandidateTrainThrough")
-    service._save_registry(registry, training_at)
+    assert registry['lastFitCompletedAt'] == training_at.isoformat()
+    assert len(registry['splitAudit']['developmentFolds']) == 3
+    assert all(len(fold['testDays']) == 20 for fold in registry['splitAudit']['developmentFolds'])
     monkeypatch.setattr(service, "_gates", lambda *args, **kwargs: {"passed": True})
     state = service.train_and_evaluate(training_at)
-    assert state["shadowVersion"] and state["championVersion"] is None
-    assert service._registry()["shadowAfterDay"] == training_at.date().isoformat()
-    assert service._registry()["shadowStartedAt"] == training_at.isoformat()
+    assert state['reason'] == 'sealed_holdout_already_observed_wait_for_new_holdout'
+    assert state['shadowVersion'] is None and state['championVersion'] is None
 
 
 def test_blocked_exit_keeps_loss_and_retries_first_legal_minute(tmp_path):
@@ -275,7 +291,8 @@ def test_blocked_exit_keeps_loss_and_retries_first_legal_minute(tmp_path):
     assert blocked["status"] == "exit_blocked"
     assert blocked["positionOpen"] and blocked["simulatedNetReturn"] is None
     assert blocked["unrealizedPriceReturn"] < 0 and blocked["mae"] > .06
-    assert not service._dataset(_clock(days[5], 15, 30))
+    primary = service._dataset(_clock(days[5], 15, 30))
+    assert primary and primary[0]['labelEndAt'][:10] == days[1].isoformat()
     # A missing first minute cannot be skipped in favor of a later good price.
     first = next(bar for bar in bars if bar["end"] == _clock(days[6], 9, 31, 0).isoformat())
     bars.remove(first)
@@ -289,8 +306,9 @@ def test_blocked_exit_keeps_loss_and_retries_first_legal_minute(tmp_path):
     assert completed["status"] == "mature" and completed["simulatedNetReturn"] < 0
     assert completed["exitAt"] == _clock(days[6], 9, 31, 0).isoformat()
     assert completed["deferredExitSessions"] == 1
-    assert service._dataset(_clock(days[6], 15, 31))[0]["labelEndAt"] == completed["exitAt"]
-    assert not service._dataset(_clock(days[5], 15, 31))  # no future labels in an earlier replay
+    assert service._dataset(_clock(days[6], 15, 31))[0]['labelEndAt'] == primary[0]['labelEndAt']
+    assert service._dataset(_clock(days[5], 15, 31))[0]['labelEndAt'] == primary[0]['labelEndAt']
+    assert not service._dataset(_clock(days[1], 15, 31))  # review was only known on day 5
 
 
 def test_frozen_validation_dates_keep_days_with_all_outcomes_missing_and_cash_days(tmp_path):

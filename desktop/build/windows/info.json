@@ -1,12 +1,12 @@
 {
   "fixed": {
-    "file_version": "2.6.3.0",
-    "product_version": "2.6.3.0"
+    "file_version": "2.7.0.0",
+    "product_version": "2.7.0.0"
   },
   "info": {
     "0409": {
-      "FileVersion": "2.6.3.0",
-      "ProductVersion": "2.6.3",
+      "FileVersion": "2.7.0.0",
+      "ProductVersion": "2.7.0",
       "CompanyName": "Stock King",
       "FileDescription": "Stock King",
       "LegalCopyright": "Based on go-stock (GPL-3.0) and Daily Stock Analysis (MIT)",

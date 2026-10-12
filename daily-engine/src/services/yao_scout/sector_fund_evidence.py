@@ -20,7 +20,7 @@ import requests
 from src.patches.eastmoney_patch import original_request
 
 from .intraday_evidence import _datetime, SHANGHAI
-from .minute_history import fetch_recent_bars, normalize_bars, window, number, bounded_fetch_map
+from .minute_history import MinuteArchive, fetch_recent_bars, normalize_bars, window, number, bounded_fetch_map
 
 BASE = 'https://push2.eastmoney.com/api/qt/'
 HEADERS = {'User-Agent':'Mozilla/5.0','Referer':'https://quote.eastmoney.com/'}
@@ -194,7 +194,7 @@ def discover_sina_sectors(codes, cutoff, cache_dir, *, getter=None, deadline=Non
 
 def compute_sector_evidence(code, stock_minutes, sector, peers, minute_rows, cutoff):
     provider=sector.get('provider','Eastmoney') if sector else 'unknown'
-    result = {'metrics':{},'source':provider+'行业成分 + Sina同刻1分钟K线', 'asOf':None,
+    result = {'metrics':{},'source':provider+'行业成分 + 已核验代码的同刻1分钟K线', 'asOf':None,
               'sector':sector, 'gaps':[], 'scope':provider+'主行业；全部沪深成分，候选股自身从板块统计剔除',
               'coverageRequiredPct':80, 'minimumPeers':3}
     try:
@@ -260,22 +260,46 @@ def prepare_sector_membership(codes, cutoff, cache_dir, *, getter=None, timeout=
     return membership, peers
 
 
-def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_fetcher=None, prepared=None, timeout=20):
-    deadline = monotonic() + max(0, timeout)
+def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_fetcher=None, prepared=None, timeout=20, deadline=None):
+    deadline = min(deadline, monotonic()+max(0,timeout)) if deadline is not None else monotonic()+max(0,timeout)
     try:
-        membership, boards = prepared or prepare_sector_membership(codes,cutoff,cache_dir,getter=getter,timeout=timeout)
+        membership, boards = prepared or prepare_sector_membership(codes,cutoff,cache_dir,getter=getter,
+                                                                   timeout=max(0,deadline-monotonic()))
     except Exception as exc:
         return {code:{'metrics':{},'gaps':['板块成员源读取失败：'+type(exc).__name__]} for code in codes}
     all_codes = sorted({code for members in boards.values() for code in members})
+    archive = MinuteArchive(Path(cache_dir)/'minute_history') if bar_fetcher is None else None
+    requested_ends = {}
+    for code in codes:
+        try:
+            end = _datetime(intraday[code]['asOf'])
+        except (KeyError, ValueError, TypeError):
+            continue
+        for peer in boards.get(membership.get(code,{}).get('code'),[]):
+            requested_ends.setdefault(peer, set()).add(end)
+    def sufficient(code, bars):
+        normalized = normalize_bars(bars, cutoff)
+        ends = requested_ends.get(code) or {_datetime(cutoff)}
+        return all(window(normalized, end, 6) for end in ends)
     def get_minutes(code):
         try:
             if bar_fetcher is None:
                 with _recent_sector_lock:
                     saved = _recent_sector_bars.get(code)
-                    if saved and 0 <= monotonic()-saved[0] < 10:
+                    if saved and 0 <= monotonic()-saved[0] < 10 and sufficient(code, saved[1]):
                         return code, saved[1]
-            bars = (bar_fetcher or fetch_recent_bars)(code,count=20)
+                cached = archive.read_recent(code, cutoff, minutes=20)
+                if sufficient(code, cached):
+                    return code, cached
+            if monotonic() >= deadline:
+                return code, []
+            bars = (bar_fetcher(code,count=20) if bar_fetcher is not None else
+                    fetch_recent_bars(code,count=20,cutoff=cutoff,deadline=deadline))
             if bar_fetcher is None:
+                # Route fresh peers through the same quarantine rules as stock
+                # evidence. Unverified is observable; tainted sessions are not.
+                archive.save(code,bars,cutoff)
+                bars = archive.read_recent(code,cutoff,minutes=20)
                 with _recent_sector_lock:
                     if len(_recent_sector_bars) >= 6000:
                         _recent_sector_bars.clear()
@@ -292,6 +316,8 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
         peers = set(boards.get(membership.get(code,{}).get('code'),[])) - {code}
         missing_peers = len(peers.intersection(missing))
         result['fetchBudget'] = {'seconds':timeout,'unfinishedPeers':missing_peers}
+        result['requestedCutoffAt'] = _datetime(cutoff).isoformat()
+        result['sourceIds'] = sorted({str(row.get('source') or 'unknown') for peer in peers for row in rows.get(peer,[])})
         if missing_peers:
             result['gaps'].append(f'行业分钟采集达到时间预算，{missing_peers}只成分未返回；完整成分分母与80%覆盖门槛保持不变')
     return results
@@ -338,10 +364,16 @@ def compute_fund_evidence(code, data, cutoff):
     return result
 
 
-def fetch_fund_evidence(code, cutoff, *, getter=None):
+def fetch_fund_evidence(code, cutoff, *, getter=None, deadline=None):
+    def bounded_get(url, **kwargs):
+        remaining = (deadline-monotonic()) if deadline is not None else 4
+        if remaining <= 0:
+            raise requests.Timeout('资金分钟采集达到时间预算')
+        kwargs['timeout'] = min(float(kwargs.get('timeout',4)), remaining)
+        return (getter or public_get)(url, **kwargs)
     try:
         data = get_data('stock/fflow/kline/get',{'secid':('1.' if code.startswith('6') else '0.')+code,
-            'lmt':'0','klt':'1','fields1':'f1,f2,f3,f7','fields2':'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63'},getter)
+            'lmt':'0','klt':'1','fields1':'f1,f2,f3,f7','fields2':'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63'},bounded_get)
         return compute_fund_evidence(code,data,cutoff)
     except Exception as exc:
         # Preserve our own bounded provider diagnostics without leaking arbitrary
@@ -349,4 +381,5 @@ def fetch_fund_evidence(code, cutoff, *, getter=None):
         reason = str(exc) if isinstance(exc, ValueError) and str(exc).startswith('Eastmoney sources unavailable: ') else type(exc).__name__
         return {'metrics':{}, 'source':'Eastmoney分钟资金流（供应商大单分类估算）',
                 'asOf':None, 'flowKind':'vendor_estimate', 'status':'unavailable',
+                'reasonCodes':['fund_deadline_exhausted' if deadline is not None and monotonic()>=deadline else 'fund_provider_failed'],
                 'reason':reason, 'gaps':['分钟资金源不可用：'+reason]}

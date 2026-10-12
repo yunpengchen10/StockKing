@@ -14,6 +14,9 @@ export const LEDGER_STATUS = {
   training: '训练中', validating: '验证中', rejected: '未通过晋升', failed: '执行失败',
   shadow: '前瞻影子验证', shadow_validation: '前瞻影子验证', active: '已启用',
   rules: '人工规则运行', fallback: '已回退', paused: '已暂停', unavailable: '暂不可用',
+  data_not_ready: '数据尚未就绪', rules_unvalidated: '规则研究 · 尚未验证', data_rejected: '行情已隔离',
+  fit_completed: '已完成拟合', development_passed: '开发验证通过', holdout_passed: '留出验证通过',
+  forward_shadow: '前向影子验证', suspended_or_rolled_back: '已暂停或回退',
 }
 export function statusLabel(value) { return LEDGER_STATUS[value] || value || '未记录' }
 export function reviewStatusLabel(value, { nextDay = false } = {}) {
@@ -74,6 +77,11 @@ export function learningEffect(state = {}) {
 }
 export function ledgerPercent(value, digits = 2) {
   return present(value) && Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(digits)}%` : '—'
+}
+// Next-day price observations are saved in percentage points, unlike the
+// decimal returns from the simulated order ledger.
+export function priceObservationPercent(value) {
+  return present(value) && Number.isFinite(Number(value)) ? `${Number(value).toFixed(2)}%` : '未取得'
 }
 export function ledgerPrice(value) { return present(value) && Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value).toFixed(2) : '—' }
 export function recordQuoteCode(value) {

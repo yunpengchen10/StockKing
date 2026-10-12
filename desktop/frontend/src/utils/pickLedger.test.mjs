@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { priceObservationPercent } from './pickLedger.mjs'
 import { groupSignals, ledgerPercent, ledgerPrice, ledgerSigned, reviewStatusLabel, reviewReasonLabel, visibleReviews, reviewProgress, learningEffect, reviewReturn, shanghaiDate, learningProgress, recordQuoteCode, recordQuoteCodes, signalPriceComparison, createRecordQuoteLoader, nextDaySignalOf, isNextDaySelection, signalSelectionLabel, nextDayPatternValue, savedRecommendationSummary, nextDayQueueLabel, nextDayTouchLabel } from './pickLedger.mjs'
 
 test('saved signals group by Shanghai day, stock and version without losing distinct scans', () => {
@@ -13,6 +14,13 @@ test('saved signals group by Shanghai day, stock and version without losing dist
   assert.equal(groups.find(group=>group.modelVersion==='v1.1').signals.length,2)
   assert.equal(groupSignals(payload,{includeControls:true}).length,3)
   assert.equal(shanghaiDate('bad timestamp'),'')
+})
+
+test('next-day price observations keep their percentage-point unit and missing old evidence', () => {
+  assert.equal(priceObservationPercent(-3.25), '-3.25%')
+  assert.equal(priceObservationPercent(0), '0.00%')
+  assert.equal(priceObservationPercent(1.2), '1.20%')
+  for (const value of [null, undefined, '', NaN]) assert.equal(priceObservationPercent(value), '未取得')
 })
 
 test('next-day observations are visible by default without changing executable selection or including controls', () => {
@@ -118,7 +126,7 @@ test('a learning-state failure cannot hide saved reviews or falsely retain an ac
     GetStockKingDelayedReviews: async () => { if (failReviews) throw new Error('复盘连接失败'); return { items: [], nextDayReview: { items: [{ signalId: 'saved', selected: true, status: 'incomplete' }, { signalId: 'control', selected: false, status: 'mature_price_pattern' }] } } },
     GetStockKingLearningState: async () => { if (failLearning) throw new Error('学习连接失败'); return { effectiveRankSource: 'champion', effectiveRankVersion: 'verified' } },
   }
-  const component = new Function('modules', compiled)({ vue, '../../wailsjs/go/main/App': api, '../utils/pickLedger.mjs': await import('./pickLedger.mjs') })
+  const component = new Function('modules', compiled)({ vue, '../../wailsjs/go/main/App': api, '../utils/pickLedger.mjs': await import('./pickLedger.mjs'), '../utils/recordRead.mjs': await import('./recordRead.mjs'), '../utils/learningStatus.mjs': await import('./learningStatus.mjs') })
   component.render = () => { instance = vue.getCurrentInstance(); return null }
   const renderer = vue.createRenderer({
     createElement: type => ({ type }), createText: text => ({ text }), createComment: text => ({ text }),

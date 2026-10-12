@@ -222,3 +222,12 @@ def test_v12_aggressive_does_not_require_daily_bullish_alignment():
     profiles = evaluate(v12_candidate(), good_context(), nontrend)['profiles']
     assert profiles['regular']['state']=='watch'
     assert profiles['aggressive']['entryEligible']
+
+
+def test_completed_minute_failed_breakout_blocks_even_a_large_rr_and_score():
+    item = {**v12_candidate(),'v11Inputs':{'failed_breakout_risk':100},
+            'structureRewardRisk':55,'finalScore':90}
+    profiles = evaluate(item,good_context(),DAILY)['profiles']
+    assert all(row['state']=='avoid' for row in profiles.values())
+    item['v11Inputs']['failed_breakout_risk'] = 0
+    assert evaluate(item,good_context(),DAILY)['profiles']['regular']['entryEligible']

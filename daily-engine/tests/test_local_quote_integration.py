@@ -19,7 +19,11 @@ def make_service(monkeypatch, start, tmp_path, fetch=None, batch=None):
     db = SimpleNamespace(list_yao_runs=lambda **kw: [], list_yao_dlm=lambda **kw: [], save_yao_run=saved.append)
     history = pd.DataFrame({'date': pd.bdate_range(end=start.date()-timedelta(days=1), periods=60),
                             'close': [9.2+i*.6/59 for i in range(60)]})
-    history['high'], history['low'] = history.close+1, history.close-.2
+    # A tradable fixture needs room beyond normal daily volatility. Keep an
+    # older pressure level within20 sessions but outside the14-day ATR window;
+    # the former +1 high on every bar only passed with a tiny minute stop.
+    history['high'], history['low'] = history.close+.15, history.close-.15
+    history.loc[history.index[-18], 'high'] = 10.8
     history.attrs['daily_source'] = 'test'
     yao = SimpleNamespace(db=db, _fetch_snapshot=snapshot, _snapshot_meta=lambda *a, **kw: {},
                           history_fetcher=lambda *a, **kw: history, data_dir=tmp_path)
@@ -121,7 +125,7 @@ def test_manual_progress_tracks_evidence_stages_and_usable_minutes(monkeypatch, 
     progress = []
     service.progress_callback = lambda value, message: progress.append((value, message))
     result = service.run('live')
-    assert [value for value, _ in progress] == [12, 20, 32, 48, 60, 72, 80, 82, 88, 94]
+    assert [value for value, _ in progress] == [12, 20, 32, 48, 55, 60, 72, 80, 88, 94]
     assert result['dataQuality']['minute_coverage'] == {'requested': 1, 'usable': 1, 'missing': 0}
     assert 'minute_warmup' not in result['dataQuality']['stageTimingsMs']
     assert set(result['dataQuality']['stageTimingsMs']) >= {'snapshot', 'daily_history', 'minute_evidence', 'final_quotes', 'evaluation'}
@@ -316,9 +320,9 @@ def test_expanded_prescreen_researches_every_stock_in_a_small_universe(monkeypat
     assert result['dataQuality']['research_policy'] == 'mainboard_10pct_min300_v1'
     assert result['dataQuality']['deep_research_count'] == 45
     budgets = result['dataQuality']['stageBudgetsSeconds']
-    assert budgets['daily_history'] == 50
-    assert budgets['minute_evidence'] == 70
-    assert budgets['fund_evidence'] == 24
+    assert budgets['daily_history'] == 25
+    assert budgets['minute_evidence'] == 30
+    assert budgets['fund_evidence'] == 10
     assert result['dataQuality']['minute_coverage'] == {'requested': 45, 'usable': 45, 'missing': 0}
     assert result['learningLedger']['researchCount'] == 45
     assert all(len(rows) <= 5 for rows in result['profileCandidates'].values())
@@ -349,7 +353,7 @@ def test_quote_batches_run_concurrently_and_one_failure_preserves_other_batches(
     assert all(quotes[code] == {'code': code, 'price': 10} for code in codes[:20] + codes[40:])
 
 
-def test_slow_optional_evidence_refreshes_minutes_before_final_quotes(monkeypatch, tmp_path):
+def test_optional_evidence_cannot_extend_global_scan_deadline(monkeypatch, tmp_path):
     start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
     service, tick, events, _ = make_service(monkeypatch, start, tmp_path)
     original_minutes, original_funds = service.minute_fetcher, service.fund_fetcher
@@ -366,19 +370,11 @@ def test_slow_optional_evidence_refreshes_minutes_before_final_quotes(monkeypatc
         return packet
     service.minute_fetcher, service.fund_fetcher = minutes, slow_funds
     result = service.run('live')
-    assert fetched_minutes == [start, start + timedelta(seconds=241)]
+    assert fetched_minutes == [start]
     assert result['dataQuality']['minute_refresh_count'] == 1
-    assert result['dataQuality']['minute_coverage']['usable'] == 1
-    assert result['dataQuality']['quote_coverage']['fresh'] == 1
-    assert result['dataQuality']['independent_evidence']['sector_confirmed'] == 0
-    assert result['dataQuality']['independent_evidence']['fund_source_available'] == 0
-    assert events[-1] == ('quote', tick[0])
-    assert result['candidates']
-    candidate = result['candidates'][0]
-    assert candidate['minuteSourceTime'] == (tick[0] - timedelta(minutes=1)).isoformat()
-    evidence = {row['key']: row for row in candidate['indicatorEvidence']}
-    assert evidence['main_net_flow_3m']['value'] is None
-    assert evidence['sector_relative_5m_pct']['value'] is None
+    assert not any(event[0] == 'quote' for event in events)
+    assert not result['candidates']
+    assert '全局时间上限' in result['message']
 
 
 @pytest.mark.parametrize('minute_age, eligible', [(299, True), (300, False)])
@@ -434,9 +430,9 @@ def test_official_expanded_stage_budgets_stay_inside_delivery_deadline(monkeypat
     assert result['delivery']['late_seconds'] == 105
     assert observed_budgets and all(0 <= budget <= remaining for budget, remaining in observed_budgets)
     budgets = result['dataQuality']['stageBudgetsSeconds']
-    assert budgets['daily_history'] == 50
-    assert budgets['minute_evidence'] == 45
-    assert budgets['fund_evidence'] == 15
+    assert budgets['daily_history'] == 25
+    assert budgets['minute_evidence'] == 30
+    assert budgets['fund_evidence'] == 0
     assert budgets['final_quotes'] == 15
 
 

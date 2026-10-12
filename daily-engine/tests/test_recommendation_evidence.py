@@ -79,6 +79,24 @@ def test_no_history_or_adjustment_mismatch_does_not_fabricate_space():
     assert any('复权' in risk for risk in result['risks'])
 
 
+def test_tiny_minute_support_does_not_fabricate_large_t1_reward_risk():
+    minutes = {'metrics':{'speed_3m_pct':.3,'speed_5m_pct':.6,'local_high_5m':9.99,
+                         'local_low_5m':9.99,'amount_3m':5000000,'relative_amount_3m_20d':2},
+               'historyDays':20,'asOf':NOW.isoformat(),'source':'test_minutes','gaps':[]}
+    result = explain(minutes=minutes)
+    rows = {row['key']:row for row in result['indicatorEvidence']}
+    assert result['rawStructureRewardRisk'] > 50
+    assert result['entryRiskDistance'] == pytest.approx(rows['atr14']['value'],abs=1e-6)
+    assert result['structureRewardRisk'] < 1
+    assert any('T+1' in risk for risk in result['risks'])
+
+
+def test_atr_risk_floor_requires_aligned_prices_and_keeps_unknown_space_unknown():
+    result = explain(quote(pre_close=9.0,change_pct=100*(10/9.0-1)))
+    assert result['entryRiskFloorAtr'] is None
+    assert result['structureRewardRisk'] is None
+
+
 def test_future_current_day_and_duplicates_cannot_change_history_features():
     original = daily_evidence(history(), NOW)
     extra = pd.DataFrame([{'date':'2026-09-15','close':100,'high':110,'low':90},

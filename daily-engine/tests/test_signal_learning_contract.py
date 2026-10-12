@@ -7,7 +7,8 @@ import pytest
 from src.services.yao_scout.local_algorithm import algorithm_contract
 from src.services.yao_scout.signal_learning import SignalLearningService, MODEL_VERSION, _signal_preflight
 from src.quant.executable_backtest import AccountConfig
-from tests.test_signal_learning import _candidate, _clock, _bars
+from src.services.yao_scout import task_learning
+from tests.test_signal_learning import _candidate, _clock, _bars, verified_ledger_quality
 
 
 DAY = date(2026, 9, 7)
@@ -51,18 +52,29 @@ def test_old_and_ineligible_samples_remain_history_but_not_current_dataset(tmp_p
 
 
 def artifact(version, contract=None):
-    return {'version':version,'executionModel':MODEL_VERSION,
+    return {**task_learning.task_contract(), 'version':version,'executionModel':MODEL_VERSION,
             'algorithmContractId':contract or algorithm_contract()['contractId'],
-            'features':['finalScore'],'medians':[50], 'netRegressor':'fixture', 'maeRegressor':'fixture',
-            'calibrationKnots':[0,1], 'calibrationPercentiles':[0,100], 'riskCoefficient':1,
-            'logisticMean':[0], 'logisticScale':[1], 'logisticCoef':[1], 'logisticIntercept':0}
+            'features':['finalScore'],'medians':[50], 'netRegressor':'fixture', 'tailRegressor':'fixture',
+            'eventClassifier':'fixture','calibrationCoef':1.,'calibrationIntercept':0.,'riskCoefficient':1,
+            'ridgeCoef':[.01,0], 'ridgeIntercept':0., 'trainingPrevalence':.1, 'trainingMeanReturn':0.,
+            'dataLineage':{'sessions':[{'code':'000001','day':DAY.isoformat(),'revision':'fixture'}]},
+            'logisticMean':[0,0], 'logisticScale':[1,1], 'logisticCoef':[1,0], 'logisticIntercept':0}
+
+
+def fixture_predictions(model, rows):
+    n = len(rows)
+    return {'rank':np.arange(n,dtype=float)+70,'baselineRank':np.full(n,50.),
+            'net':np.full(n,.07),'tail':np.full(n,-.01),'probability':np.full(n,.7),
+            'utility':np.full(n,.06),'eligible':np.ones(n,dtype=bool)}
 
 
 @pytest.mark.parametrize('stage,passed,contract,expected', [
     ('active',True,None,True), ('shadow',True,None,False), ('rejected',True,None,False),
     ('active',False,None,False), ('active',True,'old-contract',False)])
-def test_active_ranker_requires_matching_contract_and_passed_release(stage,passed,contract,expected,tmp_path):
+def test_active_ranker_requires_matching_contract_and_passed_release(stage,passed,contract,expected,tmp_path,monkeypatch):
     service = SignalLearningService(tmp_path)
+    monkeypatch.setattr(task_learning,'lineage_valid',lambda *_:True)
+    monkeypatch.setattr(task_learning,'predict_model',fixture_predictions)
     with service._connect() as db:
         db.execute('INSERT INTO model_versions VALUES(?,?,?,?,?)',
                    ('model',stage,json.dumps(artifact('model',contract)),json.dumps({'passed':passed}),_clock(DAY).isoformat()))
@@ -95,6 +107,7 @@ def test_old_gate_results_are_not_relabelled_with_the_new_contract(tmp_path):
     assert state['validationContractId'] == algorithm_contract()['contractId']
     assert service._registry()['priorValidation']['gates'] == old_gates
     service._save_registry({'algorithmContractId':algorithm_contract()['contractId'],
+                            'taskContractId':task_learning.task_contract()['taskContractId'],
                             'gates':{'holdout':{'passed':False}}},_clock(DAY))
     assert service.learning_state(_clock(DAY))['gates'] == {'holdout':{'passed':False}}
 
@@ -108,14 +121,15 @@ def test_live_ranking_and_saved_provenance_use_only_shared_eligible_rows(tmp_pat
     observed = []
     def predict(model, rows):
         observed.append(len(rows))
-        return np.arange(len(rows),dtype=float)+70,np.full(len(rows),.5)
-    monkeypatch.setattr(service,'_predict_artifact',predict)
+        return fixture_predictions(model,rows)
+    monkeypatch.setattr(task_learning,'lineage_valid',lambda *_:True)
+    monkeypatch.setattr(task_learning,'predict_model',predict)
     good = _candidate('000001',DAY)
     good['researchFactors'] = {'C': {'value': 55, 'source': 'announcement', 'availableAt': _clock(DAY).isoformat()}}
     good['factorCoverage'] = {'early': .9}
     blocked = {**_candidate('000002',DAY),'evidenceEligible':False,'finalScore':99}
     ranked = service.rank_candidates([blocked,good])
-    assert observed == [1]
+    assert observed == [1,1]  # serialized artifact probe, then one eligible candidate
     assert ranked[0]['code'] == '000001'
     assert ranked[0]['learningRankVersion'] == 'model'
     assert ranked[1]['learningRankVersion'] == 'rules_v1.2'

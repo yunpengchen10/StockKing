@@ -6,11 +6,20 @@ from .precision_policy import V11_VERSION, v11_entry_ready
 from .recommendation_evidence import VERSION as EVIDENCE_VERSION
 from .v11_factors import EARLY_WEIGHTS, MAIN_WEIGHTS, RISK_WEIGHTS, SCORE_VERSION, RISK_PENALTY_COEFFICIENT
 from .research_policy import parameter_contract
+from .decision_policy import PORTFOLIO_POLICY_VERSION, portfolio_parameters, prediction_entry_allowed
 
 
 def algorithm_contract():
+    from .task_learning import task_contract, NEXT_DAY_TASK_ID
     payload = {
-        'schemaVersion': 2,
+        'schemaVersion': 3,
+        'primaryTask': 'entry_today_exit_next_session',
+        'learningTaskContracts': [task_contract()['taskContractId']] + [
+            task_contract(NEXT_DAY_TASK_ID, queue)['taskContractId']
+            for queue in ('first_board', 'continuation')],
+        'portfolioPolicyVersion': PORTFOLIO_POLICY_VERSION,
+        'portfolioParameters': portfolio_parameters(),
+        'dataQualityPolicy': 'request_response_identity_and_whole_session_quarantine_v1',
         'scoreVersion': SCORE_VERSION,
         'entryPolicyVersion': V11_VERSION,
         'evidenceVersion': EVIDENCE_VERSION,
@@ -28,6 +37,8 @@ def algorithm_contract():
                             '量与价同刻历史均至少20日', 'M/V/W/B关键因子有效', 'dataEligibility.status=formal',
                             '对应档位entryEligible=true', '供应商前收盘及涨跌停价完整且一致', '完成时重新核验报价'],
         'profilePolicy': '三档执行乖离、ATR、结构盈亏比、解禁和财务门槛；激进档独立核验分钟突破时允许上方压力及RR未知并披露，不编目标；已知RR仍须达标；未知事件覆盖只观察，已知利空独立否决',
+        'entryRiskPolicy': '空间比风险分母取到可观察支撑距离与已对齐ATR14波动下限的较大值；局部分钟支撑不代表T+1可按此价退出',
+        'structureInvalidationPolicy': '最近完整分钟突破失败为100时等待新完整分钟确认；不只扣分后继续正式推荐',
         'samplePolicy': '同一算法契约与事前准入的正式信号及对照；手动刷新仅观察；缺证据旧记录不补造训练资格',
         'rankingPolicy': '同一 SignalLearningService 排序；只启用契约匹配且通过发布门槛的模型，否则使用规则分',
         'rankingTieBreakPolicy': '模型同分保留本轮规则分与证据顺序；账户基准使用冻结推荐名次',
@@ -37,9 +48,18 @@ def algorithm_contract():
     return {**payload, 'contractId': 'local-picks-' + fingerprint[:20]}
 
 
-def is_entry_eligible(candidate, profile='regular'):
-    """Identical final entry predicate for live selection and validation samples."""
+def is_research_eligible(candidate, profile='regular'):
+    """Prospective evidence admission independent of the model's own prediction.
+
+Rejected model choices must remain controls; otherwise training would only see
+the earlier model's positive predictions and silently lose its false negatives.
+"""
     return bool(v11_entry_ready(candidate)
                 and (candidate.get('precisionDecision') or {}).get('version') == V11_VERSION
                 and ((candidate.get('precisionDecision') or {}).get('profiles') or {})
                 .get(profile, {}).get('entryEligible') is True)
+
+
+def is_entry_eligible(candidate, profile='regular'):
+    """Final live decision adds validated absolute-edge admission to evidence."""
+    return bool(is_research_eligible(candidate, profile) and prediction_entry_allowed(candidate))

@@ -6,6 +6,7 @@ import { useMessage } from 'naive-ui'
 import { toResearchCode } from '../utils/symbol'
 import PickIndicatorEvidence from './PickIndicatorEvidence.vue'
 import PicksLedger from './PicksLedger.vue'
+import { predictionSummary, portfolioSummary, nextDayPredictionSummary } from '../utils/learningStatus.mjs'
 import { explainPick, PICK_BRANCHES, isEvidenceRuleVersion } from '../utils/pickExplain.mjs'
 import { createPicksRefreshController, readDisplayedPicks, saveDisplayedPicks, selectDisplayedPicks } from '../utils/picksRefresh.mjs'
 import { nextDayQueueLabel, nextDayTouchLabel, savedRecommendationSummary } from '../utils/pickLedger.mjs'
@@ -461,6 +462,7 @@ onDeactivated(() => {
       <n-alert v-if="adaptive.message" type="warning" :show-icon="false">{{ adaptive.message }}</n-alert>
       <div class="adaptive-summary saved-recommendations"><div><b>{{ result.adaptive ? savedRecommendations.saved ? `已保存研究推荐 · ${savedRecommendations.saved} 只` : '已保存扫描 · 暂无研究推荐' : '本地精选' }}</b><n-tag v-if="snapshotIsOld" size="small" type="warning" :bordered="false">历史结果</n-tag><small>生成时间 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small><small v-if="adaptive.run_id || adaptive.runId">扫描编号 {{ adaptive.run_id || adaptive.runId }}</small></div><n-button v-if="result.adaptive" size="small" secondary @click="openRecommendationRecords">查看最新推荐记录</n-button><span v-if="loading">扫描中 · 暂时保留原列表</span></div>
       <p v-if="adaptive.nextDayResearch" class="quote-coverage">已保存研究推荐按股票去重：{{ savedRecommendations.splitQueues ? '未触板潜伏' : '次日观察' }} {{ savedRecommendations.primary }} 只 · 交易条件候选 {{ savedRecommendations.execution }} 只<template v-if="savedRecommendations.splitQueues">；已触板延续 {{ savedRecommendations.continuation }} 只单列辅助观察，不计入主推荐。</template>研究观察保留依据和缺口，不代表已通过交易条件。</p>
+      <p v-if="adaptive.profilePortfolioPolicies?.[precisionProfile] || adaptive.portfolioPolicy" class="quote-coverage">{{ portfolioSummary(adaptive.profilePortfolioPolicies?.[precisionProfile] || adaptive.portfolioPolicy) }}</p>
       <p class="quote-coverage">本轮主板初筛 {{ researchCoverage.universe }} 只 · 进入深研 {{ researchCoverage.queued }} 只 · 完成深研 {{ researchCoverage.completed }} 只 · <template v-if="adaptive.nextDayResearch">研究推荐 {{ savedRecommendations.saved }} 只</template><template v-else>本档入选 {{ adaptivePicks.length }} 只</template></p>
       <p v-if="snapshotIsOld" class="quote-coverage">以上为已保存的历史结果，价格与证据截至标注的生成时间；刷新成功后才会更新。</p>
       <div v-if="quoteCoverageSummary || scheduleSummary" class="quote-coverage"><span v-if="quoteCoverageSummary" title="新鲜表示通过本轮报价时效核验，不代表已成交。">{{ quoteCoverageSummary }}</span><span v-if="scheduleSummary" :title="`北京时间 · 目标 ${adaptive.delivery.target_at} · 实际 ${adaptive.delivery.decision_at || '未记录'}`">{{ scheduleSummary }}</span></div>
@@ -470,7 +472,7 @@ onDeactivated(() => {
         <span>行业联动确认：{{ adaptive.dataQuality.independent_evidence.sector_confirmed }} 只</span>
         <span>分钟资金数据：{{ adaptive.dataQuality.independent_evidence.fund_source_available }} 只</span>
       </div>
-      <details v-if="isV11" class="sk-help-details picks-method"><summary>规则与覆盖</summary><p>{{ researchCoverage.description }}</p><p>行情 {{ adaptive.dataQuality?.snapshot_count ?? '未知' }} 只；深研完成表示已逐只核验，缺失和过期证据仍单独记录，不代表全部证据齐全。</p><p>{{ adaptive.marketSummary }}</p><p>算法 {{ adaptive.scoreVersion || adaptive.recommendationLogicVersion || '以单只候选记录为准' }}。</p><p>{{ adaptive.algorithm?.missingFactorPolicy || '缺失处理以该次记录的算法版本为准。' }}</p><p>{{ adaptive.algorithm?.formula || '评分公式以该次记录为准。' }}</p><p>{{ adaptive.algorithm?.profilePolicy }}</p><p>参数为待验证初值。分数用于研究排序，数据覆盖不是胜率；市场情绪调节不表示实际仓位或成交。</p></details>
+      <details v-if="isV11" class="sk-help-details picks-method"><summary>规则与覆盖</summary><p>{{ researchCoverage.description }}</p><p>行情 {{ adaptive.dataQuality?.snapshot_count ?? '未知' }} 只；深研完成表示已逐只核验，缺失和过期证据仍单独记录，不代表全部证据齐全。</p><p>{{ adaptive.marketSummary }}</p><p>算法 {{ adaptive.scoreVersion || adaptive.recommendationLogicVersion || '以单只候选记录为准' }}。</p><p>{{ adaptive.algorithm?.missingFactorPolicy || '缺失处理以该次记录的算法版本为准。' }}</p><p>{{ adaptive.algorithm?.formula || '评分公式以该次记录为准。' }}</p><p>{{ adaptive.algorithm?.profilePolicy }}</p><p>规则参数为待验证初值。通过独立检验的模型才提供预测；数据覆盖不是胜率。研究配置执行市场与行业预算，页面不代表实际成交。</p></details>
       <details v-else class="sk-help-details picks-method"><summary>旧版历史口径</summary><p>{{ modelMix }} · {{ adaptive.modelVersion }}。旧分快照保留用于回看；下一次刷新采用当前规则与证据筛选。</p></details>
       <section v-for="queue in nextDayQueues" :key="queue.key" class="next-day-watch" :class="queue.key === 'continuation' ? 'next-day-continuation' : 'next-day-primary'">
         <n-alert v-if="adaptive.nextDayResearch?.retrospectiveProjection" type="warning" :show-icon="false">历史证据重排 · 非当时推荐。{{ adaptive.nextDayResearch.projectionMeaning || '按当时已保存的证据重新排序，不作为当时已经发出的推荐或新规则命中率。' }}</n-alert>
@@ -490,6 +492,7 @@ onDeactivated(() => {
                 <p v-for="gap in pick.nextDaySignal?.gaps || []" :key="gap"><span>待确认</span>{{ gap }}</p>
                 <p v-for="risk in pick.riskReasons || []" :key="risk"><span>风险</span>{{ risk }}</p>
                 <p><span>评分含义</span>{{ pick.nextDaySignal?.scoreMeaning || '用于研究排序，未经胜率校准' }}</p>
+                <p v-if="nextDayPredictionSummary(pick.nextDaySignal)"><span>次日事件模型</span>{{ nextDayPredictionSummary(pick.nextDaySignal) }}</p>
                 <p><span>证据日期</span>{{ pick.nextDaySignal?.signalSession || '未记录' }} · 目标 {{ pick.nextDaySignal?.targetSession || '下一交易日' }}</p>
                 <p><span>交易条件</span>此通道仅用于观察，未给出买入许可；开盘、量价和风险条件仍需重新确认。</p>
               </details>
@@ -527,6 +530,7 @@ onDeactivated(() => {
                 <p><span>研究排序分</span>{{ scoreOf(pick) }} · 不是胜率或收益预测</p>
                 <p v-if="pick.dataEligibility"><span>数据资格</span>{{ { formal: '满足历史与关键因子要求', observation: '历史、关键因子或时效未满足，仅观察', insufficient: '历史或关键证据不足' }[pick.dataEligibility.status] || '待核验' }} · {{ pick.scoreStage || '阶段待确认' }}</p>
                 <p v-for="(packet, key) in pick.researchFactors || {}" :key="key"><span>{{ { C: '事件催化', G: '历史股性', E: '市场情绪', H: '题材扩散（影子）' }[key] || key }}</span>{{ { observed: '已记录', insufficient: '样本不足', unavailable: '未取得' }[packet.status] || '未取得' }} · {{ packet.gaps?.join('；') || packet.source || '来源见指标证据' }}</p>
+                <p v-if="pick.prediction"><span>{{ predictionSummary(pick.prediction).label }}</span>{{ predictionSummary(pick.prediction).detail }}</p><p v-if="pick.plannedWeight != null"><span>研究配置</span>{{ (pick.plannedWeight * 100).toFixed(1) }}% · 按总预算及行业上限分配</p>
                 <p v-if="pick.marketRegime"><span>情绪调节</span>{{ { weak: '偏弱', hot: '过热', normal: '正常', unknown: '证据不足，保留基础分' }[pick.marketRegime.state] || '待核验' }} · 研究分系数 {{ pick.marketRegime.multiplier ?? '未取得' }}，不代表实际仓位</p>
                 <template v-if="isV11Pick(pick)"><p><span>主升概率</span>{{ calibrationValue(pick, 'mainRiseProbability') }}</p><p><span>预计MFE</span>1日 {{ calibrationValue(pick, 'expectedMFE1') }} · 3日 {{ calibrationValue(pick, 'expectedMFE3') }} · 5日 {{ calibrationValue(pick, 'expectedMFE5') }}</p><p><span>预计MAE</span>1日 {{ calibrationValue(pick, 'expectedMAE1') }} · 3日 {{ calibrationValue(pick, 'expectedMAE3') }} · 5日 {{ calibrationValue(pick, 'expectedMAE5') }}</p></template>
                 <p><span>观察周期</span>{{ detail.entryPlan.holdingWindow }}</p>
@@ -587,12 +591,13 @@ onDeactivated(() => {
     </section>
     <n-drawer v-model:show="methodVisible" :width="500" placement="right"><n-drawer-content title="精选 · 方法与使用" closable><div class="pick-explanation">
       <ol class="usage-steps"><li><b>刷新扫描</b> · 检查列表生成时间、行情源时间和覆盖范围。</li><li><b>为何入选</b> · 查看实际因子、价格结构与失效条件。</li><li><b>图表</b> · 使用共用行情核对当前结构。</li><li><b>延后复盘</b> · 查看T+1、T+3、T+5的观察变化与模拟成交。</li></ol>
-      <h3>本地精选 V1.2（当前规则）</h3><p>筛选沪深主板非ST，每档每轮最多5只。突破和修复使用启动分，延续使用主升分，再计入风险与市场状态调节。每轮重新核验队列，候选及未入选对照一同记录；已保存的V1.1记录仍显示其原版本公式。</p>
+      <h3>本地精选 · 任务化学习与规则研究</h3><p>筛选沪深主板非ST，每档每轮最多5只。突破和修复使用启动分，延续使用主升分，再计入风险与市场状态调节。每轮重新核验队列，候选及未入选对照一同记录；已保存的V1.1记录仍显示其原版本公式。</p>
       <h3>次日冲板研究 · 潜伏与延续分开</h3><p>主推荐默认展示最多5只未触板潜伏：本轮规则要求扫描时涨幅在−3%至5%、当日尚未触及模式限价且仍有至少4%距离，并核验日线、量价与昨日形态；昨日证据缺失会列为缺口，不声称已确认首板。最多5只已触板延续单列为辅助观察，默认折叠，不用于补足潜伏名单或主推荐数量。两队列分别排序，保存当时依据、目标日与缺口。</p><p>已保存研究推荐数量为潜伏与交易候选按股票去重后的并集。研究观察不代表通过交易条件；排序分未校准为涨停概率，下一交易日仍需核验。旧版名单保留原算法记录，不事后分队列。</p>
       <details><summary>入选依据与指标</summary><p>量或价的同刻历史不足5日时不生成评分；5～19日仅供观察。正式候选须量价历史均达到20日、M/V/W/B关键因子有效且分钟证据新鲜，再通过本档风险门槛。数据覆盖不是胜率。缺失因子保持为空、得分贡献为零，固定权重不重新分配；缺失风险按该项上界计入惩罚。</p><p>事件、历史股性和换手参与规则分；市场情绪仅向下调节研究分，未知时保留基础分，不代表实际仓位。题材扩散只作影子记录，新闻社交舆情尚未接入。研究分不是收益预测；未经校准的MFE、MAE及概率保持待校准。风险系数0.2等参数均为待验证初值，旧记录没有保存的证据不事后补写。</p></details>
       <details><summary>旧版历史分支名称</summary><div class="branch-list"><div v-for="(item,key) in PICK_BRANCHES" :key="key"><code>{{ key }}</code><span>{{ item.name }}</span></div></div></details>
+      <h3>预测任务与复盘</h3><p>当日入场的主任务预测下一交易日合法退出的扣费收益与净收益达到5%的概率；潜伏、延续独立预测次日价格事件，不能用触板代替可成交盈利。各任务独立成熟、训练和验证。行情身份或价格路径存在冲突时隔离相关数据，旧模型不继续使用失效的数据版本。</p><p>模型使用时间顺序的训练、校准、滚动检验与最终留出。未完成验证时保留规则研究状态，不显示预测概率；启用模型后必须满足预期净收益和风险调整效用均为正，允许本轮零只。</p>
       <h3>策略分组</h3><p>V1.2三档共用研究排序，分别执行乖离、ATR、结构盈亏比、业绩与解禁门槛。事件风险覆盖未知时仅观察；已知负面业绩预告或超限解禁独立否决。激进档在分钟突破已核验时允许上方压力与盈亏比未知，但不生成目标价；已知盈亏比仍须达标。旧版不同策略的分值不能直接比较，旧契约模型不会用于新规则。</p>
-      <details><summary>定时扫描与学习</summary><p>北京时间09:20盘前观察；09:40、09:55、10:30、14:55独立扫描；15:30归档与到期复盘；周五15:45本地训练。自动推荐和自动学习分别控制。错过时点保留遗漏记录，手动刷新不计入正式训练。</p><p>默认至少120个成熟交易日、1000条有效样本，并满足训练和校准分段要求后才检验模型。独立留出段至少60个信号日、50笔完成交易；训练与验证按实际标签结束时间隔离，至少留5个交易日间隔。扣费收益与相对优势的置信下界须为正，回撤不恶化，再从模型实际创建后开展至少20个交易日前瞻影子验证。失败标签日与空仓日保留，未达要求继续使用规则。</p><p>页面读取已保存的展示快照。“刷新扫描”成功后才更新，刷新期间或失败时仍显示原推荐；新一轮无合格候选时明确显示空结果。模拟成交使用下一完整分钟入场，满足T+1后尝试期限收盘退出；遇跌停、停牌或容量不足则继续持仓，逐日标价并等待首个有完整证据的可卖分钟。缺路径不跳过，未成交独立记录；价格观察与模拟收益均不是用户真实交易。</p></details>
+      <details><summary>定时扫描与学习</summary><p>北京时间09:20盘前观察；09:40、09:55、10:30、14:55独立扫描；15:30归档与到期复盘；周五15:45本地训练。自动推荐和自动学习分别控制。错过时点保留遗漏记录，手动刷新不计入正式训练。</p><p>默认至少120个成熟交易日、1000条有效样本，并满足训练和校准分段要求后才检验模型。独立留出段至少60个信号日、50笔完成交易；训练与验证按实际标签结束时间隔离，至少留5个交易日间隔。扣费收益与相对优势的置信下界须为正，回撤不恶化，再从模型实际创建后开展至少20个交易日且至少50笔完成观察的前瞻影子验证。失败标签日与空仓日保留，未达要求继续使用规则。</p><p>页面读取已保存的展示快照。“刷新扫描”成功后才更新，刷新期间或失败时仍显示原推荐；新一轮无合格候选时明确显示空结果。模拟成交使用下一完整分钟入场，满足T+1后尝试期限收盘退出；遇跌停、停牌或容量不足则继续持仓，逐日标价并等待首个有完整证据的可卖分钟。缺路径不跳过，未成交独立记录；价格观察与模拟收益均不是用户真实交易。</p></details>
     </div></n-drawer-content></n-drawer>
     <n-drawer v-model:show="explanationVisible" :width="520" placement="right"><n-drawer-content :title="`${nameOf(selectedPick)} · ${selectedIsInsufficient ? '交易条件未满足' : '为什么入选'}`" closable><div class="pick-explanation">
       <h3>{{ explanation.title }}</h3><small>快照 {{ formatTime(adaptive.generatedAt || result.generatedAt) }} · 行情来源 {{ explanation.source }}<br/>推荐逻辑 {{ explanation.logicVersion }}</small>
@@ -605,7 +610,7 @@ onDeactivated(() => {
         <p v-for="check in explanation.evidenceChecks" :key="check.key">{{ check.passed ? '✓' : '—' }} {{ check.label }}：{{ check.passed ? '满足' : '未满足' }}</p>
         <p>同刻历史样本：{{ explanation.baselineDays ?? 0 }}/20 个交易日；来源：{{ explanation.baselineSource }}</p>
         <p v-if="explanation.missingHistoryDates.length">待补齐日期：{{ explanation.missingHistoryDates.join('、') }}</p>
-        <p>{{ isV11Pick(selectedPick) ? '缺失可选因子保留为空，已取得因子按可用权重计算；报价与交易状态仍须通过检查。' : '此处保留历史快照当时的核验口径。' }}资金指标为供应商分类估算。</p>
+        <p>{{ isV11Pick(selectedPick) ? '缺失可选因子保留为空，不重新分配权重；报价与交易状态仍须通过检查。' : '此处保留历史快照当时的核验口径。' }}资金指标为供应商分类估算。</p>
       </section>
       <h3>推荐指标 · 当时的数值与判断</h3><PickIndicatorEvidence :indicators="explanation.indicators" />
       <details><summary>{{ explanation.scoreLabel }} · {{ scoreOf(selectedPick) }}（不是胜率）</summary><p>{{ explanation.scoreMeaning }}</p><p>{{ explanation.formula }}</p><div v-for="row in explanation.modelScores" :key="row.key" class="score-row"><span>{{ row.key }} · {{ row.label }}</span><b>{{ row.value }}</b></div></details>

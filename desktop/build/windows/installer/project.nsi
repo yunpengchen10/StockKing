@@ -175,6 +175,7 @@ Section
     File "/oname=README.en.md" "..\..\..\..\README.en.md"
     File "/oname=WINDOWS_INSTALL.md" "..\..\..\..\docs\WINDOWS_INSTALL.md"
     File "/oname=WINDOWS_INSTALL.en.md" "..\..\..\..\docs\WINDOWS_INSTALL.en.md"
+    File "/oname=algorithm-v270.md" "..\..\..\..\docs\algorithm-v270.md"
 
     SetOutPath $INSTDIR
 

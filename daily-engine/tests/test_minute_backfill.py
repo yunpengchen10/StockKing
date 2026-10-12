@@ -30,19 +30,19 @@ def test_cross_source_duplicate_enriches_only_compatible_missing_fields():
     assert not minute.normalize_bars([original, {**second, 'volume_shares': 200, 'amount_cny': 2000}], CUTOFF)
 
 
-def test_archive_supplements_holes_without_overwriting_disagreeing_existing_prices(tmp_path):
+def test_archive_quarantines_whole_day_instead_of_splicing_disagreeing_prices(tmp_path):
     original = session(DAYS[0])
     archive = minute.MinuteArchive(tmp_path)
     archive.save('600000', original[2:], CUTOFF)
     alternative = [{**row, 'source': 'sina', 'close': 10.02, 'amount_cny': 1002} for row in original]
     result = archive.save('600000', alternative, CUTOFF)
     saved = {row['end']: row for row in archive.read('600000', CUTOFF)}
-    assert result == {'addedMinutes': 2, 'enrichedMinutes': 0, 'conflictingOverlapMinutes': 238}
-    assert len(saved) == 240
-    assert saved[original[0]['end']]['source'] == 'sina'
-    assert saved[original[0]['end']]['close'] == 10.02
-    assert saved[original[2]['end']]['source'] == 'software'
-    assert saved[original[2]['end']]['close'] == 10
+    assert result['addedMinutes'] == 0 and result['conflictingOverlapMinutes'] == 238
+    assert result['quarantinedDays'] == DAYS[:1]
+    assert not saved
+    assert archive.quality('600000', CUTOFF)['status'] == 'tainted'
+    with archive.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM session_evidence').fetchone()[0] == 2
 
 
 def test_required_days_find_a_historical_hole_despite_a_complete_current_day(monkeypatch, tmp_path):

@@ -68,6 +68,8 @@ DEFAULT_PARAMETERS = _freeze({
         'aggressive': {'label': '激进', 'max_bias_pct': 7.5, 'max_atr_extension': 2.5,
                        'min_reward_risk': 1.2, 'max_unlock_pct': 8., 'require_financial_quality': False}},
     'entry': {'previousCloseToleranceCny': .011, 'unknownRewardRiskAggressiveBreakoutException': True,
+              'volatilityRiskFloorAtr': 1.,
+              'riskDistancePolicy': 'max_observed_support_distance_and_aligned_daily_atr14',
               'eventCoverage': ['forecast', 'unlock'], 'negativeForecastTypes': ['首亏', '续亏', '增亏', '预减']},
     'researchFactors': {
         'C': {'halfLifeSessions': 1., 'neutralScore': 50., 'positiveScale': 50.,
@@ -81,7 +83,7 @@ DEFAULT_PARAMETERS = _freeze({
         'H': {'minPeers': 5, 'minimumCoverage': .8, 'minimumBreadthPct': 60.}},
     'validation': {'minimumMatureDays': 120, 'minimumValidSamples': 1000, 'purgeDays': 5,
         'shadowDays': 20, 'minimumHoldoutDays': 60, 'minimumHoldoutTrades': 50,
-        'minimumShadowTrades': 1, 'executionModel': 'king-v1.2-execution-model',
+        'minimumShadowTrades': 50, 'executionModel': 'king-v1.2-execution-model',
         'splitPolicy': 'reserve_max_60_days_or_20pct_holdout_then_75pct_pre_holdout_training',
         'holdoutFraction': .20, 'preHoldoutTrainFraction': .75,
         'minimumCalibrationDays': 15, 'minimumTrainSamples': 300,

@@ -66,6 +66,10 @@ def test_research_queues_persist_once_without_entry_or_training_promotion(tmp_pa
     service = ledger.SignalLearningService(tmp_path, clock=lambda: NOW)
     # Even an accidentally entry-shaped watch-only row cannot become training.
     monkeypatch.setattr(ledger, "_signal_preflight", lambda *_: True)
+    # This fixture isolates queue membership; all three rows have evidence
+    # known at publication, yet watch-only rows still cannot become entries.
+    from src.services.yao_scout import task_learning
+    monkeypatch.setattr(task_learning, "lineage_known_at", lambda *_: NOW.isoformat())
     result = scan()
     original = deepcopy(result)
     saved = service.persist_scan(result, "1030", NOW, True)

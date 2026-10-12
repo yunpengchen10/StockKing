@@ -234,8 +234,10 @@ def _signal_learning(config, db_manager):
 
 @router.get('/picks/records')
 def get_signal_records(date: str = '', symbol: str = '', version: str = '',
+    compact: bool = False, include_controls: bool = True,
     config: Config = Depends(get_config_dep), db_manager: DatabaseManager = Depends(get_database_manager)):
-    return _signal_learning(config, db_manager).history({'date': date, 'symbol': symbol, 'version': version})
+    return _signal_learning(config, db_manager).history({'date': date, 'symbol': symbol, 'version': version,
+                                                        'compact': compact, 'include_controls': include_controls})
 
 
 @router.get('/picks/reviews')

@@ -2,9 +2,9 @@
 
 [English](WINDOWS_INSTALL.en.md)
 
-## v2.6.3 一键安装包
+## v2.7.0 一键安装包
 
-文件名：`Stock-King-Setup-x64-v2.6.3.exe`。适用于 Windows 10/11 x64，包含桌面程序、本地研究引擎及离线 WebView2 安装程序，无需另外安装 Python、Go 或 Node.js。仅在缺少 WebView2 时安装该组件；行情下载仍需要网络。
+文件名：`Stock-King-Setup-x64-v2.7.0.exe`。适用于 Windows 10/11 x64，包含桌面程序、本地研究引擎及离线 WebView2 安装程序，无需另外安装 Python、Go 或 Node.js。仅在缺少 WebView2 时安装该组件；行情下载仍需要网络。
 
 1. 关闭正在运行的 Stock King，再双击安装包。
 2. 已有安装时选择原来的安装目录，例如 `D:\Stock King`。新用户可使用默认目录。
@@ -13,9 +13,13 @@
 
 安装不会把个人数据库、密钥、自选或训练模型装入发行包。已有数据存放在 `%APPDATA%\Stock King` 与 `%LOCALAPPDATA%\Stock King`；卸载程序保留这些用户数据。升级前建议备份这两个目录。安装器注册七个当前用户后台任务；自动推荐与学习仍分别由软件开关控制，电脑需保持开机并登录。
 
-安装包附 `SHA256SUMS.txt`。可用 `Get-FileHash .\Stock-King-Setup-x64-v2.6.3.exe -Algorithm SHA256` 核对。Stock King 程序与安装包未购买代码签名证书，内置 WebView2 安装程序已验证微软签名。
+安装包附 `SHA256SUMS.txt`。可用 `Get-FileHash .\Stock-King-Setup-x64-v2.7.0.exe -Algorithm SHA256` 核对。Stock King 程序与安装包未购买代码签名证书，内置 WebView2 安装程序已验证微软签名。
 
 ## 修复了什么
+
+v2.7.0 新增行情身份与独立OHLC核验、污染隔离、独立任务回归及概率校准、时间检验与影子发布、组合预算。推荐记录修复原生浏览器计时器导致的 `Illegal invocation`。模型不足或验证未通过时仍显示规则研究，不宣称收益已改善。详见[算法与验证说明](algorithm-v270.md)。
+
+2026年10月12日本地维护修复：推荐记录使用精简载荷、分批展示及明确超时/重试；延后复盘按条保存，展示入选/对照的收盘价格变化与待补状态。正式准入使用已对齐ATR14作为支撑风险比较下限，并等待突破失败后的新分钟结构确认；次日观察明确转弱扣分。这些是软件行为与风险口径修复，未证明预测收益提高。新旧推荐与算法契约分别保存，详情见[规则与复盘说明](yao-v12-upgrade.md)。
 
 v2.6.3 修复分钟历史分页提前停止、短响应阻止备用源补齐、20日基准未齐就停止回补，以及报价合并丢失涨跌停价的问题；优化财报分页、行业缓存读取和报价时效。延后复盘先保存已有结果，再补充所需数据并重新结算，价格路径观测与有效训练样本分别统计。关键数据不足或冲突时，正式候选保持受限，不将缺失值补成零。
 
@@ -34,7 +38,7 @@ v2.6.2 修复推荐记录响应超过 16 MiB 时被截断的问题。此前会�
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1 `
   -BuiltExe 'desktop/build/bin/Stock King.exe' `
-  -BuiltEngineDir 'daily-engine/dist/stock_analysis' `
+  -BuiltEngineDir 'daily-engine/dist/backend/stock_analysis' `
   -WebViewInstaller 'desktop/build/windows/installer/tmp/MicrosoftEdgeWebView2RuntimeInstallerX64.exe'
 ```
 
