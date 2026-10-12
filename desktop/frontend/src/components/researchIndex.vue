@@ -1,5 +1,5 @@
 <script setup>
-import {computed, h, onBeforeMount, onBeforeUnmount, onMounted,onUnmounted, ref,reactive} from 'vue'
+import {computed, h, onBeforeMount, onBeforeUnmount, onMounted,onUnmounted, ref,reactive,watch} from 'vue'
 import {GetAIResponseResultList} from "../../wailsjs/go/main/App";
 import {NButton, NEllipsis, NText} from "naive-ui";
 import ResearchReport from "./researchReport.vue";
@@ -23,6 +23,7 @@ const defaultTab = "AI分析报告"
 const availableTabs = new Set(["AI分析报告", "股票推荐记录", "异动监控", "涨停梯队", "提示词模板", "形态选股", "指标选股", "定时任务", "交易日志", "每日操作计划", "MCP服务", "技能管理"])
 const nowTab = ref(defaultTab)
 const route = useRoute()
+watch(() => route.query.name, name => { if (availableTabs.has(name)) nowTab.value = name })
 onBeforeMount(() => {
   nowTab.value = availableTabs.has(route.query.name) ? route.query.name : defaultTab
 })

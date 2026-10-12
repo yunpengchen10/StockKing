@@ -1,6 +1,37 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { explainPick, normalizeIndicatorEvidence, safeEvidenceURL } from './pickExplain.mjs'
+import { explainPick, normalizeIndicatorEvidence, safeEvidenceURL, isEvidenceRuleVersion } from './pickExplain.mjs'
+
+test('v1.2 retains calibrated-output boundaries and recognises saved v1.1 records', () => {
+  assert.equal(isEvidenceRuleVersion('stockking-v1.2-rules'), true)
+  assert.equal(isEvidenceRuleVersion('stockking-v1.1-rules'), true)
+  assert.equal(isEvidenceRuleVersion('stockking-v1.20-rules'), false)
+  const pick = { scoreVersion: 'stockking-v1.2-rules', finalScore: 72, remainingSpace: null,
+    factorScores: { C: 25, G: null }, probabilityStatus: 'withheld_until_calibrated' }
+  const current = explainPick(pick)
+  const previous = explainPick({ ...pick, scoreVersion: 'stockking-v1.1-rules' })
+  assert.equal(current.entryPlan.holdingWindow, previous.entryPlan.holdingWindow)
+  assert.match(current.scoreMeaning, /不是胜率|非概率/)
+  assert.match(current.formula, /StageScore/)
+  assert.match(current.formula, /固定权重不重新分配/)
+  assert.match(current.formula, /缺失风险按该项上界/)
+  assert.match(current.formula, /仅向下调节/)
+  assert.doesNotMatch(current.formula, /max\(Early/)
+  assert.match(previous.formula, /V1.1旧记录/)
+  assert.match(previous.formula, /max\(Early, MainRise\)/)
+  assert.match(previous.formula, /按可用权重重新分配/)
+  assert.doesNotMatch(previous.formula, /StageScore|RegimeMultiplier/)
+})
+
+test('v1.2 formula uses saved coefficients and never fabricates missing stage evidence', () => {
+  const result = explainPick({ scoreVersion: 'stockking-v1.2-rules', selectedScoreBranch: 'main',
+    riskPenaltyCoefficient: 0.3, marketRegime: { multiplier: 0.75 } })
+  assert.match(result.formula, /0.3 × DistributionRisk/)
+  assert.match(result.formula, /本次阶段分支：MainRise，市场状态系数：0.75/)
+  const missing = explainPick({ scoreVersion: 'stockking-v1.2-rules' })
+  assert.match(missing.formula, /本次阶段分支：未记录，市场状态系数：未记录/)
+  assert.equal(explainPick({ scoreVersion: 'stockking-v1.20-rules' }).formula, '该快照未提供公式版本')
+})
 
 test('independent checks retain failures and exact missing baseline dates', () => {
   const result=explainPick({evidenceChecks:{sector_resonance:true,history_20d:false,fund_direction:false},

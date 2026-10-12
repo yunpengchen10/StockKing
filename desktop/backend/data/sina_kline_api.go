@@ -614,12 +614,16 @@ func eastMoneyAdjustFromFlag(adjustFlag string) string {
 func fetchKLineUncached(stockCode, stockName, klt string, limit int, end string, adjustFlag ...string) *KLineSourceResult {
 	flag := adjustFlagFromVariadic(adjustFlag...)
 
-	// MAC/通达信最新 K 线接口不接受 end 游标。历史分页若仍优先调用它，
-	// 会反复返回今日附近的数据，导致分钟线无法定位到用户选择的历史日期。
-	// 指定 end 时直接从支持历史截止时间的东方财富开始降级链。
+	// A-share one-minute history now implements end using MAC offsets. Other
+	// periods still use only the latest MAC endpoint and retain their old fallback.
 	var macResult *KLineSourceResult
-	if ShouldUseLatestMACKLine(end) {
-		macResult = fetchFromMACWithTimeout(stockCode, klt, limit, 5*time.Second, flag)
+	minuteHistory := klt == "1" && !IsHKStockCode(stockCode) && !IsUSStockCode(stockCode) && !IsCSIIndexCode(stockCode) && !IsGlobalIndexCode(stockCode)
+	if ShouldUseLatestMACKLine(end) || minuteHistory {
+		macTimeout := 5 * time.Second
+		if minuteHistory && (limit > 240 || end != "") {
+			macTimeout = 10 * time.Second
+		}
+		macResult = fetchFromMACWithTimeout(stockCode, klt, limit, macTimeout, flag, end)
 		if macResult != nil && macResult.Data != nil && len(*macResult.Data) > 0 {
 			macResult.Source = "tdx-mac"
 			fillVolumeRatio(macResult.Data)
@@ -745,14 +749,19 @@ func fetchFromMAC(stockCode, klt string, limit int, adjustFlag string) *KLineSou
 	return &KLineSourceResult{Data: data}
 }
 
-func fetchFromMACWithTimeout(stockCode, klt string, limit int, timeout time.Duration, adjustFlag string) *KLineSourceResult {
+func fetchFromMACWithTimeout(stockCode, klt string, limit int, timeout time.Duration, adjustFlag string, historicalEnd ...string) *KLineSourceResult {
 	type result struct {
 		rs *KLineSourceResult
 		ok bool
 	}
 	ch := make(chan result, 1)
 	go func() {
-		rs := fetchFromMAC(stockCode, klt, limit, adjustFlag)
+		var rs *KLineSourceResult
+		if klt == "1" && len(historicalEnd) > 0 && historicalEnd[0] != "" {
+			rs = &KLineSourceResult{Data: NewTdxKLineApi().GetMACMinuteKLineBefore(stockCode, limit, historicalEnd[0])}
+		} else {
+			rs = fetchFromMAC(stockCode, klt, limit, adjustFlag)
+		}
 		ch <- result{rs: rs, ok: true}
 	}()
 

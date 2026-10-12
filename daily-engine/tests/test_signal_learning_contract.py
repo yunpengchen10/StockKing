@@ -7,7 +7,8 @@ import pytest
 from src.services.yao_scout.local_algorithm import algorithm_contract
 from src.services.yao_scout.signal_learning import SignalLearningService, MODEL_VERSION, _signal_preflight
 from src.quant.executable_backtest import AccountConfig
-from tests.test_signal_learning import _candidate, _clock, _bars
+from src.services.yao_scout import task_learning
+from tests.test_signal_learning import _candidate, _clock, _bars, verified_ledger_quality
 
 
 DAY = date(2026, 9, 7)
@@ -51,18 +52,29 @@ def test_old_and_ineligible_samples_remain_history_but_not_current_dataset(tmp_p
 
 
 def artifact(version, contract=None):
-    return {'version':version,'executionModel':MODEL_VERSION,
+    return {**task_learning.task_contract(), 'version':version,'executionModel':MODEL_VERSION,
             'algorithmContractId':contract or algorithm_contract()['contractId'],
-            'features':['finalScore'],'medians':[50], 'netRegressor':'fixture', 'maeRegressor':'fixture',
-            'calibrationKnots':[0,1], 'calibrationPercentiles':[0,100], 'riskCoefficient':1,
-            'logisticMean':[0], 'logisticScale':[1], 'logisticCoef':[1], 'logisticIntercept':0}
+            'features':['finalScore'],'medians':[50], 'netRegressor':'fixture', 'tailRegressor':'fixture',
+            'eventClassifier':'fixture','calibrationCoef':1.,'calibrationIntercept':0.,'riskCoefficient':1,
+            'ridgeCoef':[.01,0], 'ridgeIntercept':0., 'trainingPrevalence':.1, 'trainingMeanReturn':0.,
+            'dataLineage':{'sessions':[{'code':'000001','day':DAY.isoformat(),'revision':'fixture'}]},
+            'logisticMean':[0,0], 'logisticScale':[1,1], 'logisticCoef':[1,0], 'logisticIntercept':0}
+
+
+def fixture_predictions(model, rows):
+    n = len(rows)
+    return {'rank':np.arange(n,dtype=float)+70,'baselineRank':np.full(n,50.),
+            'net':np.full(n,.07),'tail':np.full(n,-.01),'probability':np.full(n,.7),
+            'utility':np.full(n,.06),'eligible':np.ones(n,dtype=bool)}
 
 
 @pytest.mark.parametrize('stage,passed,contract,expected', [
     ('active',True,None,True), ('shadow',True,None,False), ('rejected',True,None,False),
     ('active',False,None,False), ('active',True,'old-contract',False)])
-def test_active_ranker_requires_matching_contract_and_passed_release(stage,passed,contract,expected,tmp_path):
+def test_active_ranker_requires_matching_contract_and_passed_release(stage,passed,contract,expected,tmp_path,monkeypatch):
     service = SignalLearningService(tmp_path)
+    monkeypatch.setattr(task_learning,'lineage_valid',lambda *_:True)
+    monkeypatch.setattr(task_learning,'predict_model',fixture_predictions)
     with service._connect() as db:
         db.execute('INSERT INTO model_versions VALUES(?,?,?,?,?)',
                    ('model',stage,json.dumps(artifact('model',contract)),json.dumps({'passed':passed}),_clock(DAY).isoformat()))
@@ -76,7 +88,7 @@ def test_corrupt_configured_champion_is_not_reported_as_effective(tmp_path):
     assert state['configuredChampionVersion'] == 'missing'
     assert state['championVersion'] is None
     assert state['stage'] == 'rules_cold_start'
-    assert state['effectiveRankVersion'] == 'rules_v1.1'
+    assert state['effectiveRankVersion'] == 'rules_v1.2'
     assert state['effectiveRankSource'] == 'rules'
     assert state['rankingFallbackReason']
 
@@ -95,6 +107,7 @@ def test_old_gate_results_are_not_relabelled_with_the_new_contract(tmp_path):
     assert state['validationContractId'] == algorithm_contract()['contractId']
     assert service._registry()['priorValidation']['gates'] == old_gates
     service._save_registry({'algorithmContractId':algorithm_contract()['contractId'],
+                            'taskContractId':task_learning.task_contract()['taskContractId'],
                             'gates':{'holdout':{'passed':False}}},_clock(DAY))
     assert service.learning_state(_clock(DAY))['gates'] == {'holdout':{'passed':False}}
 
@@ -108,20 +121,26 @@ def test_live_ranking_and_saved_provenance_use_only_shared_eligible_rows(tmp_pat
     observed = []
     def predict(model, rows):
         observed.append(len(rows))
-        return np.arange(len(rows),dtype=float)+70,np.full(len(rows),.5)
-    monkeypatch.setattr(service,'_predict_artifact',predict)
+        return fixture_predictions(model,rows)
+    monkeypatch.setattr(task_learning,'lineage_valid',lambda *_:True)
+    monkeypatch.setattr(task_learning,'predict_model',predict)
     good = _candidate('000001',DAY)
+    good['researchFactors'] = {'C': {'value': 55, 'source': 'announcement', 'availableAt': _clock(DAY).isoformat()}}
+    good['factorCoverage'] = {'early': .9}
     blocked = {**_candidate('000002',DAY),'evidenceEligible':False,'finalScore':99}
     ranked = service.rank_candidates([blocked,good])
-    assert observed == [1]
+    assert observed == [1,1]  # serialized artifact probe, then one eligible candidate
     assert ranked[0]['code'] == '000001'
     assert ranked[0]['learningRankVersion'] == 'model'
-    assert ranked[1]['learningRankVersion'] == 'rules_v1.1'
+    assert ranked[1]['learningRankVersion'] == 'rules_v1.2'
     service.persist_scan({'status':'completed_observations','scoreVersion':algorithm_contract()['scoreVersion'],
                           'candidates':ranked[:1],'controls':ranked[1:]},'0940',_clock(DAY),True)
     signals = service.history()['items'][0]['signals']
     assert signals[0]['snapshot']['learningRankVersion'] == 'model'
     assert signals[0]['snapshot']['algorithmContractId'] == algorithm_contract()['contractId']
+    assert signals[0]['snapshot']['researchFactors'] == good['researchFactors']
+    assert signals[0]['snapshot']['dataEligibility']['status'] == 'formal'
+    assert signals[0]['snapshot']['priceHistoricalCoverageDays'] == 20
     assert signals[0]['trainingEligible']
     assert not signals[1]['trainingEligible']
 
@@ -130,7 +149,8 @@ def test_account_baseline_uses_saved_selection_rank_and_model_ties_use_live_orde
     day = DAY.isoformat()
     common = {'day':day,'runId':'same-scan','selected':True,'filled':True,
               'decisionAt':_clock(DAY).isoformat(),'entryAt':_clock(DAY,9,42).isoformat(),
-              'exitAt':_clock(DAY,15,0).isoformat(),'entryPrice':10.,'entryMinuteVolume':1_000_000}
+              'exitAt':_clock(DAY,15,0,0).isoformat(),'entryPrice':10.,'entryMinuteVolume':1_000_000,
+              'exitMinuteVolume': 1_000_000}
     winner = {**common,'code':'000001','features':{'finalScore':10},'selectionRank':1,
               'recordedRankScore':90,'rankingTieBreakOrder':0,'exitPrice':12.,'marks':{day:12.}}
     loser = {**common,'code':'000002','features':{'finalScore':99},'selectionRank':2,
@@ -140,3 +160,22 @@ def test_account_baseline_uses_saved_selection_rank_and_model_ties_use_live_orde
     assert SignalLearningService._account_nav(samples,None,config)['net'] > 0
     assert SignalLearningService._account_nav(samples,np.array([90,90]),config)['net'] > 0
     assert SignalLearningService._account_nav(samples,np.array([99,80]),config)['net'] < 0
+
+
+def test_deferred_intraday_exit_releases_cash_before_later_scan():
+    tomorrow, next_day = DAY + timedelta(days=1), DAY + timedelta(days=2)
+    first = {'day': DAY.isoformat(), 'runId': 'first', 'code': '000001', 'selected': True,
+             'filled': True, 'features': {'finalScore': 70}, 'decisionAt': _clock(DAY).isoformat(),
+             'entryAt': _clock(DAY, 9, 42).isoformat(), 'entryPrice': 10.,
+             'exitAt': _clock(tomorrow, 9, 31).isoformat(), 'exitPrice': 9.,
+             'entryMinuteVolume': 1_000_000, 'exitMinuteVolume': 1_000_000,
+             'marks': {DAY.isoformat(): 9., tomorrow.isoformat(): 9.}}
+    second = {**first, 'day': tomorrow.isoformat(), 'runId': 'second', 'code': '000002',
+              'decisionAt': _clock(tomorrow).isoformat(), 'entryAt': _clock(tomorrow, 9, 42).isoformat(),
+              'exitAt': _clock(next_day, 15, 0, 0).isoformat(), 'exitPrice': 10.2,
+              'marks': {tomorrow.isoformat(): 10., next_day.isoformat(): 10.2}}
+    result = SignalLearningService._account_nav([first, second], np.array([70., 70.]), AccountConfig(max_positions=1))
+    assert result['valid'] and result['completedTrades'] == 2
+    second['exitMinuteVolume'] = 1
+    failed = SignalLearningService._account_nav([first, second], np.array([70., 70.]), AccountConfig(max_positions=1))
+    assert not failed['valid'] and failed['reason'] == 'exit_participation_evidence_missing_or_exceeded'

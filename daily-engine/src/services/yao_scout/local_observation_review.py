@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
 STATE_KEY = "king-local-observation-review-v1"
-SCAN_MODES = {"king_live", "king_0920", "king_0922", "king_1030", "king_1455"}
+SCAN_MODES = {"king_live", "king_0920", "king_0922", "king_0940", "king_0955", "king_1030", "king_1455"}
 
 
 def _stamp(value):
@@ -180,12 +180,11 @@ def review_local_observations(db, quote_fetcher, now, history=None, *, clock=Non
     return review
 
 
-def read_observation_reminders(db, code, now):
+def _reminders_from_state(state, code, now):
     """Read prior review evidence to add verification reminders to the next scan."""
     if now.tzinfo is None:
         return []
     now = now.astimezone(TZ)
-    state = _load_state(db)
     reviewed_at = _stamp(state.get("reviewed_at"))
     if reviewed_at is None or reviewed_at > now:
         return []
@@ -201,3 +200,16 @@ def read_observation_reminders(db, code, now):
     if windvanes:
         reminders.append("历史扫描出现不可买风向标状态，本轮重新核对封板、停牌及成交条件")
     return reminders
+
+
+def read_observation_reminders_batch(db, codes, now):
+    """Decode the saved review once, before fetching the scan's final quotes."""
+    codes = list(dict.fromkeys(codes))
+    if not codes or now.tzinfo is None:
+        return {code: [] for code in codes}
+    state = _load_state(db)
+    return {code: _reminders_from_state(state, code, now) for code in codes}
+
+
+def read_observation_reminders(db, code, now):
+    return read_observation_reminders_batch(db, [code], now).get(code, [])

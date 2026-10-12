@@ -3,6 +3,8 @@
 import {CaretDown, CaretUp, RefreshCircleOutline} from "@vicons/ionicons5";
 import {NText,useMessage} from "naive-ui";
 import {onBeforeUnmount, onMounted, onUnmounted, ref} from "vue";
+import {usePageActive} from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 import {GetIndustryMoneyRankSina} from "../../wailsjs/go/main/App";
 import KLineChart from "./KLineChart.vue";
 
@@ -31,6 +33,7 @@ onMounted(()=>{
   fenlei.value=props.fenlei
   GetRankData()
   interval.value=setInterval(()=>{
+    if (!pageActive.value) return
     GetRankData()
   },1000*60)
 })

@@ -1,6 +1,7 @@
 <script setup>
 import * as echarts from "echarts";
-import {computed, h, inject, nextTick, onBeforeMount, onBeforeUnmount, onMounted,onUnmounted, ref} from 'vue'
+import {computed, h, inject, nextTick, onActivated, onBeforeMount, onBeforeUnmount, onDeactivated, onMounted,onUnmounted, ref, watch} from 'vue'
+import {usePageActive} from '../utils/pageSession.mjs'
 import {
   GetAIResponseResult,
   GetConfig,
@@ -44,6 +45,7 @@ import ConceptFundFlowChart from "./conceptFundFlowChart.vue";
 import RzrqRank from "./RzrqRank.vue";
 
 const route = useRoute()
+const pageActive = usePageActive()
 const icon = ref('');
 
 const message = useMessage()
@@ -89,6 +91,8 @@ const tradingCheckInterval = ref(null)
 const mdPreviewRef = ref(null)
 const aiResultScrollRef = ref(null)
 const stockCode= ref('')
+watch(() => route.query.name, name => { if (name) updateTab(name) })
+watch(() => route.query.stockCode, code => { if (code) stockCode.value = code })
 const enableTools= ref(true)
 const thinkingMode = ref(true)
 const treemapRef = ref(null);
@@ -137,12 +141,14 @@ onBeforeMount(() => {
   startTradingTimers();
 
   tradingCheckInterval.value = setInterval(async () => {
+    if (!pageActive.value) return
     const [cn, hk, us] = await Promise.all([
       IsTradingTime().catch(() => false),
       IsHKTradingTime().catch(() => false),
       IsUSTradingTime().catch(() => false)
     ])
     const anyTrading = cn || hk || us
+    if (!pageActive.value) return
     if (anyTrading && !indexInterval.value) {
       startTradingTimers()
     } else if (!anyTrading && indexInterval.value) {
@@ -165,10 +171,13 @@ onBeforeUnmount(() => {
 
 function startTradingTimers() {
   stopTradingTimers()
+  if (!pageActive.value) return
   indexInterval.value = setInterval(() => {
+    if (!pageActive.value) return
     getIndex()
   }, 3000)
   indexIndustryRank.value = setInterval(() => {
+    if (!pageActive.value) return
     industryRank()
     ReFlesh("财联社电报")
     ReFlesh("新浪财经")
@@ -186,6 +195,8 @@ function stopTradingTimers() {
     indexIndustryRank.value = null
   }
 }
+onActivated(() => { void nextTick(() => { startTradingTimers(); panelHeight.value = window.innerHeight - 240; treemapchart?.resize() }) })
+onDeactivated(stopTradingTimers)
 
 onUnmounted(() => {
 

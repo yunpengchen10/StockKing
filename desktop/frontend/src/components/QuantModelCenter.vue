@@ -1,5 +1,5 @@
 <script setup>
-import {computed, nextTick, onBeforeUnmount, onMounted, ref} from 'vue'
+import {computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref} from 'vue'
 import {useMessage} from 'naive-ui'
 import * as echarts from 'echarts'
 import {GetEngineStatus, GetModelMetrics, ListQuantTasks, PauseQuantTask, ResumeQuantTask,
@@ -220,7 +220,10 @@ function tabChanged(value) {
   if (value === 'account') void refreshReports()
   void nextTick(() => chart?.resize())
 }
-onMounted(() => { void refresh(); timer = setInterval(refresh, 5000) })
+function startRefreshTimer() { clearInterval(timer); timer = setInterval(refresh, 5000) }
+onMounted(() => { void refresh(); startRefreshTimer() })
+onActivated(() => { startRefreshTimer(); void nextTick(() => chart?.resize()) })
+onDeactivated(() => { clearInterval(timer) })
 onBeforeUnmount(() => { clearInterval(timer); observer?.disconnect(); chart?.dispose() })
 </script>
 
@@ -332,7 +335,7 @@ onBeforeUnmount(() => { clearInterval(timer); observer?.disconnect(); chart?.dis
         <n-alert v-if="!localAlgorithm.contractId" type="warning" :bordered="false" class="notice">尚未取得本地精选算法契约，不能确认当前版本的验证结果。</n-alert>
         <section class="panel holding-review local-contract">
           <div class="section-title"><h3>{{ localStageLabel }}</h3><n-tag size="small" :bordered="false" :type="localValidation.stage === 'active' ? 'info' : 'warning'">{{ localValidation.stage === 'active' ? '排序模型已发布' : '未宣称已验证收益' }}</n-tag></div>
-          <dl class="contract-fields"><div><dt>评分规则</dt><dd>{{ localAlgorithm.scoreVersion || '未读取' }}</dd></div><div><dt>实际排序版本</dt><dd>{{ localValidation.effectiveRankVersion || '未读取' }}</dd></div><div><dt>准入规则</dt><dd>{{ localAlgorithm.entryPolicyVersion || '未读取' }}</dd></div><div><dt>证据规则</dt><dd>{{ localAlgorithm.evidenceVersion || '未读取' }}</dd></div><div><dt>算法契约</dt><dd>{{ localAlgorithm.contractId || '未读取' }}</dd></div><div><dt>最近训练</dt><dd>{{ localValidation.lastTrainingAt || '尚未训练' }}</dd></div></dl>
+          <dl class="contract-fields"><div><dt>评分规则</dt><dd>{{ localAlgorithm.scoreVersion || '未读取' }}</dd></div><div><dt>实际排序版本</dt><dd>{{ localValidation.effectiveRankVersion || '未读取' }}</dd></div><div><dt>准入规则</dt><dd>{{ localAlgorithm.entryPolicyVersion || '未读取' }}</dd></div><div><dt>证据规则</dt><dd>{{ localAlgorithm.evidenceVersion || '未读取' }}</dd></div><div><dt>算法契约</dt><dd>{{ localAlgorithm.contractId || '未读取' }}</dd></div><div><dt>最近训练检查</dt><dd>{{ localValidation.lastLearningCheckAt || localValidation.lastTrainingAt || '尚未检查' }}</dd></div><div><dt>最近完成拟合</dt><dd>{{ localValidation.lastFitCompletedAt || '尚未完成' }}</dd></div><div><dt>最近验证</dt><dd>{{ localValidation.lastValidationAt || '尚未完成' }}</dd></div></dl>
           <p>{{ localValidation.reason || '当前验证状态尚未读取。' }}</p>
           <p v-if="localValidation.rankingFallbackReason">排序回退原因：{{ localValidation.rankingFallbackReason }}</p>
           <p>精选与验证共用评分权重、版本检查和事前准入。实时行情时间与历史验证时点不同，结果不要求相同；旧快照保留其生成时版本。</p>

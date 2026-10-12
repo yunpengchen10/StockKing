@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stock-king"
-version = "2.6.0"
+version = "2.7.0"
 description = "Stock King desktop launcher and auditable stock research engine"
 readme = "README.md"
 requires-python = ">=3.11"

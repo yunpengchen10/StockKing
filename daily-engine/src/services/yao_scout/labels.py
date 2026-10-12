@@ -8,6 +8,8 @@ from typing import Any
 
 import pandas as pd
 
+LABEL_SCHEMA_VERSION = "yao-outcomes-v2-horizon-local"
+
 
 def board_limit_ratio(code: str, trade_date: date, *, is_st: bool = False) -> float:
     """Return the historical daily price-limit ratio for the supported universe."""
@@ -82,10 +84,12 @@ def evaluate_outcome_labels(
     lows = pd.to_numeric(future.get("low"), errors="coerce").dropna()
     max_return = ((float(highs.max()) / entry_price) - 1.0) * 100.0 if not highs.empty else None
     max_drawdown = ((float(lows.min()) / entry_price) - 1.0) * 100.0 if not lows.empty else None
+    continuation_highs = pd.to_numeric(future.head(5).get("high"), errors="coerce").dropna()
+    continuation_return = ((float(continuation_highs.max()) / entry_price) - 1.0) * 100.0 if not continuation_highs.empty else None
 
     ignition = any(touches[:3]) if len(future) >= 3 else None
     continuation = (
-        sum(touches[:5]) >= 2 or (max_return is not None and max_return >= 20.0)
+        sum(touches[:5]) >= 2 or (continuation_return is not None and continuation_return >= 20.0)
         if len(future) >= 5
         else None
     )
@@ -100,6 +104,7 @@ def evaluate_outcome_labels(
     if touched_count and all(one_price[index] for index, touched in enumerate(touches) if touched):
         tradability_status = "unavailable_one_price_limit"
     return {
+        "labelSchemaVersion": LABEL_SCHEMA_VERSION,
         "maturity_status": maturity,
         "ignition_3d": ignition,
         "continuation_5d": continuation,
@@ -141,6 +146,7 @@ def _normalize_history(history: pd.DataFrame) -> pd.DataFrame:
 
 def _unavailable(reason: str) -> dict[str, Any]:
     return {
+        "labelSchemaVersion": LABEL_SCHEMA_VERSION,
         "maturity_status": "unavailable",
         "ignition_3d": None,
         "continuation_5d": None,

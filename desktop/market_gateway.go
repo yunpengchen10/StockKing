@@ -110,7 +110,7 @@ func marketGatewayHandler(token string) http.Handler {
 			results := map[string]any{}
 			for _, code := range request.Codes {
 				raw := data.FetchKLineWithFallback(code, "", request.Period, request.Count, request.End, "none")
-				results[code] = normalizedGatewayBars(raw, request.Period, time.Now())
+				results[code] = normalizedGatewayBars(raw, request.Period, time.Now(), code)
 			}
 			payload = map[string]any{"results": results}
 		case "/v1/snapshot":
@@ -178,10 +178,22 @@ func snapshotVolumeShares(s models.StockInfo) any {
 	return nil
 }
 
-func normalizedGatewayBars(raw *data.KLineSourceResult, period string, now time.Time) map[string]any {
+func normalizedGatewayBars(raw *data.KLineSourceResult, period string, now time.Time, requestedCode ...string) map[string]any {
 	rows := []map[string]any{}
 	if raw == nil {
 		return map[string]any{"bars": rows}
+	}
+	identity := map[string]any{"status": "request_only", "period": period}
+	if len(requestedCode) > 0 {
+		market, code := data.TdxMarketFromStockCode(requestedCode[0])
+		identity["requested_code"], identity["requested_market"] = code, market
+		if raw.Source == "tdx-mac" {
+			// marketminute.Fetch validated every page's echoed code, market,
+			// period and start before returning any bars through this path.
+			identity["status"] = "provider_reply_checked"
+			identity["response_code"], identity["response_market"] = code, market
+			identity["page_cursor_checked"] = true
+		}
 	}
 	// A cached unfinished bar does not become final merely because time passed.
 	if fetched, err := time.Parse(time.RFC3339Nano, raw.FetchedAt); err == nil && fetched.Before(now) {
@@ -212,8 +224,8 @@ func normalizedGatewayBars(raw *data.KLineSourceResult, period string, now time.
 					continue
 				}
 			}
-			rows = append(rows, map[string]any{"end": end.Format(time.RFC3339), "open": finiteMarketNumber(b.Open), "high": finiteMarketNumber(b.High), "low": finiteMarketNumber(b.Low), "close": finiteMarketNumber(b.Close), "volume_shares": finiteMarketNumber(b.Volume), "amount_cny": finiteMarketNumber(b.Amount), "source": raw.Source, "fetched_at": raw.FetchedAt})
+			rows = append(rows, map[string]any{"end": end.Format(time.RFC3339), "open": finiteMarketNumber(b.Open), "high": finiteMarketNumber(b.High), "low": finiteMarketNumber(b.Low), "close": finiteMarketNumber(b.Close), "volume_shares": finiteMarketNumber(b.Volume), "amount_cny": finiteMarketNumber(b.Amount), "source": raw.Source, "fetched_at": raw.FetchedAt, "identity_evidence": identity})
 		}
 	}
-	return map[string]any{"bars": rows, "source": raw.Source, "fetched_at": raw.FetchedAt, "volume_unit": raw.VolumeUnit, "amount_unit": raw.AmountUnit, "adjustment": raw.Adjustment, "time_semantics": "bar_end", "count": len(rows), "contract_version": "stock-king-market-v1"}
+	return map[string]any{"bars": rows, "source": raw.Source, "fetched_at": raw.FetchedAt, "volume_unit": raw.VolumeUnit, "amount_unit": raw.AmountUnit, "adjustment": raw.Adjustment, "time_semantics": "bar_end", "count": len(rows), "identity_evidence": identity, "contract_version": "stock-king-market-v2"}
 }

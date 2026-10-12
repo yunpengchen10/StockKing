@@ -81,7 +81,8 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--sk-accent); out
 .sk-connection.ready i { background: var(--sk-accent); }
 .sk-icon-button { display: inline-grid; place-items: center; width: 33px; height: 33px; border: 1px solid var(--sk-border); border-radius: 8px; background: transparent; color: var(--sk-text-muted); cursor: pointer; }
 .sk-icon-button:hover { background: var(--sk-surface-2); color: var(--sk-text); }
-.sk-page-content { flex: 1; min-height: 0; min-width: 0; overflow: auto; position: relative; overscroll-behavior: contain; --wails-draggable: no-drag; }
+.sk-page-content { flex: 1; min-height: 0; min-width: 0; overflow: hidden; position: relative; --wails-draggable: no-drag; }
+.sk-page-session { height: 100%; min-width: 0; overflow: auto; overscroll-behavior: contain; }
 .sk-startup-status { display: flex; align-items: center; justify-content: center; gap: 9px; padding: 8px 16px; font-size: 11px; color: var(--sk-accent); background: var(--sk-accent-soft); }
 .sk-startup-status>span { height: 8px; width: 8px; border-radius: 50%; background: var(--sk-accent); animation: sk-pulse 1.5s ease-in-out infinite; }
 .sk-statusbar { display: flex; flex: 0 0 28px; align-items: center; justify-content: space-between; gap: 18px; padding: 0 22px; border-top: 1px solid var(--sk-border); color: var(--sk-text-muted); background: var(--sk-shell-bg); font-size: 10px; }
@@ -112,7 +113,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--sk-accent); out
 .home-news-panel .n-list { border: 0; background: transparent; }
 .home-news-panel .n-list-item { padding: 14px 2px; }
 .home-news-panel .n-list .n-list__header { padding: 10px 2px; }
-.sk-page-content > .n-card { min-height: 100%; border-radius: 0; border: 0; padding: 9px; background: var(--sk-page-bg); }
+.sk-page-session > .n-card { min-height: 100%; border-radius: 0; border: 0; padding: 9px; background: var(--sk-page-bg); }
 .sk-help-details { color: var(--sk-text-muted); font-size: 11px; line-height: 1.8; }
 .sk-help-details > summary { cursor: pointer; user-select: none; }
 .sk-help-details[open] > summary { margin-bottom: 9px; color: var(--sk-text); }

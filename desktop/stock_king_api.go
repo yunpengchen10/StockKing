@@ -346,17 +346,17 @@ func (a *App) GetKingPicksHistory(limit int) (map[string]any, error) {
 	if limit < 1 || limit > 100 {
 		limit = 30
 	}
-	return a.dailyMap(http.MethodGet, fmt.Sprintf("/api/v1/stock-king/picks/history?limit=%d", limit), nil)
+	return a.kingPicksControl(http.MethodGet, fmt.Sprintf("/api/v1/stock-king/picks/history?limit=%d", limit), nil)
 }
 
-func (a *App) GetStockKingRecommendationHistory(date, symbol, version string) (map[string]any, error) {
-	return a.dailyMap(http.MethodGet, "/api/v1/stock-king/picks/records?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}}.Encode(), nil)
+func (a *App) GetStockKingRecommendationHistory(date, symbol, version string, includeControls bool) (map[string]any, error) {
+	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/records?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}, "compact": {"true"}, "include_controls": {strconv.FormatBool(includeControls)}}.Encode(), nil)
 }
 func (a *App) GetStockKingDelayedReviews(date, symbol, version string) (map[string]any, error) {
-	return a.dailyMap(http.MethodGet, "/api/v1/stock-king/picks/reviews?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}}.Encode(), nil)
+	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/reviews?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}}.Encode(), nil)
 }
 func (a *App) GetStockKingLearningState() (map[string]any, error) {
-	return a.dailyMap(http.MethodGet, "/api/v1/stock-king/picks/learning", nil)
+	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/learning", nil)
 }
 
 func syncKingPicksToRecommendations(result map[string]any) (int, error) {

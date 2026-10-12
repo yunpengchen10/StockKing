@@ -2,9 +2,9 @@
 
 [简体中文](WINDOWS_INSTALL.md)
 
-## v2.6.2 one-click installer
+## v2.7.0 one-click installer
 
-File: `Stock-King-Setup-x64-v2.6.2.exe`. For Windows 10/11 x64. It includes the desktop app, StockKing V1.1 local research engine, and an offline WebView2 installer. Python, Go and Node.js are not required. WebView2 is installed only if missing; market-data downloads still require a network connection.
+File: `Stock-King-Setup-x64-v2.7.0.exe`. For Windows 10/11 x64. It includes the desktop app, local research engine, and an offline WebView2 installer. Python, Go and Node.js are not required. WebView2 is installed only if missing; market-data downloads still require a network connection.
 
 1. Close Stock King, then double-click the installer.
 2. For an upgrade, select the existing installation directory, for example `D:\Stock King`. New users can use the default directory.
@@ -13,9 +13,17 @@ File: `Stock-King-Setup-x64-v2.6.2.exe`. For Windows 10/11 x64. It includes the 
 
 The distribution contains no personal databases, keys, watchlists or trained models. Existing user data lives under `%APPDATA%\Stock King` and `%LOCALAPPDATA%\Stock King`; uninstall preserves these directories. Back them up before upgrading. The installer registers seven current-user background tasks; automatic recommendations and learning retain separate application switches. The computer must stay on and the user must remain logged in.
 
-Compare `Get-FileHash .\Stock-King-Setup-x64-v2.6.2.exe -Algorithm SHA256` with the accompanying `SHA256SUMS.txt`. The Stock King app and installer are not code-signed; the bundled WebView2 installer has a verified Microsoft signature.
+Compare `Get-FileHash .\Stock-King-Setup-x64-v2.7.0.exe -Algorithm SHA256` with the accompanying `SHA256SUMS.txt`. The Stock King app and installer are not code-signed; the bundled WebView2 installer has a verified Microsoft signature.
 
 ## What changed
+
+v2.7.0 adds response-identity and independent OHLC checks, data quarantine, task-specific regression and probability calibration, chronological and shadow gates, and portfolio budgets. Native browser timer binding fixes `Illegal invocation` in records. Unqualified models remain rule research; improved returns have not been established. See the [algorithm specification](algorithm-v270.md) (Chinese).
+
+Local maintenance on 12 October 2026 adds compact recommendation records, incremental rendering and bounded reads with retries. Delayed reviews checkpoint each event and report closing price changes for selections and controls. Formal entries compare support risk against aligned ATR14 and wait for a new completed-minute structure after an observed failed breakout. Next-session research penalizes observed weakening. These repair software behavior and risk measurement; improved prediction returns have not been established. Frozen historical signals and algorithm contracts remain distinct. See the [rule and review notes](yao-v12-upgrade.md) for details.
+
+v2.6.3 fixes prematurely stopped minute-history pagination, partial responses suppressing fallback, backfill stopping before a full 20-session baseline, and price limits lost during quote merging. It improves financial pagination, sector-cache use and quote freshness. Delayed reviews save available results before fetching missing evidence and settling again; observed price paths remain separate from valid training samples. Missing or conflicting critical data restricts formal candidates and is never replaced with zero.
+
+A fresh installation downloads and accumulates data for its own research universe; it contains no distributor history, positions or models. Initial runs and insufficient history can still show gaps, and absent or inconsistent upstream data cannot be fabricated. Upgrades preserve frozen recommendation snapshots and do not backdate newly collected evidence.
 
 v2.6.2 fixes truncated recommendation-record responses exceeding 16 MiB. Previously, this caused `unexpected end of JSON input` and made records unavailable. The update reads and displays complete records while preserving existing signal data.
 

@@ -11,8 +11,9 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from .daily_opportunities import finite, quote_check, is_market_open
+from .research_policy import DEFAULT_PARAMETERS
 
-VERSION = 'king-evidence-20260920'
+VERSION = 'king-evidence-20261012'
 
 
 def research_queue_limit(universe_size: int) -> int:
@@ -80,6 +81,9 @@ def daily_evidence(frame, cutoff):
     close = data.close
     tr = pd.concat([data.high-data.low, (data.high-close.shift()).abs(), (data.low-close.shift()).abs()], axis=1).max(axis=1)
     result['asOf'] = data.date.iloc[-1].isoformat()
+    result['previousSession'] = {'asOf': result['asOf'], 'preCloseAsOf': data.date.iloc[-2].isoformat(), 'source': result['source'],
+        'priceBasis': frame.attrs.get('daily_adjustment') or frame.attrs.get('adjustment'),
+        'preClose': float(close.iloc[-2]), 'close': float(close.iloc[-1]), 'high': float(data.high.iloc[-1])}
     m = result['metrics']
     m.update(history_sessions=len(data), last_close=float(close.iloc[-1]),
              ma5=float(close.tail(5).mean()), ma10=float(close.tail(10).mean()), ma20=float(close.tail(20).mean()),
@@ -102,17 +106,37 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
     sector, funds = sector or {}, funds or {}
     sm, fm = dict(sector.get('metrics') or {}), dict(funds.get('metrics') or {})
     independent_gaps = list(sector.get('gaps') or []) + list(funds.get('gaps') or [])
+    factor_availability = {}
+    def aligned_asof(left, right):
+        try:
+            a, b = datetime.fromisoformat(left or ''), datetime.fromisoformat(right or '')
+            return a.tzinfo is not None and b.tzinfo is not None and a == b
+        except (ValueError, TypeError):
+            return False
     for data, metrics, label in ((sector,sm,'板块'),(funds,fm,'资金')):
+        missing_reasons = list(data.get('reasonCodes') or [])
         try:
             at = datetime.fromisoformat(data.get('asOf') or '')
             if at.tzinfo is None or not 0 <= (now-at).total_seconds() < 300:
                 raise ValueError()
         except (ValueError,TypeError):
             metrics.clear()
+            missing_reasons.append('source_time_missing_future_or_stale')
             independent_gaps.append(label+'源时间缺失、超前或过期')
-        if data.get('asOf') != (intraday or {}).get('asOf'):
+        if not aligned_asof(data.get('asOf'), (intraday or {}).get('asOf')):
             metrics.clear()
+            missing_reasons.append('minute_window_mismatch')
             independent_gaps.append(label+'分钟与个股计算窗口未对齐')
+        required = 'sector_return_5m_pct' if label=='板块' else 'main_net_flow_3m'
+        observed = finite(metrics.get(required)) is not None
+        if not observed and not missing_reasons:
+            missing_reasons.append('required_window_or_coverage_missing')
+        factor_availability['S' if label=='板块' else 'F'] = {
+            'status':'observed' if observed else 'unavailable', 'available':observed,
+            'sourceAsOf':data.get('asOf'), 'stockAsOf':(intraday or {}).get('asOf'),
+            'requestedCutoffAt':(intraday or {}).get('requestedCutoffAt'),
+            'reasonCodes':list(dict.fromkeys(missing_reasons)),
+            'meaning':'源数据可用性；负值仍是有效观测，不代表方向通过'}
     minute_gaps = list((intraday or {}).get('gaps') or [])
     try:
         minute_at = datetime.fromisoformat((intraday or {}).get('asOf') or '')
@@ -198,13 +222,22 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
         support = m['local_low_5m']
     space = (resistance/p-1)*100 if resistance and p else None
     risk = (1-support/p)*100 if support and p else None
-    rr = space/risk if space is not None and risk and risk > 0 else None
+    raw_rr = space/risk if space is not None and risk and risk > 0 else None
+    atr = finite(d.get('atr14')) if aligned else None
+    risk_floor = atr * DEFAULT_PARAMETERS['entry']['volatilityRiskFloorAtr'] if atr and atr > 0 else None
+    risk_distance = max(p-support, risk_floor or 0) if support and p else None
+    effective_risk = risk_distance/p*100 if risk_distance and p else None
+    rr = space/effective_risk if space is not None and effective_risk and effective_risk > 0 else None
     derived_source = f'日线:{(daily or {}).get("source") or "未取得"}；分钟:{(intraday or {}).get("source") or "未取得"}；报价:{source or "未取得"}'
     derived_at = f'日线截至{(daily or {}).get("asOf") or "未知"}；分钟{(intraday or {}).get("asOf") or "未知"}；报价{stamp or "未知"}'
     add('support', '失效参考支撑', support, '元', '跌破后原结构失效，不保证可按此价卖出', '风险', derived_source, derived_at)
     add('resistance', '上方历史压力', resistance, '元', '尚未突破前不假设越过', '空间', derived_source, derived_at)
     add('remaining_space_pct', '距历史压力空间', space, '%', '不是预期收益或涨停空间', '空间', derived_source, derived_at)
-    add('structure_reward_risk', '压力空间/支撑距离', rr, '倍', '只展示，不设统一入选门槛，不按此单项排序', '空间', derived_source, derived_at)
+    add('raw_structure_reward_risk', '压力空间/原支撑距离', raw_rr, '倍', '原始几何比；短分钟支撑不代表T+1可按此价退出', '空间', derived_source, derived_at)
+    add('entry_risk_distance', '入场风险比较距离', risk_distance, '元', 'max(到支撑距离,已对齐ATR14)；波动比较，不是止损或成交承诺', '风险', derived_source, derived_at)
+    add('structure_reward_risk', '压力空间/波动风险距离', rr, '倍', '使用支撑与ATR风险下限，避免局部低点过近放大空间比；分档检查，不作为排名分', '空间', derived_source, derived_at)
+    if raw_rr is not None and risk_floor and p-support < risk_floor:
+        risks.append(f'局部支撑仅距{p-support:.2f}元，小于ATR14 {atr:.2f}元；不能假设T+1期间可按局部支撑价止损')
     amount_ok = bool(amount and amount > 0 and volume and volume > 0 and not invalid_cumulative)
     above_vwap = bool(p and vwap and p > vwap)
     repair = bool(p and op and p > op and above_vwap)
@@ -256,17 +289,18 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
     if p and aligned and d.get('high20') and p > d['high20'] and resistance is None:
         reasons.append(f'价格已越过已知20日高点{d["high20"]:.2f}元；可继续观察突破承接，上方空间未量化，不设目标价')
     if rr is not None:
-        reasons.append(f'至历史压力{resistance:.2f}元尚有{space:.2f}%，至支撑{support:.2f}元为{risk:.2f}%，结构比{rr:.2f}倍')
+        reasons.append(f'至历史压力{resistance:.2f}元尚有{space:.2f}%，至支撑{support:.2f}元为{risk:.2f}%；波动风险距离{risk_distance:.2f}元，空间比{rr:.2f}倍')
     if high and low and d.get('atr14') and high-low > d['atr14']:
         branch = '高波动·' + branch
         risks.append(f'当日振幅金额{high-low:.2f}元高于历史ATR14 {d["atr14"]:.2f}元，须防冲高回落；高波动本身不加分或淘汰')
     gaps = list((daily or {}).get('gaps') or []) + minute_gaps + independent_gaps
-    gaps.append('催化事件及预期差尚未独立核验，不作为本轮入选理由')
+    if not v11:
+        gaps.append('催化事件及预期差尚未独立核验，不作为本轮入选理由')
     if not sector_ok:
         gaps.append('行业同刻共振未完整确认；降低置信度，不作为单项否决' if v11 else
                     '未同时满足行业同刻上涨、半数同业上涨及个股相对领先；不按孤立脉冲推荐')
     if not baseline_ok:
-        gaps.append('同刻20日基准尚未齐全；5—19日仅低置信排序，少于5日不生成V1.1分数' if v11 else
+        gaps.append('同刻20日基准尚未齐全；5—19日仅观察，少于5日不评分；正式候选另须通过关键因子和分档风险检查' if v11 else
                     '同刻20日基准尚未齐全，盘中推荐资格未开放')
     elif not volume_confirmed:
         risks.append('近3分钟成交额未超过20日同刻中位数，即时放量未确认')
@@ -299,7 +333,11 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
     risks = list(dict.fromkeys(risks + gaps))
     return {'recommendationLogicVersion': VERSION, 'strategyBranch': branch, 'selectionReasons': reasons,
             'riskReasons': risks, 'indicatorEvidence': evidence, 'evidenceEligible': eligible,
+            'factorAvailability':factor_availability,
             'evidenceGaps': list(dict.fromkeys(gaps)), 'structureRewardRisk': rr,
+            'rawStructureRewardRisk': raw_rr,
+            'entryRiskDistance': risk_distance, 'entryRiskFloorAtr': risk_floor,
+            'entryRiskBasis': 'max_observed_support_distance_and_aligned_daily_atr14',
             'evidenceChecks': {'minute_structure':immediate,'sector_resonance':sector_ok,
                 'history_5d':history_days >= 5,'history_20d':baseline_ok,
                 'relative_volume':volume_confirmed,'fund_direction':funds_ok},

@@ -1,5 +1,5 @@
 <script setup>
-import {ref, onBeforeUnmount} from "vue";
+import {ref, onBeforeUnmount, watch} from "vue";
 import {EventsOn, EventsOff} from "../../wailsjs/runtime";
 import {useRoute} from 'vue-router'
 import FundFollow from "./FundFollow.vue";
@@ -9,6 +9,7 @@ const nowTab = ref("基金自选")
 const route = useRoute()
 
 nowTab.value = route.query.name || '基金自选'
+watch(() => route.query.name, name => { if (['基金自选', '基金排行'].includes(name)) nowTab.value = name })
 
 EventsOn("changeFundTab", async (msg) => {
   nowTab.value = msg.name

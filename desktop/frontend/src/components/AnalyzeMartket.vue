@@ -11,7 +11,9 @@ import {
   RzrqTrend
 } from "../../wailsjs/go/main/App";
 import * as echarts from "echarts";
-import {onMounted, onUnmounted, ref, computed, watch} from "vue";
+import {nextTick, onMounted, onUnmounted, ref, computed, watch} from "vue";
+import {usePageActive} from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 const {darkTheme, chartHeight} = defineProps({
   chartHeight: {
     type: Number,
@@ -34,6 +36,7 @@ let latestCapital = null
 let chartObserver = null
 
 function resizeCharts() {
+  if (!pageActive.value) return
   for (const element of [limitChartRef.value, tlineChartRef.value, rzrqChartRef.value]) {
     if (element) echarts.getInstanceByDom(element)?.resize()
   }
@@ -101,6 +104,7 @@ onMounted(() => {
   handleIndexQuotes()
   handleEmotion()
   handleChartInterval = setInterval(function () {
+    if (!pageActive.value) return
     handleGlobalIndexes()
     handleIndexQuotes()
     handleEmotion()
@@ -125,6 +129,7 @@ watch(() => darkTheme, () => {
   if (latestTline) renderTlineChart(...latestTline)
   if (latestCapital) renderRzrqChart(...latestCapital)
 })
+watch(pageActive, active => { if (active) void nextTick(resizeCharts) })
 
 // 日期变更时重新加载
 function onDateChange(ts) {

@@ -6,6 +6,8 @@ import { EventsOff, EventsOn, WindowSetTitle } from '../wailsjs/runtime'
 import { GetConfig, GetEngineStatus, IsHKTradingTime, IsTradingTime, IsUSTradingTime } from '../wailsjs/go/main/App'
 import StockKingIcon from './components/StockKingIcon.vue'
 import stockKingLogo from './assets/images/stock-king-mark.svg'
+import { resumePage } from './router/router'
+import { PageSession } from './utils/pageSession.mjs'
 import './style.css'
 
 const route = useRoute()
@@ -85,7 +87,7 @@ function toggleTheme() {
   try { localStorage.setItem('stock-king.appearance', appearance) } catch {}
   document.documentElement.setAttribute('theme-mode', appearance)
 }
-function goTool(key) { void router.push({ name: key }) }
+function goTool(key) { void router.push(resumePage(key)) }
 
 onBeforeMount(async () => {
   applyTheme()
@@ -122,9 +124,9 @@ onBeforeUnmount(() => {
     <n-message-provider><n-notification-provider><n-modal-provider><n-dialog-provider>
       <div class="stock-king-shell" :class="isDark ? 'theme-dark' : 'theme-light'">
         <aside class="sk-sidebar" aria-label="主导航">
-          <RouterLink :to="{ name: 'home' }" class="sk-brand" aria-label="Stock King 市场概览"><img :src="stockKingLogo" alt="Stock King" /></RouterLink>
+          <RouterLink :to="resumePage('home')" class="sk-brand" aria-label="Stock King 市场概览"><img :src="stockKingLogo" alt="Stock King" /></RouterLink>
           <nav class="sk-primary-nav">
-            <RouterLink v-for="item in navigation" :key="item.name" :to="{ name: item.name }" class="sk-nav-item" :class="{ 'is-active': route.name === item.name }" :title="item.title" :aria-current="route.name === item.name ? 'page' : undefined">
+            <RouterLink v-for="item in navigation" :key="item.name" :to="resumePage(item.name)" class="sk-nav-item" :class="{ 'is-active': route.name === item.name }" :title="item.title" :aria-current="route.name === item.name ? 'page' : undefined">
               <StockKingIcon :name="item.icon" /><span>{{ item.label }}</span>
             </RouterLink>
           </nav>
@@ -132,7 +134,7 @@ onBeforeUnmount(() => {
             <n-dropdown trigger="click" placement="right-end" :options="toolOptions" @select="goTool">
               <button class="sk-nav-item" :class="{ 'is-active': moreActive }" aria-label="更多研究工具"><StockKingIcon name="tools" /><span>工具</span></button>
             </n-dropdown>
-            <RouterLink :to="{ name: 'settings' }" class="sk-nav-item" :class="{ 'is-active': route.name === 'settings' }" title="偏好设置"><StockKingIcon name="settings" /><span>设置</span></RouterLink>
+            <RouterLink :to="resumePage('settings')" class="sk-nav-item" :class="{ 'is-active': route.name === 'settings' }" title="偏好设置"><StockKingIcon name="settings" /><span>设置</span></RouterLink>
           </div>
         </aside>
         <div class="sk-workspace">
@@ -148,7 +150,13 @@ onBeforeUnmount(() => {
             </div>
           </header>
           <div v-if="loading" class="sk-startup-status" role="status"><span />{{ loadingMessage }}</div>
-          <div class="sk-page-content"><RouterView /></div>
+          <div class="sk-page-content">
+            <RouterView v-slot="{ Component, route: pageRoute }">
+              <KeepAlive>
+                <PageSession v-if="Component" :key="pageRoute.name" :component="Component" :location="pageRoute" />
+              </KeepAlive>
+            </RouterView>
+          </div>
           <footer class="sk-statusbar"><span><i class="sk-status-dot" />{{ connectionText }}</span><span class="sk-color-key"><i class="up" />红涨<i class="down" />绿跌</span></footer>
         </div>
       </div>

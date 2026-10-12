@@ -1,5 +1,7 @@
 <script setup>
 import { h, onMounted, onUnmounted, ref, reactive } from 'vue'
+import {usePageActive} from '../utils/pageSession.mjs'
+const pageActive = usePageActive()
 import {
   AddTradingRecord,
   GetTradingRecordList,
@@ -710,6 +712,7 @@ onMounted(() => {
   fetchStatistics()
   // 定时刷新收盘/最新价与盈亏：不抢 loading，避免请求进行中时跳过后续刷新
   refreshTimer.value = setInterval(() => {
+    if (!pageActive.value) return
     silentRefreshCurrentPage()
   }, 1000 * 10)
 })

@@ -14,6 +14,19 @@ const unique = value => [...new Set(value)]
 const recordedReason = value => !/(?:模型.*(?:未通过发布门槛|不可用|未就绪|未训练)|仅显示规则观察分|未加载模型)/.test(value)
 const missingReason = '旧记录未保存具体入选理由，不能据此补写；请查看原记录说明。'
 const present = value => value !== null && value !== undefined && value !== ''
+export const isEvidenceRuleVersion = value => /^stockking-v1\.[12](?:-|$)/.test(String(value || ''))
+function evidenceRuleFormula(pick) {
+  if (/^stockking-v1\.2(?:-|$)/.test(String(pick.scoreVersion || ''))) {
+    const coefficient = valid(pick.riskPenaltyCoefficient) ? Number(pick.riskPenaltyCoefficient) : 0.2
+    const branch = { early: 'Early', main: 'MainRise' }[pick.selectedScoreBranch] || '未记录'
+    const regime = valid(pick.marketRegime?.multiplier) ? Number(pick.marketRegime.multiplier) : '未记录'
+    return `FinalScore = clip(StageScore − ${coefficient} × DistributionRisk, 0, 100) × RegimeMultiplier。突破/修复选Early，延续选MainRise；本次阶段分支：${branch}，市场状态系数：${regime}。缺失因子保留为空、贡献为零，固定权重不重新分配；缺失风险按该项上界计入惩罚。市场状态仅向下调节研究分，不代表实际仓位；参数为未验证初值。`
+  }
+  if (/^stockking-v1\.1(?:-|$)/.test(String(pick.scoreVersion || ''))) {
+    return 'V1.1旧记录公式：FinalScore = clip(max(Early, MainRise) − 0.2 × DistributionRisk, 0, 100)。缺失因子按可用权重重新分配；0.2为未验证初值。'
+  }
+  return null
+}
 function displayValue(value) {
   if (!present(value) || (typeof value === 'number' && !Number.isFinite(value))) return '未取得'
   if (typeof value === 'boolean') return value ? '是' : '否'
@@ -67,7 +80,7 @@ export function explainPick(pick = {}) {
   const indicators = normalizeIndicatorEvidence(structured ? pick.indicatorEvidence : legacyIndicators(pick, features))
   const risks = unique([...strings(pick.riskReasons), ...strings(pick.risks), ...strings(pick.data_quality?.gaps)])
   const entry = pick.entryPlan || {}
-  const v11 = String(pick.scoreVersion || '').startsWith('stockking-v1.1')
+  const v11 = isEvidenceRuleVersion(pick.scoreVersion)
   const entryPlan = {
     trigger: strings(entry.trigger || pick.triggerConditions || pick.upgradeConditions || pick.triggers).join('；') || '未取得',
     invalidations: strings(entry.invalidations || pick.invalidationConditions || pick.invalidations).join('；') || '未取得',
@@ -89,7 +102,7 @@ export function explainPick(pick = {}) {
     baselineSource: pick.baselineEvidence?.baselineSource || '未取得',
     facts: indicators.map(({label, value}) => ({label, value})),
     scoreMeaning: pick.scoreMeaning || '研究排序分，仅用于候选比较；不是胜率、上涨概率或预期收益。',
-    scoreLabel:nls?'尾盘研究分 NLS':'研究排序分', formula:v11?'FinalScore = clip(max(Early, MainRise) − 0.2 × DistributionRisk, 0, 100)。缺失因子按可用权重重新分配；0.2为未验证初值。':meta?.formula||'该快照未提供公式版本',
+    scoreLabel:nls?'尾盘研究分 NLS':'研究排序分', formula:evidenceRuleFormula(pick)||meta?.formula||'该快照未提供公式版本',
     modelScores:v11 ? [['Early',pick.earlyScore],['MainRise',pick.mainRiseScore],['DistributionRisk',pick.distributionRisk], ...Object.entries(pick.factorScores || {})].map(([key,value])=>({key,label:key,value:valid(value)?number(value):'未取得'})) : Object.entries(scores.models||{}).filter(([,value])=>valid(value)).map(([key,value])=>({key,label:PICK_BRANCHES[key]?.name||key,value:number(value),selected:key===branch})),
     nlsScores:nls?Object.entries(nlsLabels).map(([key,[label,max]])=>({key,label,value:valid(scores.nls?.[key])?`${number(scores.nls[key])} / ${max}`:'未提供'})):[],
     evidence:(Array.isArray(pick.evidence)?pick.evidence:[]).map(item=>({...item,url:safeEvidenceURL(item.url)})),

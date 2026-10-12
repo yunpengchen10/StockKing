@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)][string]$BuiltExe,
     [Parameter(Mandatory = $true)][string]$BuiltEngineDir,
     [Parameter(Mandatory = $true)][string]$PythonBin,
-    [switch]$BackupConfig
+    [switch]$BackupConfig,
+    [switch]$NoLaunch
 )
 
 # Local, reversible installer. It never deletes an installation or a database.
@@ -263,6 +264,7 @@ print(json.dumps(records, ensure_ascii=True))
     # automatically restore old databases over newly written user state.
     # This is the user's desktop window, not a background helper. A hidden
     # launch holds the single-instance lock while making the app inaccessible.
+    if (-not $NoLaunch) {
     $started = Start-Process -FilePath $installedExe -WorkingDirectory $installRoot -WindowStyle Normal -PassThru
     $newAppStarted = $true
     $windowDeadline = (Get-Date).AddSeconds(30)
@@ -273,6 +275,10 @@ print(json.dumps(records, ensure_ascii=True))
     } while ($started.MainWindowHandle -eq 0 -and (Get-Date) -lt $windowDeadline)
     if ($started.MainWindowHandle -eq 0) { throw 'The desktop process has no visible window; see application logs and the retained backups.' }
     $manifest['desktopWindowVerified'] = $true
+    } else {
+        $manifest['desktopWindowVerified'] = $false
+        $manifest['launchDeferred'] = $true
+    }
     $manifest.phase = 'completed'
     $manifest['completedAtUtc'] = [DateTime]::UtcNow.ToString('o')
     Save-Manifest
