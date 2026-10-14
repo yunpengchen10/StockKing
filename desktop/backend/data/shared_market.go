@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 type marketCacheItem struct {
@@ -22,6 +24,8 @@ var sharedBars = struct {
 	sync.Mutex
 	entries map[string]marketCacheItem
 }{entries: make(map[string]marketCacheItem)}
+
+var sharedBarsRequests singleflight.Group
 
 func cloneKLines(r *KLineSourceResult) *KLineSourceResult {
 	if r == nil {
@@ -36,11 +40,24 @@ func cloneKLines(r *KLineSourceResult) *KLineSourceResult {
 }
 
 func FetchKLineWithFallback(code, name, period string, count int, end string, flags ...string) *KLineSourceResult {
+	return fetchSharedKLines(code, name, period, count, end, fetchKLineUncached, flags...)
+}
+
+// Coalesce overlapping chart and research requests without extending the quote
+// cache lifetime. Each caller receives its own rows, including concurrent callers.
+func fetchSharedKLines(code, name, period string, count int, end string, fetch func(string, string, string, int, string, ...string) *KLineSourceResult, flags ...string) *KLineSourceResult {
 	flag := adjustFlagFromVariadic(flags...)
 	if period == "1" || period == "5" || period == "15" || period == "30" || period == "60" {
 		flag = "none"
 	}
 	key := fmt.Sprintf("%s|%s|%s|%s", sinaSymbolFromStockCode(code), period, end, flag)
+	value, _, _ := sharedBarsRequests.Do(fmt.Sprintf("%s|%d", key, count), func() (interface{}, error) {
+		return loadSharedKLines(key, code, name, period, count, end, flag, fetch), nil
+	})
+	return cloneKLines(value.(*KLineSourceResult))
+}
+
+func loadSharedKLines(key, code, name, period string, count int, end, flag string, fetch func(string, string, string, int, string, ...string) *KLineSourceResult) *KLineSourceResult {
 	sharedBars.Lock()
 	cached, ok := sharedBars.entries[key]
 	sharedBars.Unlock()
@@ -52,7 +69,7 @@ func FetchKLineWithFallback(code, name, period string, count int, end string, fl
 		}
 		return result
 	}
-	result := fetchKLineUncached(code, name, period, count, end, flag)
+	result := fetch(code, name, period, count, end, flag)
 	if result == nil {
 		return &KLineSourceResult{Data: &[]KLineData{}}
 	}

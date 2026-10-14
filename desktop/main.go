@@ -4,11 +4,11 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
-	"fmt"
 	"go-stock/backend/data"
 	"go-stock/backend/db"
 	log "go-stock/backend/logger"
 	"go-stock/backend/models"
+	"go-stock/internal/desktopguard"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -59,6 +59,7 @@ func main() {
 		if r := recover(); r != nil {
 			log.SugaredLogger.Error("panic: ", r)
 			log.SugaredLogger.Error("stack: ", string(debug.Stack()))
+			os.Exit(1)
 		}
 	}()
 
@@ -72,6 +73,9 @@ func main() {
 	if slot := requestedBackgroundTask(os.Args[1:]); slot != "" {
 		db.Init(paths.databaseDSN())
 		os.Exit(runStockKingBackgroundTask(paths, slot))
+	}
+	if handled, code := desktopguard.Run(paths.LogDir); handled {
+		os.Exit(code)
 	}
 	data.SetAppIcon(icon)
 	db.Init(paths.databaseDSN())
@@ -131,12 +135,16 @@ func main() {
 	appHeight := config.WindowHeight
 
 	// 若用户尚未调整过窗口或记录为 0，则按屏幕比例给一个合适默认值
-	if appWidth <= 0 || appHeight <= 0 {
+	if appWidth < 480 || appHeight < 320 {
 		appWidth = width * 5 / 10
 		appHeight = height * 5 / 10
 	}
 	log.SugaredLogger.Info("screen resolution: " + convertor.ToString(width) + "x" + convertor.ToString(height))
 	log.SugaredLogger.Info("window size: " + convertor.ToString(appWidth) + "x" + convertor.ToString(appHeight))
+	startState := options.Normal
+	if desktopguard.IsRecoveryMinimized() {
+		startState = options.Minimised
+	}
 
 	// Create application with options
 	err = wails.Run(&options.App{
@@ -157,16 +165,16 @@ func main() {
 		BackgroundColour:         backgroundColour,
 		Assets:                   assets,
 		Menu:                     AppMenu,
-		Logger:                   logger.NewFileLogger(filepath.Join(paths.LogDir, "wails.log")),
+		Logger:                   newDesktopLogger(paths.LogDir, desktopguard.IsSupervised(), os.Exit),
 		LogLevel:                 logger.DEBUG,
 		LogLevelProduction:       logger.INFO,
 		OnStartup:                app.startup,
 		OnDomReady:               app.domReady,
 		OnBeforeClose:            app.beforeClose,
 		OnShutdown:               app.shutdown,
-		WindowStartState:         options.Normal,
+		WindowStartState:         startState,
 		SingleInstanceLock: &options.SingleInstanceLock{
-			UniqueId:               "stock-king",
+			UniqueId:               desktopInstanceID(paths),
 			OnSecondInstanceLaunch: app.onSecondInstanceLaunch,
 		},
 		Bind: []interface{}{
@@ -445,7 +453,6 @@ func initStockData(ctx context.Context) {
 // PanicHandler 捕获 panic 的包装函数
 func PanicHandler() {
 	if r := recover(); r != nil {
-		fmt.Printf("Recovered from panic: %v\n", r)
-		debug.PrintStack()
+		log.SugaredLogger.Errorf("Recovered from panic: %v\n%s", r, debug.Stack())
 	}
 }

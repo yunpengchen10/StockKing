@@ -1,11 +1,12 @@
-"""Durable, explicitly refreshed local-picks display, separate from scan history."""
+"""Durable local-picks display reconciled with completed scan history."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import threading
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,15 +16,26 @@ from src.services.stock_king_service import (
 )
 
 _display_lock = threading.RLock()
+logger = logging.getLogger(__name__)
+_SCAN_MODES = tuple(f"king_{slot}" for slot in ("live", "0920", "0922", "0940", "0955", "1030", "1455"))
+_SHANGHAI_TZ = timezone(timedelta(hours=8))
 _VALID_STATUSES = {
     "completed_observations", "no_candidates_with_coverage_limits",
     "completed", "no_qualified_signal",
 }
 
 
-def has_candidates(run: dict[str, Any]) -> bool:
-    return bool(run.get("candidates") or run.get("nextDayWatchlist") or run.get("nextDayContinuationWatchlist")
-                or any((run.get("profileCandidates") or {}).values()))
+def _generated_at(run: dict[str, Any]) -> datetime:
+    """Compare completion times across UTC, offset and legacy local timestamps."""
+    for key in ("generatedAt", "as_of", "cutoff_at"):
+        try:
+            stamp = datetime.fromisoformat(run.get(key) or "")
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=_SHANGHAI_TZ)
+            return stamp.astimezone(timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def display_counts(run: dict[str, Any]) -> dict[str, Any]:
@@ -41,6 +53,27 @@ def display_counts(run: dict[str, Any]) -> dict[str, Any]:
         # Continuations are an auxiliary queue, not a first-board recommendation.
         "savedRecommendationCount": len(trade | watch),
     }
+
+
+def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep full scans on disk, but omit unused duplicate research from the UI."""
+    run = payload.get("adaptive")
+    if not isinstance(run, dict):
+        return payload
+    shown = {key: value for key, value in run.items() if key not in {"controls", "windvanes"}}
+    if isinstance(run.get("precisionWatchlist"), list):
+        shown["precisionWatchlist"] = []
+        for pick in run["precisionWatchlist"]:
+            if not isinstance(pick, dict):
+                continue
+            item = {key: pick[key] for key in ("code", "name", "symbol", "stock_code", "symbol_code", "stock_name", "ts_code") if key in pick}
+            profiles = (pick.get("precisionDecision") or {}).get("profiles") or {}
+            item["precisionDecision"] = {"profiles": {
+                profile: {key: value[key] for key in ("entryEligible", "reasons") if key in value}
+                for profile, value in profiles.items() if isinstance(value, dict)
+            }}
+            shown["precisionWatchlist"].append(item)
+    return {**payload, "adaptive": shown}
 
 
 def displayable_run(run: Any) -> bool:
@@ -77,28 +110,53 @@ class LocalPicksDisplayStore:
     def storage_key(self) -> str:
         return str(self.path)
 
+    def _read_saved(self) -> dict[str, Any]:
+        """Read under _display_lock; compatibility summaries never rewrite a run."""
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            if (isinstance(value, dict) and value.get("displaySnapshotVersion") == 1
+                    and value.get("schemaVersion") == STOCK_KING_SCHEMA_VERSION
+                    and displayable_run(value.get("adaptive"))):
+                return {**value, **display_counts(value["adaptive"])}
+        except (OSError, ValueError, TypeError):
+            pass
+        return {}
+
     def read(self) -> dict[str, Any]:
-        with _display_lock:
+        # Reading history never starts a live scan. Filter at the database so
+        # unrelated/review runs cannot consume its bounded history window.
+        chosen = None
+        sync_error = False
+        if self.db is not None:
             try:
-                value = json.loads(self.path.read_text(encoding="utf-8"))
-                if (isinstance(value, dict) and value.get("displaySnapshotVersion") == 1
-                        and value.get("schemaVersion") == STOCK_KING_SCHEMA_VERSION
-                        and displayable_run(value.get("adaptive"))):
-                    # Response-only compatibility: opening a saved page never
-                    # rewrites its immutable selection or upgrades its rules.
-                    return {**value, **display_counts(value["adaptive"])}
-            except (OSError, ValueError, TypeError):
-                pass
-            if self.db is None:
-                return {}
-            # Initial migration only. Once saved, scheduled runs cannot change
-            # this display, and merely opening the page never invokes a scan.
-            rows = self.db.list_yao_runs(limit=100, include_result=True)
-            valid = [row["result"] for row in rows
-                     if str(row.get("mode") or "").startswith("king_")
-                     and displayable_run(row.get("result"))]
-            chosen = next((run for run in valid if has_candidates(run)), valid[0] if valid else None)
-            return self.save(chosen, source="migration") if chosen is not None else {}
+                rows = self.db.list_yao_display_runs(limit=100, modes=_SCAN_MODES,
+                                                    statuses=tuple(sorted(_VALID_STATUSES)))
+                valid = [row for row in rows
+                         if row.get("mode") in _SCAN_MODES and displayable_run(row.get("result"))]
+                newest = max(valid, key=lambda row: _generated_at(row["result"]), default=None)
+                with _display_lock:
+                    saved = self._read_saved()
+                if newest and (not saved or _generated_at(newest["result"]) > _generated_at(saved["adaptive"])):
+                    row = self.db.get_yao_run(newest["run_id"])
+                    result = (row or {}).get("result")
+                    if displayable_run(result):
+                        chosen = result
+                    else:
+                        sync_error = True
+            except Exception:
+                sync_error = True
+                logger.warning("Unable to reconcile local picks with scan history; retaining saved display", exc_info=True)
+
+        with _display_lock:
+            # A manual refresh may have finished while the database was read.
+            # Re-read inside the write lock so it cannot be replaced by an older
+            # history result. Equal timestamps retain the existing snapshot.
+            saved = self._read_saved()
+            if sync_error:
+                return _display_response({**saved, "displaySyncError": "最新推荐暂时读取失败，当前保留上次已保存结果"})
+            if chosen is None or (saved and _generated_at(chosen) <= _generated_at(saved["adaptive"])):
+                return _display_response(saved)
+            return self.save(chosen, source="history" if saved else "migration")
 
     def save(self, run: dict[str, Any], *, source: str = "manual") -> dict[str, Any]:
         if not displayable_run(run):
@@ -136,6 +194,9 @@ class LocalPicksDisplayStore:
         }
         encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False)
         with _display_lock:
+            saved = self._read_saved()
+            if saved and _generated_at(saved["adaptive"]) > _generated_at(run):
+                return _display_response(saved)
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = None
             try:
@@ -149,4 +210,4 @@ class LocalPicksDisplayStore:
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
-        return payload
+        return _display_response(payload)

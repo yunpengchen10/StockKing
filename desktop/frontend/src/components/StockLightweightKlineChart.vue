@@ -447,6 +447,10 @@ const longFocusedPriceField = ref(null)
 const suppressLongPriceEmit = ref(false)
 const loading = ref(false)
 const loadingHistory = ref(false)
+let loadRevision = 0
+let activeLoadKey = ''
+let chartDisposed = false
+let latestPollInFlight = false
 const errorText = ref('')
 const activeDataSource = ref('')
 const selectedMinuteDate = ref(null)
@@ -4187,6 +4191,8 @@ function returnToLatestMinute() {
 }
 
 function disposeChart() {
+  chartDisposed = true
+  loadRevision++
   clearPoll()
   if (loadOlderDebounceTimer) {
     clearTimeout(loadOlderDebounceTimer)
@@ -4307,7 +4313,7 @@ function scheduleLoadOlderDebounced() {
 function tryScheduleLoadOlderFromVisibleRange(range) {
   if (!pageActive.value) return
   if (!chart || !candleSeries) return
-  if (programmaticRangeDepth > 0 || loadingHistory.value || !hasMoreOlder.value) return
+  if (programmaticRangeDepth > 0 || loading.value || loadingHistory.value || !hasMoreOlder.value) return
   const lr = range ?? chart?.timeScale().getVisibleLogicalRange()
   if (!lr) return
   const info = candleSeries.barsInLogicalRange(lr)
@@ -4346,6 +4352,8 @@ function stopHistoryVisiblePoll() {
 
 async function loadOlderHistory() {
   if (
+    chartDisposed ||
+    loading.value ||
     loadingHistory.value ||
     !hasMoreOlder.value ||
     !mergedRawRows.length ||
@@ -4356,6 +4364,7 @@ async function loadOlderHistory() {
     return
   }
   const kltSnap = activeKlt.value
+  const revision = loadRevision
   const codeSnap = props.code
   const adjustSnap = DAILY_LIKE_KLT.has(kltSnap) ? activeAdjust.value : ''
   const oldest = mergedRawRows[0]
@@ -4376,7 +4385,7 @@ async function loadOlderHistory() {
       end,
       adjustSnap,
     )
-    if (kltSnap !== activeKlt.value || codeSnap !== props.code || adjustSnap !== adjustFlagForRequest.value) return
+    if (revision !== loadRevision || kltSnap !== activeKlt.value || codeSnap !== props.code || adjustSnap !== adjustFlagForRequest.value) return
     const src = result?.source || ''
     if (src) activeDataSource.value = src
     const raw = result?.data
@@ -4412,13 +4421,15 @@ async function loadOlderHistory() {
   } catch {
     /* 网络/桥接异常：保留 hasMoreOlder，用户可继续拖动重试 */
   } finally {
-    loadingHistory.value = false
+    if (revision === loadRevision) loadingHistory.value = false
   }
 }
 
 async function refreshLatestPoll() {
   if (!pageActive.value) return
-  if (!props.code || !candleSeries || isHistoricalMinuteView.value) return
+  if (chartDisposed || loading.value || latestPollInFlight || !props.code || !candleSeries || isHistoricalMinuteView.value) return
+  latestPollInFlight = true
+  const revision = loadRevision
   const kltSnap = activeKlt.value
   const codeSnap = props.code
   const adjustSnap = DAILY_LIKE_KLT.has(kltSnap) ? activeAdjust.value : ''
@@ -4431,7 +4442,7 @@ async function refreshLatestPoll() {
       meta.limit,
       adjustSnap,
     )
-    if (codeSnap !== props.code || activeKlt.value !== kltSnap || adjustSnap !== adjustFlagForRequest.value) return
+    if (revision !== loadRevision || codeSnap !== props.code || activeKlt.value !== kltSnap || adjustSnap !== adjustFlagForRequest.value) return
     const src = result?.source || ''
     if (src) activeDataSource.value = src
     const raw = result?.data
@@ -4443,6 +4454,8 @@ async function refreshLatestPoll() {
     withProgrammaticTimeRange(() => applySeriesFromRaw())
   } catch {
     /* 静默，避免打断看盘 */
+  } finally {
+    latestPollInFlight = false
   }
 }
 
@@ -4550,7 +4563,14 @@ function ensureChart() {
 }
 
 async function loadData() {
+  if (chartDisposed) return
+  const key = JSON.stringify([props.code, activeKlt.value, adjustFlagForRequest.value, selectedMinuteDate.value])
+  if (loading.value && key === activeLoadKey) return
+  activeLoadKey = key
+  const revision = ++loadRevision
+  loadingHistory.value = false
   if (!props.code) {
+    loading.value = false
     errorText.value = '未设置股票代码'
     mergedRawRows = []
     mergedRawRowsVersion.value++
@@ -4590,6 +4610,8 @@ async function loadData() {
           meta.limit,
           adjustFlagForRequest.value,
         )
+    // A slow reply must not replace a newer symbol, period, or minute-date view.
+    if (revision !== loadRevision) return
     const src = result?.source || ''
     activeDataSource.value = src
     const raw = result?.data
@@ -4624,9 +4646,9 @@ async function loadData() {
       chipItems.value = []
     }
   } catch (e) {
-    errorText.value = String(e?.message || e)
+    if (revision === loadRevision) errorText.value = String(e?.message || e)
   } finally {
-    loading.value = false
+    if (revision === loadRevision) loading.value = false
   }
 }
 
@@ -4871,6 +4893,8 @@ watch(pageActive, active => {
 watch(
   () => props.code,
   () => {
+    // Reset before requesting; the adjust watcher shares the same in-flight load.
+    activeAdjust.value = (isEtfCode.value || isHkCode.value || isCsiIndexCode.value || isGlobalIndexCode.value) ? 'none' : DEFAULT_ADJUST
     hoverRawRow.value = null
     clearAllMeasure()
     clearAllWave()
@@ -4922,14 +4946,6 @@ watch(activeAdjust, () => {
   if (!DAILY_LIKE_KLT.has(activeKlt.value)) return
   hoverRawRow.value = null
   loadData()
-})
-
-// 代码切换时（调用方未用 :key 重建组件的防御性处理）按 ETF/港股/中证指数/海外指数规则重置复权默认值
-watch(() => props.code, () => {
-  const next = (isEtfCode.value || isHkCode.value || isCsiIndexCode.value || isGlobalIndexCode.value) ? 'none' : DEFAULT_ADJUST
-  if (activeAdjust.value !== next) {
-    activeAdjust.value = next
-  }
 })
 
 watch(

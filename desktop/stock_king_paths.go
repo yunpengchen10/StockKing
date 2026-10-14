@@ -1,11 +1,23 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
+
+// A desktop owns the same profile it writes. This keeps independent profiles
+// (including recovery regression fixtures) from forwarding to each other's UI.
+func desktopInstanceID(paths AppPaths) string {
+	root := filepath.Clean(paths.RoamingRoot)
+	if runtime.GOOS == "windows" {
+		root = strings.ToLower(root)
+	}
+	return fmt.Sprintf("stock-king-%x", sha256.Sum256([]byte(root)))
+}
 
 // AppPaths keeps every writable Stock King artifact outside the installation
 // directory. This deliberately does not reuse the legacy go-stock or Daily

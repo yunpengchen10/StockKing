@@ -35,6 +35,12 @@ const forecastsLoading = ref(false)
 const forecasts = ref([])
 const note = ref({ symbolCode: '', symbolName: '', coreLogic: '', observationPlan: '', invalidationRisk: '' })
 let searchTimer = null
+let disposed = false
+let symbolRevision = 0
+let recentLoaded = false
+let preferenceWrites = Promise.resolve()
+let noteStatus = 'idle'
+let forecastsStatus = 'idle'
 
 const title = computed(() => code.value ? (name.value ? `${name.value} · ${code.value}` : code.value) : '尚未选择研究对象')
 
@@ -76,23 +82,42 @@ function submitTyped() {
   choose(value)
 }
 
-async function openSymbol(nextCode, nextName = '', syncRoute = true) {
+function persistSelection() {
+  if (!recentLoaded || !code.value) return
+  const recentJson = JSON.stringify(recent.value)
+  const lastJson = JSON.stringify({ code: code.value, name: name.value })
+  // Keep slow preference writes off the chart path, but preserve selection order.
+  preferenceWrites = preferenceWrites.then(() => Promise.allSettled([
+    SaveStockKingPreference('kline.recentSymbols', recentJson),
+    SaveStockKingPreference('kline.lastViewedSymbol', lastJson),
+  ])).catch(() => {})
+}
+
+function openSymbol(nextCode, nextName = '', syncRoute = true) {
   const normalized = toResearchCode(nextCode)
-  if (!normalized) return
+  if (!normalized || disposed) return
+  if (normalized !== code.value) {
+    symbolRevision++
+    noteStatus = 'idle'
+    forecastsStatus = 'idle'
+    note.value = { symbolCode: normalized, symbolName: nextName || normalized, coreLogic: '', observationPlan: '', invalidationRisk: '' }
+    forecasts.value = []
+    forecastsLoading.value = false
+  }
   code.value = normalized
   name.value = nextName || normalized
   recent.value = [{ code: normalized, name: name.value }, ...recent.value.filter((item) => item.code !== normalized)].slice(0, 12)
-  try {
-    await Promise.all([
-      SaveStockKingPreference('kline.recentSymbols', JSON.stringify(recent.value)),
-      SaveStockKingPreference('kline.lastViewedSymbol', JSON.stringify({ code: normalized, name: name.value })),
-    ])
-  } catch {}
+  persistSelection()
   if (syncRoute && pageActive.value && router.currentRoute.value.name === 'klineAnalysis' && (route.query.code !== code.value || route.query.name !== name.value)) {
-    await router.replace({ name: 'klineAnalysis', query: { code: code.value, name: name.value } })
+    void router.replace({ name: 'klineAnalysis', query: { code: code.value, name: name.value } })
   }
-  void loadNote()
-  void loadForecasts()
+  loadNotebook()
+}
+
+function loadNotebook() {
+  if (!showNotebook.value || !code.value) return
+  if (noteStatus === 'idle') void loadNote()
+  if (forecastsStatus === 'idle') void loadForecasts()
 }
 
 async function loadNote() {
@@ -101,9 +126,11 @@ async function loadNote() {
     return
   }
   const symbol = code.value
+  const revision = symbolRevision
+  noteStatus = 'loading'
   try {
     const stored = await GetResearchNote(symbol)
-    if (code.value !== symbol) return
+    if (disposed || revision !== symbolRevision || code.value !== symbol) return
     note.value = {
       symbolCode: code.value,
       symbolName: name.value,
@@ -111,7 +138,10 @@ async function loadNote() {
       observationPlan: stored?.observationPlan || '',
       invalidationRisk: stored?.invalidationRisk || '',
     }
+    noteStatus = 'ready'
   } catch (error) {
+    if (disposed || revision !== symbolRevision) return
+    noteStatus = 'idle'
     message.error(`读取笔记失败：${error?.message || error}`)
   }
 }
@@ -139,17 +169,22 @@ async function loadForecasts() {
   if (!/\.(SH|SZ|BJ)$/i.test(code.value)) {
     forecasts.value = []
     forecastsLoading.value = false
+    forecastsStatus = 'ready'
     return
   }
   forecastsLoading.value = true
+  forecastsStatus = 'loading'
   const symbol = code.value
+  const revision = symbolRevision
+  let failed = false
   const result = await Promise.all([1, 5, 20].map(async (horizon) => {
     try { return await GetForecast(symbol, horizon) }
-    catch (error) { return { horizon, available: false, unavailableReason: error?.message || String(error) } }
+    catch (error) { failed = true; return { horizon, available: false, unavailableReason: error?.message || String(error) } }
   }))
-  if (code.value !== symbol) return
+  if (disposed || revision !== symbolRevision || code.value !== symbol) return
   forecasts.value = result
   forecastsLoading.value = false
+  forecastsStatus = failed ? 'idle' : 'ready'
 }
 
 async function addToWatchlist() {
@@ -175,16 +210,27 @@ function percent(value) {
 }
 
 onBeforeMount(async () => {
+  // A pick supplies the symbol already: mount its chart before reading preferences.
+  if (route.query.code) openSymbol(route.query.code, route.query.name || '', false)
+  const revision = symbolRevision
   let recentRaw = ''
   try { recentRaw = await GetStockKingPreference('kline.recentSymbols') } catch {}
+  if (disposed) return
   if (recentRaw) {
-    try { recent.value = JSON.parse(recentRaw) } catch { recent.value = [] }
+    try {
+      const stored = JSON.parse(recentRaw)
+      if (Array.isArray(stored)) {
+        const seen = new Set(recent.value.map(item => item.code))
+        recent.value = [...recent.value, ...stored.filter(item => item?.code && !seen.has(item.code) && seen.add(item.code))].slice(0, 12)
+      }
+    } catch {}
   }
-  const fromRoute = route.query.code ? { code: route.query.code, name: route.query.name } : null
-  if (fromRoute?.code) await openSymbol(fromRoute.code, fromRoute.name || '', false)
-  else {
+  recentLoaded = true
+  if (code.value) persistSelection()
+  else if (revision === symbolRevision) {
     let lastRaw = ''
     try { lastRaw = await GetStockKingPreference('kline.lastViewedSymbol') } catch {}
+    if (disposed || revision !== symbolRevision) return
     let lastViewed = null
     if (lastRaw) {
       try { lastViewed = JSON.parse(lastRaw) } catch { lastViewed = { code: lastRaw, name: '' } }
@@ -206,6 +252,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  disposed = true
+  symbolRevision++
   window.removeEventListener('resize', updateHeight)
   try { EventsOff('klineSelectStock') } catch {}
   if (searchTimer) clearTimeout(searchTimer)
@@ -214,6 +262,8 @@ onBeforeUnmount(() => {
 watch(() => route.query.code, (next) => {
   if (next && next !== code.value) void openSymbol(next, route.query.name || '', false)
 })
+
+watch(showNotebook, loadNotebook)
 </script>
 
 <template>

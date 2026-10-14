@@ -12,6 +12,7 @@ import (
 	"go-stock/backend/db"
 	"go-stock/backend/logger"
 	"go-stock/backend/models"
+	"go-stock/internal/desktopguard"
 	"io"
 	"os"
 	"path/filepath"
@@ -95,6 +96,7 @@ func (a *App) removeCronEntry(key string) {
 // domReady is called after front-end resources have been loaded
 func (a *App) domReady(ctx context.Context) {
 	defer PanicHandler()
+	desktopguard.MarkReady()
 	defer func() {
 		// 增加延迟确保前端已准备好接收事件
 		go func() {

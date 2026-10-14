@@ -9,13 +9,14 @@ import PicksLedger from './PicksLedger.vue'
 import { predictionSummary, portfolioSummary, nextDayPredictionSummary } from '../utils/learningStatus.mjs'
 import { explainPick, PICK_BRANCHES, isEvidenceRuleVersion } from '../utils/pickExplain.mjs'
 import { createPicksRefreshController, readDisplayedPicks, saveDisplayedPicks, selectDisplayedPicks } from '../utils/picksRefresh.mjs'
+import { withRecordReadTimeout } from '../utils/recordRead.mjs'
 import { nextDayQueueLabel, nextDayTouchLabel, savedRecommendationSummary } from '../utils/pickLedger.mjs'
 
 const router = useRouter()
 const message = useMessage()
 const darkTheme = inject('appDarkTheme', ref(true))
 const loading = ref(false), refreshError = ref(''), viewingHistory = ref(false), methodVisible = ref(false), selectedPick = ref(null), explanationVisible = ref(false)
-const restoring = ref(true)
+const restoring = ref(true), restoreError = ref('')
 const refreshProgress = ref(0), refreshStage = ref(''), refreshElapsed = ref(0)
 const isV11 = computed(() => isEvidenceRuleVersion(adaptive.value.scoreVersion || adaptive.value.modelVersion) || adaptivePicks.value.some(pick => isV11Pick(pick)))
 const explanation = computed(() => explainPick(selectedPick.value || {}))
@@ -43,7 +44,7 @@ const backgroundStatus = ref({ status: 'never_run', updatedAt: '' })
 const historyVisible = ref(false)
 const historyLoading = ref(false)
 const historyItems = ref([])
-let disposed = false, savedSyncTimer = null, savedSyncInFlight = false, displayReadPromise = null, displayLoaded = false, displayRevision = 0, startupPolls = 0
+let disposed = false, savedSyncTimer = null, savedSyncInFlight = false, displayReadPromise = null, displayRevision = 0, startupPolls = 0
 const pageResult = computed(() => viewMode.value === 'classic' ? classicResult.value : result.value)
 let snapshotStorage = null
 try { snapshotStorage = window.localStorage } catch (_) { /* Server persistence remains available. */ }
@@ -60,11 +61,13 @@ const refreshController = createPicksRefreshController({
   },
   onResult(fresh) {
     displayRevision++
-    displayLoaded = true
-    displayedResult.value = fresh
-    result.value = fresh
+    const saved = selectDisplayedPicks(displayedResult.value, fresh)
+    displayedResult.value = saved
+    result.value = saved
+    restoring.value = false
+    restoreError.value = ''
     viewingHistory.value = false
-    saveDisplayedPicks(snapshotStorage, fresh)
+    saveDisplayedPicks(snapshotStorage, saved)
     if (fresh.recommendationSyncError) message.warning(`精选已生成，但推荐记录同步失败：${fresh.recommendationSyncError}`)
   },
 })
@@ -238,7 +241,8 @@ function mergeAdaptive(snapshot) {
 
 function readSnapshot() {
   const parsed = readDisplayedPicks(snapshotStorage)
-  if (parsed) { displayedResult.value = parsed; result.value = parsed; classicResult.value = parsed }
+  // Cache is a fallback only; first verify the latest completed server scan.
+  if (parsed) displayedResult.value = parsed
   return !!parsed
 }
 
@@ -251,7 +255,7 @@ function calibrationValue(pick, key) {
 }
 function factorValue(value) { return value == null || !Number.isFinite(Number(value)) ? '未取得' : Number(value).toFixed(1) }
 
-async function syncSavedResults() {
+async function syncSavedResults(refreshDisplay = true) {
   if (disposed || savedSyncInFlight) return
   if (savedSyncTimer !== null) clearTimeout(savedSyncTimer)
   savedSyncTimer = null
@@ -263,7 +267,7 @@ async function syncSavedResults() {
     engine.value = status
     if (!status?.ready) { startupPolls++; return }
     startupPolls = 0
-    if (!displayLoaded && !loading.value) await restoreDisplayed()
+    if (refreshDisplay) await restoreDisplayed()
     if (disposed) return
     const background = await GetStockKingBackgroundStatus().catch(() => null)
     if (background && !disposed) backgroundStatus.value = background
@@ -277,13 +281,18 @@ async function syncSavedResults() {
 }
 
 async function restoreDisplayed() {
-  if (disposed || loading.value) return
+  if (disposed) return
   const revision = displayRevision
   try {
-    if (!displayReadPromise) displayReadPromise = GetDisplayedKingPicks().finally(() => { displayReadPromise = null })
+    if (!displayReadPromise) {
+      const pending = withRecordReadTimeout(GetDisplayedKingPicks()).finally(() => {
+        if (displayReadPromise === pending) displayReadPromise = null
+      })
+      displayReadPromise = pending
+    }
     const payload = await displayReadPromise
     if (disposed || revision !== displayRevision) return
-    displayLoaded = true
+    restoreError.value = payload?.displaySyncError || ''
     const saved = selectDisplayedPicks(displayedResult.value, payload)
     if (saved) {
       displayedResult.value = saved
@@ -291,7 +300,13 @@ async function restoreDisplayed() {
       saveDisplayedPicks(snapshotStorage, saved)
     }
     refreshController.resume(payload?.refreshTask)
-  } catch (_) { /* Keep the local display and retry once the engine becomes ready. */ }
+  } catch (error) {
+    if (disposed || revision !== displayRevision) return
+    restoreError.value = error?.message || String(error)
+    if (!viewingHistory.value && displayedResult.value) result.value = displayedResult.value
+  } finally {
+    if (!disposed && revision === displayRevision) restoring.value = false
+  }
 }
 function returnToDisplayed() {
   viewingHistory.value = false
@@ -406,10 +421,9 @@ onBeforeMount(async () => {
     GetStockKingAutoRecommendations().then(value => { if (!disposed) recommendationsEnabled.value = value }),
   ])
   await restoreDisplayed()
-  if (disposed) return
-  restoring.value = false
+  if (disposed || !pageActive.value) return
   refreshController.resume()
-  void syncSavedResults()
+  void syncSavedResults(false)
   await preferences
 })
 onBeforeUnmount(() => {
@@ -419,10 +433,19 @@ onBeforeUnmount(() => {
 })
 onActivated(() => {
   pageActive.value = true
-  if (!restoring.value && savedSyncTimer === null) void syncSavedResults()
+  if (!restoring.value && savedSyncTimer === null) {
+    restoring.value = true
+    void restoreDisplayed().then(() => {
+      if (!disposed && pageActive.value) void syncSavedResults(false)
+    })
+  }
 })
 onDeactivated(() => {
   pageActive.value = false
+  // A reply captured before leaving cannot verify the latest scan on return.
+  displayRevision++
+  displayReadPromise = null
+  restoring.value = false
   methodVisible.value = false
   historyVisible.value = false
   explanationVisible.value = false
@@ -445,10 +468,12 @@ onDeactivated(() => {
     <n-alert v-if="refreshError" type="warning" :show-icon="false" class="sync-alert">更新未完成：{{ refreshError }}<br/>已保存的推荐仍保留，可点击“刷新扫描”重试。</n-alert>
     <n-alert v-if="viewingHistory || (!engine.ready && !loading)" type="warning" :show-icon="false" class="sync-alert"><span>{{ viewingHistory ? '正在浏览历史快照' : (engine.message || '引擎正在启动，已保存推荐可以继续查看。') }}</span><n-button v-if="viewingHistory" size="tiny" text @click="returnToDisplayed">返回当前</n-button></n-alert>
     <div v-if="loading" class="refresh-progress" role="status" aria-live="polite"><div><b>{{ refreshStage || '正在扫描' }}</b><span>已用 {{ refreshElapsed }} 秒 · {{ refreshProgress }}%</span></div><n-progress type="line" :percentage="refreshProgress" :show-indicator="false" /><small>完成并保存后更新列表；切换页面后可继续查看进度。</small></div>
-    <div class="picks-meta"><span>{{ pageResult.asOfDate || pageResult.as_of_date || '待生成' }}</span><details class="sk-help-details"><summary>扫描信息</summary><p>生成 {{ pageResult.generatedAt || pageResult.generated_at || '—' }} · 版本 {{ pageResult.methodologyVersion || '兼容旧榜' }}</p><p>后台学习 {{ backgroundEnabled ? '开启' : '暂停' }} · {{ backgroundStatus.status || '未运行' }} {{ backgroundStatus.updatedAt }}</p><p>每轮扫描保留当时证据，可在历史中回看。</p></details></div>
+    <n-alert v-if="restoreError" type="warning" :show-icon="false" class="sync-alert">最新推荐读取失败：{{ restoreError }}<br/>{{ displayedResult ? '当前显示上次保存的推荐，尚未确认是否最新。' : '暂未取得推荐。' }}<n-button size="tiny" text @click="restoring=true; restoreDisplayed()">重试读取</n-button></n-alert>
+    <div v-if="!restoring || viewingHistory" class="picks-meta"><span>{{ pageResult.asOfDate || pageResult.as_of_date || '待生成' }}</span><details class="sk-help-details"><summary>扫描信息</summary><p>生成 {{ pageResult.generatedAt || pageResult.generated_at || '—' }} · 版本 {{ pageResult.methodologyVersion || '兼容旧榜' }}</p><p>后台学习 {{ backgroundEnabled ? '开启' : '暂停' }} · {{ backgroundStatus.status || '未运行' }} {{ backgroundStatus.updatedAt }}</p><p>每轮扫描保留当时证据，可在历史中回看。</p></details></div>
     <n-tabs v-model:value="viewMode" type="line" animated class="view-tabs"><n-tab-pane name="adaptive" tab="本地精选" /><n-tab-pane name="records" tab="推荐记录" /><n-tab-pane name="reviews" tab="延后复盘" /><n-tab-pane name="learning" tab="学习状态" /><n-tab-pane name="classic" tab="策略分组" /></n-tabs>
 
-    <section v-show="viewMode === 'adaptive'">
+    <section v-if="viewMode === 'adaptive' && restoring && !viewingHistory" class="picks-loading" role="status" aria-live="polite"><n-spin size="small" /><span>正在读取最新已完成的推荐…</span></section>
+    <section v-if="!restoring || viewingHistory" v-show="viewMode === 'adaptive'">
       <n-tabs v-if="adaptive.profileCandidates && !isV11" v-model:value="precisionProfile" type="segment">
         <n-tab-pane name="conservative" tab="稳健 · 财务与回撤" />
         <n-tab-pane name="regular" tab="均衡 · 趋势与买点" />
@@ -458,7 +483,7 @@ onDeactivated(() => {
       <details v-if="precisionWatchlist.length" class="sk-help-details"><summary>等待条件的股票（{{ precisionWatchlist.length }}）</summary>
         <p v-for="pick in precisionWatchlist" :key="codeOf(pick)">{{ nameOf(pick) }}：{{ pick.precisionDecision?.profiles?.[precisionProfile]?.reasons?.join('；') }}</p>
       </details>
-      <p class="quote-coverage">软件行情 · 本地计算 · 沪深主板非ST。次日冲板观察与交易条件候选分别保留，点击“刷新扫描”才重新选股。</p>
+      <p class="quote-coverage">软件行情 · 本地计算 · 沪深主板非ST。页面自动显示最新完成的扫描；点击“刷新扫描”可立即发起新一轮选股。</p>
       <n-alert v-if="adaptive.message" type="warning" :show-icon="false">{{ adaptive.message }}</n-alert>
       <div class="adaptive-summary saved-recommendations"><div><b>{{ result.adaptive ? savedRecommendations.saved ? `已保存研究推荐 · ${savedRecommendations.saved} 只` : '已保存扫描 · 暂无研究推荐' : '本地精选' }}</b><n-tag v-if="snapshotIsOld" size="small" type="warning" :bordered="false">历史结果</n-tag><small>生成时间 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small><small v-if="adaptive.run_id || adaptive.runId">扫描编号 {{ adaptive.run_id || adaptive.runId }}</small></div><n-button v-if="result.adaptive" size="small" secondary @click="openRecommendationRecords">查看最新推荐记录</n-button><span v-if="loading">扫描中 · 暂时保留原列表</span></div>
       <p v-if="adaptive.nextDayResearch" class="quote-coverage">已保存研究推荐按股票去重：{{ savedRecommendations.splitQueues ? '未触板潜伏' : '次日观察' }} {{ savedRecommendations.primary }} 只 · 交易条件候选 {{ savedRecommendations.execution }} 只<template v-if="savedRecommendations.splitQueues">；已触板延续 {{ savedRecommendations.continuation }} 只单列辅助观察，不计入主推荐。</template>研究观察保留依据和缺口，不代表已通过交易条件。</p>
@@ -652,6 +677,7 @@ onDeactivated(() => {
 </template>
 
 <style scoped>
+.picks-loading{display:flex;align-items:center;justify-content:center;gap:12px;min-height:180px;color:var(--sk-text-muted)}
 .pick-body>p.next-day-reason,.pick-body>p.quote-coverage{display:block}
 .history-channel{margin:10px 0 6px;font-size:11px;color:var(--sk-text-muted)}
 .refresh-progress{margin:12px 0;padding:12px;background:var(--sk-surface-2);border-radius:8px;font-size:12px}.refresh-progress>div{display:flex;justify-content:space-between;gap:14px;margin-bottom:8px}.refresh-progress span,.refresh-progress small{color:var(--sk-text-muted)}.refresh-progress small{display:block;margin-top:7px}.adaptive-summary>div{flex-wrap:wrap}

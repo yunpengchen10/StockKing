@@ -30,13 +30,13 @@ function fakeClock() {
   }
 }
 
-test('legacy candidates survive a newer empty migration; explicit manual empty results replace them', () => {
+test('latest completed scan replaces old candidates even when empty', () => {
   const storage = memoryStorage()
   const old = snapshot()
   storage.setItem(LEGACY_SNAPSHOT_KEY, JSON.stringify(old))
   assert.deepEqual(readDisplayedPicks(storage), old)
   const emptyMigration = { ...snapshot([], '2026-09-30T09:20:00+08:00'), displaySnapshotVersion: 1, displaySource: 'migration' }
-  assert.deepEqual(selectDisplayedPicks(old, emptyMigration), old)
+  assert.deepEqual(selectDisplayedPicks(old, emptyMigration), emptyMigration)
   const emptyManual = { ...emptyMigration, displaySource: 'manual' }
   const selected = selectDisplayedPicks(old, emptyManual)
   saveDisplayedPicks(storage, selected)
@@ -45,13 +45,35 @@ test('legacy candidates survive a newer empty migration; explicit manual empty r
   assert.ok(storage.getItem(DISPLAY_SNAPSHOT_KEY))
 })
 
+test('manual caches cannot pin the display over newer scheduled scans or roll it back', () => {
+  const oldManual = { ...snapshot(), displaySnapshotVersion: 1, displaySource: 'manual' }
+  const latest = { ...snapshot([{ code: '600002' }], '2026-10-13T10:30:00+08:00'), displaySnapshotVersion: 1, displaySource: 'scheduled' }
+  assert.deepEqual(selectDisplayedPicks(oldManual, latest), latest)
+  assert.deepEqual(selectDisplayedPicks(latest, oldManual), latest)
+  const nextDayOnly = { ...snapshot([], '2026-10-13T14:55:00+08:00'), displaySource: 'scheduled' }
+  nextDayOnly.adaptive.nextDayWatchlist = [{ code: '600003' }]
+  assert.deepEqual(selectDisplayedPicks(latest, nextDayOnly), nextDayOnly)
+})
+
 test('persisted display excludes active task metadata and ignores malformed snapshots', () => {
   const storage = memoryStorage()
-  saveDisplayedPicks(storage, { ...snapshot(), refreshTask: { task_id: 'active' } })
+  saveDisplayedPicks(storage, { ...snapshot(), refreshTask: { task_id: 'active' }, displaySyncError: 'temporary history failure' })
   assert.equal(readDisplayedPicks(storage).refreshTask, undefined)
+  assert.equal(readDisplayedPicks(storage).displaySyncError, undefined)
   assert.deepEqual(selectDisplayedPicks(snapshot(), {}), snapshot())
   saveDisplayedPicks(storage, { adaptive: { status: 'failed', candidates: [] } })
   assert.deepEqual(readDisplayedPicks(storage), snapshot())
+})
+
+test('a full browser cache cannot keep resurrecting a superseded recommendation', () => {
+  const storage = memoryStorage()
+  saveDisplayedPicks(storage, snapshot())
+  storage.setItem(LEGACY_SNAPSHOT_KEY, JSON.stringify(snapshot()))
+  storage.setItem = () => { throw new Error('QuotaExceededError') }
+  saveDisplayedPicks(storage, snapshot([], '2026-10-13T14:55:00+08:00'))
+  assert.equal(readDisplayedPicks(storage), null)
+  assert.equal(storage.getItem(DISPLAY_SNAPSHOT_KEY), null)
+  assert.equal(storage.getItem(LEGACY_SNAPSHOT_KEY), null)
 })
 
 test('refresh reports actual stages and replaces display only after a complete successful task', async () => {

@@ -292,8 +292,8 @@ func (a *App) GetKingPicksRefreshTask(taskID string) (map[string]any, error) {
 	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/refresh/tasks/"+url.PathEscape(taskID), nil)
 }
 
-// GetDisplayedKingPicks reads the durable display snapshot. Scheduled scans
-// cannot overwrite it, and this read never starts a new scan.
+// GetDisplayedKingPicks reads the newest completed saved scan, including
+// scheduled scans. This read never starts a new scan.
 func (a *App) GetDisplayedKingPicks() (map[string]any, error) {
 	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/display", nil)
 }

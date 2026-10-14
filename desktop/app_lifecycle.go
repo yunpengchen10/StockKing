@@ -10,6 +10,7 @@ import (
 	"go-stock/backend/data"
 	"go-stock/backend/db"
 	"go-stock/backend/logger"
+	"go-stock/internal/desktopguard"
 	"time"
 )
 
@@ -113,8 +114,10 @@ func MonitorStockPrices(a *App) {
 // Returning true will cause the application to continue, false will continue shutdown as normal.
 func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 	defer PanicHandler()
+	desktopguard.MarkClosing()
+	logger.SugaredLogger.Info("Desktop close requested; automatic recovery disabled for this launch")
 
-	if a.ctx != nil {
+	if a.ctx != nil && !runtime.WindowIsMinimised(ctx) {
 		w, h := runtime.WindowGetSize(ctx)
 		if w > 0 && h > 0 {
 			cfg := data.GetSettingConfig()

@@ -19,7 +19,7 @@ import logging
 import threading
 import time
 from datetime import datetime, date, timedelta, timezone
-from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar, Union
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar, Union, Sequence
 
 import pandas as pd
 from sqlalchemy import (
@@ -2621,6 +2621,36 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 select(YaoRun).where(YaoRun.run_id == str(run_id or "").strip())
             ).scalar_one_or_none()
             return self._yao_run_to_dict(row, include_result=True) if row else None
+
+    def list_yao_display_runs(
+        self, *, modes: Sequence[str], statuses: Sequence[str], limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Read completion/quality headers without materializing large scan payloads."""
+        with self.get_session() as session:
+            ids = (select(YaoRun.id).where(YaoRun.mode.in_(modes), YaoRun.status.in_(statuses))
+                   .order_by(desc(YaoRun.as_of_at), desc(YaoRun.id)).limit(max(1, min(int(limit), 100))))
+            # A scan can contain tens of MB of research history. Select IDs
+            # before JSON projection, then fetch only the winning full result.
+            header = func.json_extract(
+                YaoRun.result_json, '$.generatedAt', '$.as_of', '$.cutoff_at', '$.scanSlot', '$.status',
+                '$.dataQuality', '$.data_quality',
+            )
+            rows = session.execute(select(
+                YaoRun.run_id, YaoRun.mode, header,
+                func.json_type(YaoRun.result_json, '$.candidates'),
+                func.json_array_length(YaoRun.result_json, '$.nextDayWatchlist'),
+                func.json_array_length(YaoRun.result_json, '$.nextDayContinuationWatchlist'),
+            ).where(YaoRun.id.in_(ids))).all()
+            result = []
+            for run_id, mode, encoded, candidate_type, next_day_count, continuation_count in rows:
+                values = json.loads(encoded)
+                metadata = dict(zip(("generatedAt", "as_of", "cutoff_at", "scanSlot", "status",
+                                     "dataQuality", "data_quality"), values))
+                metadata.update(candidates=[] if candidate_type == "array" else None,
+                                nextDayWatchlist=[True] if next_day_count else [],
+                                nextDayContinuationWatchlist=[True] if continuation_count else [])
+                result.append({"run_id": run_id, "mode": mode, "result": metadata})
+            return result
 
     def get_latest_yao_run(self, *, mode: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self.get_session() as session:

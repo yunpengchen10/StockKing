@@ -1,6 +1,7 @@
 package data
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"go-stock/backend/logger"
@@ -50,8 +51,11 @@ func (item *SinaKLineItem) UnmarshalJSON(encoded []byte) error {
 }
 
 func NewSinaKLineApi(config *SettingConfig) *SinaKLineApi {
-	client := SharedHTTPClient
-	client.SetTimeout(time.Duration(config.CrawlTimeOut) * time.Second)
+	timeout := time.Duration(config.CrawlTimeOut) * time.Second
+	if timeout <= 0 {
+		timeout = chartKLineHTTPTimeout
+	}
+	client := CreateHTTPClientWithTimeout(timeout)
 	return &SinaKLineApi{
 		client: client,
 		config: config,
@@ -384,8 +388,11 @@ type TencentKLineResponse struct {
 }
 
 func NewTencentKLineApi(config *SettingConfig) *TencentKLineApi {
-	client := SharedHTTPClient
-	client.SetTimeout(time.Duration(config.CrawlTimeOut) * time.Second)
+	timeout := time.Duration(config.CrawlTimeOut) * time.Second
+	if timeout <= 0 {
+		timeout = chartKLineHTTPTimeout
+	}
+	client := CreateHTTPClientWithTimeout(timeout)
 	return &TencentKLineApi{
 		client: client,
 		config: config,
@@ -613,6 +620,30 @@ func eastMoneyAdjustFromFlag(adjustFlag string) string {
 // 注意：新浪/腾讯数据源硬编码前复权作为兜底，adjustFlag 对其无效；港美股 ExKLine2 协议不支持复权。
 func fetchKLineUncached(stockCode, stockName, klt string, limit int, end string, adjustFlag ...string) *KLineSourceResult {
 	flag := adjustFlagFromVariadic(adjustFlag...)
+	if shouldHedgeLatestKLine(stockCode, klt, end, flag) {
+		result := fetchKLineWithHedge(func() *KLineSourceResult {
+			primary := fetchFromMACWithTimeout(stockCode, klt, limit, 5*time.Second, flag)
+			if primary != nil {
+				primary.Source = "tdx-mac"
+			}
+			return primary
+		}, func(ctx context.Context) *KLineSourceResult {
+			return fetchLatestHTTPKLine(ctx, stockCode, stockName, klt, limit, flag)
+		}, chartKLineHedgeDelay)
+		if hasKLineRows(result) {
+			fillVolumeRatio(result.Data)
+			return result
+		}
+		if tdx := fetchFromTdx(stockCode, klt, limit, flag); hasKLineRows(tdx) {
+			tdx.Source = "tdx"
+			fillVolumeRatio(tdx.Data)
+			return tdx
+		}
+		if result != nil {
+			return result
+		}
+		return &KLineSourceResult{Data: &[]KLineData{}, Source: ""}
+	}
 
 	// A-share one-minute history now implements end using MAC offsets. Other
 	// periods still use only the latest MAC endpoint and retain their old fallback.
@@ -714,7 +745,13 @@ func fillVolumeRatio(data *[]KLineData) {
 }
 
 func fetchFromEastMoney(stockCode, stockName, klt string, limit int, end string, adjustFlag string) *KLineSourceResult {
-	api := NewEastMoneyKLineApi(GetSettingConfig())
+	return fetchFromEastMoneyContext(context.Background(), stockCode, stockName, klt, limit, end, adjustFlag)
+}
+
+func fetchFromEastMoneyContext(ctx context.Context, stockCode, stockName, klt string, limit int, end string, adjustFlag string) *KLineSourceResult {
+	ctx, cancel := context.WithTimeout(ctx, chartKLineHTTPTimeout)
+	defer cancel()
+	api := &EastMoneyKLineApi{client: chartKLineHTTPClient(ctx), config: chartKLineConfig()}
 	emAdjust := eastMoneyAdjustFromFlag(adjustFlag)
 	var data *[]KLineData
 	if strings.TrimSpace(end) == "" {
@@ -726,13 +763,25 @@ func fetchFromEastMoney(stockCode, stockName, klt string, limit int, end string,
 }
 
 func fetchFromSina(stockCode, klt string, limit int) *KLineSourceResult {
-	api := NewSinaKLineApi(GetSettingConfig())
+	return fetchFromSinaContext(context.Background(), stockCode, klt, limit)
+}
+
+func fetchFromSinaContext(ctx context.Context, stockCode, klt string, limit int) *KLineSourceResult {
+	ctx, cancel := context.WithTimeout(ctx, chartKLineHTTPTimeout)
+	defer cancel()
+	api := &SinaKLineApi{client: chartKLineHTTPClient(ctx), config: chartKLineConfig()}
 	data := api.GetKLineData(stockCode, klt, limit)
 	return &KLineSourceResult{Data: data}
 }
 
 func fetchFromTencent(stockCode, klt string, limit int) *KLineSourceResult {
-	api := NewTencentKLineApi(GetSettingConfig())
+	return fetchFromTencentContext(context.Background(), stockCode, klt, limit)
+}
+
+func fetchFromTencentContext(ctx context.Context, stockCode, klt string, limit int) *KLineSourceResult {
+	ctx, cancel := context.WithTimeout(ctx, chartKLineHTTPTimeout)
+	defer cancel()
+	api := &TencentKLineApi{client: chartKLineHTTPClient(ctx), config: chartKLineConfig()}
 	data := api.GetKLineData(stockCode, klt, limit)
 	return &KLineSourceResult{Data: data}
 }

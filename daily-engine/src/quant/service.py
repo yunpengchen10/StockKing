@@ -434,6 +434,11 @@ def make_lightgbm_factory(horizon: int):
             num_leaves=24, max_depth=6, min_child_samples=24,
             subsample=0.85, colsample_bytree=0.8, reg_alpha=0.2,
             reg_lambda=1.5, random_state=20260820 + int(horizon), verbosity=-1,
+            # LightGBM's default probes physical cores through joblib, which
+            # launches a visible PowerShell window in the Windows desktop app.
+            # An explicit positive count avoids that subprocess and matches
+            # the bounded CPU budget used by the other local models.
+            n_jobs=max(1, min(8, (os.cpu_count() or 2) // 2)),
         )
     return factory
 

@@ -13,13 +13,13 @@ function readJSON(storage, key) {
   try { return JSON.parse(storage?.getItem(key) || 'null') } catch (_) { return null }
 }
 function writeJSON(storage, key, value) {
-  try { storage?.setItem(key, JSON.stringify(value)) } catch (_) { /* The server also persists the display. */ }
+  try { storage?.setItem(key, JSON.stringify(value)); return true } catch (_) { return false }
 }
 function remove(storage, key) {
   try { storage?.removeItem(key) } catch (_) { /* Storage may be disabled. */ }
 }
 function withoutTask(payload) {
-  const { refreshTask, ...snapshot } = payload
+  const { refreshTask, displaySyncError, ...snapshot } = payload
   return snapshot
 }
 export function readDisplayedPicks(storage) {
@@ -29,7 +29,13 @@ export function readDisplayedPicks(storage) {
   return isSavedPicks(legacy) ? legacy : null
 }
 export function saveDisplayedPicks(storage, payload) {
-  if (isSavedPicks(payload)) writeJSON(storage, DISPLAY_SNAPSHOT_KEY, { version: 1, payload: withoutTask(payload) })
+  if (!isSavedPicks(payload)) return
+  if (!writeJSON(storage, DISPLAY_SNAPSHOT_KEY, { version: 1, payload: withoutTask(payload) })) {
+    // Large evidence snapshots can exceed browser storage quotas. The server
+    // keeps the full result; never leave an older cache masquerading as it.
+    remove(storage, DISPLAY_SNAPSHOT_KEY)
+    remove(storage, LEGACY_SNAPSHOT_KEY)
+  }
 }
 function snapshotTime(payload) {
   return Date.parse(payload?.generatedAt || payload?.adaptive?.generatedAt || payload?.adaptive?.generated_at || '') || 0
@@ -38,13 +44,8 @@ export function selectDisplayedPicks(local, remote) {
   if (!isSavedPicks(remote)) return local
   const saved = withoutTask(remote)
   if (!isSavedPicks(local)) return saved
-  // An explicitly refreshed empty result is meaningful. A legacy empty scan is not.
-  if (remote.displaySnapshotVersion && remote.displaySource === 'manual') return saved
-  if (local.displaySnapshotVersion && local.displaySource === 'manual') return local
-  const localCount = local.adaptive.candidates.length
-  const remoteCount = remote.adaptive.candidates.length
-  if (localCount && !remoteCount) return local
-  if (remoteCount && !localCount) return saved
+  // A completed empty scan is meaningful too. Compare generation times, not
+  // whether a snapshot was manual or happened to contain candidates.
   return snapshotTime(remote) >= snapshotTime(local) ? saved : local
 }
 
