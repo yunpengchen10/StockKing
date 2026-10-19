@@ -187,6 +187,7 @@ def _snapshot(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "support", "resistance", "atr14", "structureRewardRisk", "biasMa5Pct", "atrExtension",
         "eventAssessment", "marketBreadth", "rankMeaning", "riskProfile", "executionQuoteData",
         "trainingEligible", "minuteModelTrainingEligible", "entryEligible", "executable",
+        "trendEvidence", "intradayDirectionEvidence",
     )
     return {key: candidate[key] for key in keys if key in candidate}
 
@@ -209,6 +210,7 @@ _COMPACT_KEYS = (
     "stateLabel", "strategyId", "strategyBranch", "validationStatus", "horizon", "horizonId",
     "support", "resistance", "atr14", "structureRewardRisk", "biasMa5Pct", "atrExtension",
     "eventAssessment", "marketBreadth", "rankMeaning", "riskProfile",
+    "trendEvidence", "intradayDirectionEvidence",
 )
 
 

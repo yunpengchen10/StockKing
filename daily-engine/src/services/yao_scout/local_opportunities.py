@@ -364,10 +364,13 @@ class LocalOpportunityService(DailyOpportunityService):
                 candidates=packet['dailyCandidates'], profileCandidates=packet['dailyProfileCandidates'],
                 status='completed_observations' if assessment['dailyUsableCount'] else 'no_candidates_with_coverage_limits',
                 message=assessment.get('message', '当前不在日线条件推荐的连续交易时段。'),
-                marketSummary='依据已完成日K、最新报价及已披露风险筛选日线条件推荐；分钟与上午模型独立准备，规则排序未校准为上涨概率。')
+                marketSummary='依据已完成日K、最新报价及已披露风险筛选；日线推荐另须现价高于昨收、开盘及当日成交均价。该方向过滤不证明持续主升，规则排序未校准为上涨概率。')
             run['recommendationPolicy'] = {'version': assessment['version'], 'minuteRequired': False,
                 'morningModelRequired': False, 'validationStatus': 'unvalidated_rules',
-                'missingPolicy': 'daily_source_quote_and_event_risk_required'}
+                'missingPolicy': 'daily_source_quote_and_event_risk_required',
+                'intradayDirectionRequired': True,
+                'intradayDirectionPolicy': 'price_above_previous_close_open_and_session_vwap',
+                'mainRiseConfirmed': False}
             run['historyPreparation'] = {key: preparation.get(key) for key in
                 ('status', 'ready', 'requested', 'pending', 'updatedAt', 'targetSession', 'baselineClock', 'reason')}
             run['historyPreparation']['message'] = '分钟历史在后台补取，不影响独立日线条件筛选。'

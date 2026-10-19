@@ -176,6 +176,7 @@ Section
     File "/oname=WINDOWS_INSTALL.md" "..\..\..\..\docs\WINDOWS_INSTALL.md"
     File "/oname=WINDOWS_INSTALL.en.md" "..\..\..\..\docs\WINDOWS_INSTALL.en.md"
     File "/oname=algorithm-v270.md" "..\..\..\..\docs\algorithm-v270.md"
+    File "/oname=MAIN_RISE_MATH_20261019.md" "..\..\..\..\docs\MAIN_RISE_MATH_20261019.md"
 
     SetOutPath $INSTDIR
 

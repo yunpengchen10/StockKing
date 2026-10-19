@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from src.services.yao_scout.daily_opportunities import TZ
-from src.services.yao_scout.daily_primary import build_daily_candidates, TASK_ID
+from src.services.yao_scout.daily_primary import build_daily_candidates, TASK_ID, VERSION, _intraday_direction
 from src.services.yao_scout.recommendation_evidence import daily_evidence
 
 
@@ -63,6 +63,98 @@ def test_real_downloaded_daily_history_works_with_no_minute_archive_or_ml_model(
     assert result['dailyAssessment']['marketBreadth']['passed'] is None
     assert any('环境保持未知' in gap for gap in row['dataGaps'])
     assert len(result['dailyCandidates']) == 1  # Never fill the requested five slots.
+
+
+def test_same_fresh_quote_exposes_direction_math_without_inventing_fund_identity_or_probability():
+    result = run()
+    row = result['dailyCandidates'][0]
+    direction = row['intradayDirectionEvidence']
+    assert row['version'] == VERSION == 'king-daily-primary-v2'
+    assert direction['status'] == 'observed' and direction['passed'] is True
+    assert direction['source'] == row['quote']['source']
+    assert direction['sourceTime'] == row['quote']['provider_timestamp']
+    assert direction['metrics'] == pytest.approx({
+        'returnFromPreviousClosePct': .5, 'returnFromOpenPct': .5,
+        'sessionVwap': 10., 'vwapGapPct': .5,
+        'pullbackFromSessionHighPct': .05 / 10.1 * 100, 'sessionRangeLocation': 2 / 3})
+    assert direction['validationStatus'] == 'unvalidated_rules' and direction['probability'] is None
+    assert '单次量价快照不能确认持续主力资金' in direction['meaning']
+    assert set(direction['formulas']) == set(direction['metrics'])
+    assert result['dailyAssessment']['intradayDirectionPassedCount'] == 1
+
+
+@pytest.mark.parametrize(('changes', 'reason'), [
+    # A below-prior-close repair can be above both open and VWAP; still not an upward-day entry.
+    ({'price': 9.99, 'open_price': 9.98, 'amount': 9_970_000}, 'current_price_not_above_previous_close'),
+    ({'open_price': 10.06}, 'current_price_not_above_open'),
+    ({'amount': 10_060_000}, 'current_price_not_above_session_vwap'),
+    ({'price': 10., 'open_price': 9.99, 'amount': 9_990_000}, 'current_price_not_above_previous_close'),
+    ({'open_price': 10.05}, 'current_price_not_above_open'),
+    ({'amount': 10_050_000}, 'current_price_not_above_session_vwap'),
+])
+def test_each_direction_reference_is_a_strict_independent_veto(changes, reason):
+    q = quote(**changes)
+    q['change_pct'] = (q['price'] / q['pre_close'] - 1) * 100
+    result = run(q=q)
+    assert all(not rows for rows in result['dailyProfileCandidates'].values())
+    assert result['dailyAssessment']['excludedCounts'] == {reason: 1}
+    assert result['dailyAssessment']['intradayDirectionPassedCount'] == 0
+
+
+@pytest.mark.parametrize(('code', 'price', 'previous', 'opened', 'vwap'), [
+    ('600812', 5.88, 6.26, 6.10, 6.00),
+    ('603980', 9.54, 10.00, 9.95, 9.80),
+    ('002990', 53.73, 57.50, 56.78, 55.06355),
+])
+def test_declining_today_patterns_cannot_use_old_daily_uptrend_or_large_rr_to_bypass_direction(
+        code, price, previous, opened, vwap):
+    # Synthetic completed daily packets preserve a rising MA structure and ample
+    # upside, isolating the adverse intraday pattern seen in the audited quotes.
+    packet = daily()
+    packet['previousSession']['close'] = previous
+    packet['metrics'].update(last_close=previous, ma5=previous * .94,
+        ma10=previous * .93, ma20=previous * .90, high20=previous * 1.2,
+        high60=previous * 1.2, low20=previous * .85, atr14=previous * .02)
+    q = quote(code=code, price=price, pre_close=previous, open_price=opened,
+        low=price - .02, high=opened + .02, amount=vwap * 1_000_000,
+        change_pct=(price / previous - 1) * 100,
+        limit_up=round(previous * 1.1, 2), limit_down=round(previous * .9, 2))
+    result = build_daily_candidates([{'code': code, 'name': '回归测试股份'}],
+        {code: packet}, {code: q}, NOW, contexts={code: context()})
+    assert all(not rows for rows in result['dailyProfileCandidates'].values())
+    assert result['dailyAssessment']['quoteUsableCount'] == 1
+    assert result['dailyAssessment']['excludedCounts'] == {
+        'current_price_not_above_previous_close': 1,
+        'current_price_not_above_open': 1,
+        'current_price_not_above_session_vwap': 1}
+
+
+@pytest.mark.parametrize('changes', [
+    {'open_price': None}, {'open_price': True}, {'open_price': 10.11},
+    {'open_price': 9.94}, {'high': 10.04}, {'low': 10.06},
+    {'high': 9.94, 'low': 10.1}, {'amount': float('nan')}, {'volume': None},
+])
+def test_missing_or_inconsistent_direction_inputs_are_excluded_without_fabricated_metrics(changes):
+    q = quote(**changes)
+    assert not run(q=q)['dailyCandidates']
+    evidence = _intraday_direction(q)
+    assert evidence['status'] == 'unavailable' and evidence['passed'] is None
+    assert all(value is None for value in evidence['metrics'].values())
+
+
+def test_session_low_and_flat_range_are_observed_without_division_by_zero_or_fake_strength():
+    low_quote = quote(price=9.95, change_pct=-.5)
+    evidence = _intraday_direction(low_quote)
+    assert evidence['metrics']['sessionRangeLocation'] == 0
+    assert evidence['passed'] is False
+    assert not run(q=low_quote)['dailyCandidates']
+    flat_quote = quote(price=10.05, open_price=10.05, high=10.05, low=10.05,
+                       amount=10_050_000)
+    evidence = _intraday_direction(flat_quote)
+    assert evidence['status'] == 'observed' and evidence['passed'] is False
+    assert evidence['metrics']['sessionRangeLocation'] is None
+    assert evidence['metrics']['pullbackFromSessionHighPct'] == 0
+    assert not run(q=flat_quote)['dailyCandidates']
 
 
 @pytest.mark.parametrize('change', ['short', 'stale', 'adjusted', 'source_unknown', 'prior_mismatch'])

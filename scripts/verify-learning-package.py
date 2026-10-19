@@ -8,9 +8,15 @@ from PyInstaller.archive.readers import CArchiveReader
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path)
+parser.add_argument('--engine', type=Path,
+                    default=root / 'daily-engine/dist/backend/stock_analysis/stock_analysis.exe',
+                    help='Frozen engine executable to compare with this checkout.')
+parser.add_argument('--desktop', type=Path,
+                    default=root / 'desktop/build/bin/Stock King.exe',
+                    help='Desktop executable paired with the frozen engine.')
 args = parser.parse_args()
-engine = root / "daily-engine/dist/backend/stock_analysis/stock_analysis.exe"
-desktop = root / "desktop/build/bin/Stock King.exe"
+engine = args.engine.resolve(strict=True)
+desktop = args.desktop.resolve(strict=True)
 archive = CArchiveReader(str(engine))
 pyz = archive.open_embedded_archive(next(name for name in archive.toc if name.lower().endswith(".pyz")))
 checks = {}
@@ -19,7 +25,7 @@ for suffix in (
     "task_learning", "decision_policy", "research_policy", "minute_integrity", "minute_history",
     "next_day_watch", "recommendation_evidence", "sector_fund_evidence", "morning_task", "primary_policy",
     "precision_policy", "research_factors", "premarket", "daily_primary", "admission_diagnostics",
-    "history_preparation", "history_maintenance",
+    "history_preparation", "history_maintenance", "v11_factors", "trend_evidence",
 ):
     name = "src.services.yao_scout." + suffix
     frozen = pyz.extract(name)

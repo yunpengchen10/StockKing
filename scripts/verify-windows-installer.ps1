@@ -27,6 +27,7 @@ $documents = @{
     'docs/README.md' = 'README.md'; 'docs/README.en.md' = 'README.en.md'
     'docs/WINDOWS_INSTALL.md' = 'docs/WINDOWS_INSTALL.md'; 'docs/WINDOWS_INSTALL.en.md' = 'docs/WINDOWS_INSTALL.en.md'
     'docs/algorithm-v270.md' = 'docs/algorithm-v270.md'
+    'docs/MAIN_RISE_MATH_20261019.md' = 'docs/MAIN_RISE_MATH_20261019.md'
     'resources/register-stock-king-tasks.ps1' = 'scripts/register-stock-king-tasks.ps1'
     'licenses/Stock-King-GPL-3.0.txt' = 'desktop/LICENSE'
     'licenses/Daily-Stock-Analysis-MIT.txt' = 'daily-engine/LICENSE'

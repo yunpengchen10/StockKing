@@ -7,6 +7,7 @@ bound. Calibrated MFE, MAE and state probabilities remain withheld.
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from datetime import datetime
 
 from .research_policy import DEFAULT_PARAMETERS, VALIDATION_STATUS
@@ -89,6 +90,30 @@ def _evidence_values(candidate):
             if isinstance(row, dict) and row.get('status') == 'observed'}
 
 
+def _trend_packet(minute, now):
+    """Preserve versioned shadow measurements without granting selection power."""
+    packet = deepcopy(minute.get('trendEvidence') or {})
+    if not packet:
+        return {'status': 'unavailable', 'metrics': {}, 'selectionAuthority': False,
+                'validationStatus': 'unvalidated_descriptive',
+                'reasonCodes': ['minute_trend_window_unavailable']}
+    at = _timestamp(packet.get('asOf'))
+    lineage = (minute.get('dataLineage') or {}).get('status')
+    valid = bool(lineage == 'verified' and now and at and
+                 at == _timestamp(minute.get('asOf')) and
+                 0 <= (now-at).total_seconds() < DEFAULT_PARAMETERS['freshness']['minuteSeconds'])
+    packet.update(selectionAuthority=False, source=minute.get('source'),
+                  lineageStatus=lineage or 'unknown', mainFundsIdentified=False)
+    observed = sum(value is not None for value in packet.get('metrics', {}).values())
+    packet['status'] = ('observed' if observed == len(packet.get('metrics', {})) and observed
+                        else 'partial' if observed else 'unavailable')
+    if not valid:
+        packet.update(status='unavailable',
+                      metrics={key: None for key in packet.get('metrics', {})},
+                      reasonCodes=['minute_trend_source_unverified_stale_or_misaligned'])
+    return packet
+
+
 def score_v11(candidate, minute, *, now=None):
     """Add ranking evidence without relaxing eligibility or implying a fill."""
     minute = minute or {}
@@ -134,6 +159,7 @@ def score_v11(candidate, minute, *, now=None):
             'v11Inputs': {key: _number(value) for key, value in raw.items()
                           if _number(value) is not None}}
     base['minuteArchivePath'] = minute.get('archivePath')
+    base['trendEvidence'] = _trend_packet(minute, cutoff)
     base['sourceTime'] = (candidate.get('quote') or {}).get('provider_timestamp') or (candidate.get('quote') or {}).get('source_time')
     base['signalPrice'] = _number(candidate.get('referencePrice'))
     base['observableStructure'] = candidate.get('strategyBranch')

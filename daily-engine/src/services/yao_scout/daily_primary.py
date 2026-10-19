@@ -14,12 +14,60 @@ from .premarket import _at, _daily_valid, _local, previous_session
 from .precision_policy import execution_quote_data, POLICIES
 from .research_policy import DEFAULT_PARAMETERS
 
-VERSION = 'king-daily-primary-v1'
+VERSION = 'king-daily-primary-v2'
 TASK_ID = 'daily_structure_to_next_session'
+INTRADAY_DIRECTION_RULE = 'price > pre_close and price > open_price and price > amount / volume'
+INTRADAY_DIRECTION_MEANING = ('同一新鲜报价的价格方向约束，只排除已知逆向走势；规则尚未验证，'
+    '单次量价快照不能确认持续主力资金、资金身份或主升，也不表示上涨概率')
 
 
 def _number(value):
     return None if isinstance(value, bool) else finite(value)
+
+
+def _intraday_direction(quote):
+    """Observed snapshot metrics, not signed money flow or persistent-fund proof.
+
+    Callers must first verify quote source, freshness, code and price limits.
+    Amount is CNY and volume is shares, as in the existing VWAP sanity gate.
+    """
+    price, prev, opened, high, low, amount, volume = (
+        _number(quote.get(key)) for key in
+        ('price', 'pre_close', 'open_price', 'high', 'low', 'amount', 'volume'))
+    valid = (all(value is not None and value > 0 for value in
+                 (price, prev, opened, high, low, amount, volume))
+             and low <= price <= high and low <= opened <= high)
+    vwap = amount / volume if valid else None
+    valid = bool(valid and low - .01 <= vwap <= high + .01)
+    metrics = {'returnFromPreviousClosePct': None, 'returnFromOpenPct': None,
+               'sessionVwap': None, 'vwapGapPct': None,
+               'pullbackFromSessionHighPct': None, 'sessionRangeLocation': None}
+    reasons = []
+    if valid:
+        metrics.update(returnFromPreviousClosePct=(price / prev - 1) * 100,
+            returnFromOpenPct=(price / opened - 1) * 100, sessionVwap=vwap,
+            vwapGapPct=(price / vwap - 1) * 100,
+            pullbackFromSessionHighPct=(high - price) / high * 100,
+            sessionRangeLocation=(price - low) / (high - low) if high > low else None)
+        reasons = [reason for reference, reason in (
+            (prev, 'current_price_not_above_previous_close'),
+            (opened, 'current_price_not_above_open'),
+            (vwap, 'current_price_not_above_session_vwap')) if price <= reference]
+    else:
+        reasons = ['intraday_direction_inputs_unverified']
+    return {'version': VERSION, 'status': 'observed' if valid else 'unavailable',
+        'passed': not reasons if valid else None, 'validationStatus': 'unvalidated_rules',
+        'probability': None, 'rule': INTRADAY_DIRECTION_RULE, 'reasons': reasons,
+        'source': quote.get('source'),
+        'sourceTime': quote.get('provider_timestamp') or quote.get('source_time'),
+        'metrics': metrics,
+        'formulas': {'returnFromPreviousClosePct': '100 * (price / pre_close - 1)',
+            'returnFromOpenPct': '100 * (price / open_price - 1)',
+            'sessionVwap': 'amount_CNY / volume_shares',
+            'vwapGapPct': '100 * (price / sessionVwap - 1)',
+            'pullbackFromSessionHighPct': '100 * (high - price) / high',
+            'sessionRangeLocation': '(price - low) / (high - low); null when high == low'},
+        'meaning': INTRADAY_DIRECTION_MEANING}
 
 
 def _known(record, now):
@@ -123,6 +171,9 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
         'probability': None, 'horizon': 'next_session', 'minuteDataRequired': False,
         'morningModelRequired': False, 'minuteSectorFundRequired': False,
         'marketBreadth': market, 'dailyUsableCount': 0, 'quoteUsableCount': 0,
+        'intradayDirectionPassedCount': 0,
+        'intradayDirectionPolicy': {'version': VERSION, 'rule': INTRADAY_DIRECTION_RULE,
+                                   'meaning': INTRADAY_DIRECTION_MEANING},
         'eventCoveragePassedCount': 0, 'researchedCount': 0, 'excludedCounts': {},
         'profileExcludedCounts': {}, 'profileQualifiedCounts': {}, 'count': 0,
         'meaning': '真实已完成日K、当日报价及已披露风险的独立条件筛选；不表示分钟主力确认、上午T0模型通过或上涨概率'}
@@ -180,6 +231,11 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
             excluded['not_tradable_or_limit_locked'] += 1
             continue
         assessment['quoteUsableCount'] += 1
+        direction = _intraday_direction(quote)
+        if direction['passed'] is not True:
+            excluded.update(direction['reasons'])
+            continue
+        assessment['intradayDirectionPassedCount'] += 1
         events = _events((contexts or {}).get(code) or {}, now)
         if events['missingReasons'] or events['riskReasons']:
             excluded.update(events['missingReasons'] + events['riskReasons'])
@@ -205,10 +261,12 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
         if not market['available']:
             gaps.append('全市场广度未取得或未满足时效覆盖要求，市场环境保持未知')
         reasons = [f"{int(d['history_sessions'])}个已完成日K截至{previous}，报价前收盘与日线末收盘一致",
+                   '现价严格高于前收盘、当日开盘及成交额/成交量计算的当日VWAP',
                    'MA5>MA10>MA20，现价维持MA20上方',
                    f'压力空间/支撑及ATR风险距离为{rr:.2f}倍；MA5乖离{bias:.2f}%',
                    '财报、业绩预告及未来14日解禁覆盖已核验']
         risk_notes = ['日线条件规则尚未经过概率校准；排序不代表上涨概率',
+                      INTRADAY_DIRECTION_MEANING,
                       '按A股T+1约束评估下一交易日；支撑和压力不是保证成交的止损价或收益目标']
         candidate = {'code': code, 'name': name, 'status': 'daily_conditional', 'stateLabel': '日线条件推荐',
             'strategyBranch': '日线趋势与T+1价格纪律', 'strategyId': TASK_ID,
@@ -218,6 +276,7 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
             'dailyLastClose': d['last_close'], 'dailyPreviousSession': dict(prior),
             'baselineAsOf': previous, 'baselineSource': daily['source'], 'dailyEvidence': daily,
             'dailyEvidenceStatus': 'completed_daily_source_and_quote_preclose_verified',
+            'intradayDirectionEvidence': direction,
             'support': support, 'resistance': resistance, 'atr14': d['atr14'], 'structureRewardRisk': rr,
             'biasMa5Pct': bias, 'atrExtension': extension, 'riskDistance': risk_distance,
             'indicatorEvidence': indicators, 'selectionReasons': reasons, 'reasons': reasons,

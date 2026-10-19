@@ -25,6 +25,7 @@ import requests
 
 from .intraday_evidence import SHANGHAI, _datetime, _prior_sessions, METRIC_DEFINITIONS
 from .research_policy import DEFAULT_PARAMETERS
+from .trend_evidence import compute_trend_evidence
 from .minute_integrity import (DATA_QUALITY_VERSION, canonical_hash, inspect_session,
                                session_revision, read_archive_lineage, validate_archive_lineage)
 
@@ -823,6 +824,9 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
                 row['low'] <= vwap_series[datetime.fromisoformat(row['end'])]*(1+MINUTE_PARAMS['vwapRetestTolerance'])
                 and row['close'] > vwap_series[datetime.fromisoformat(row['end'])]
                 for row in recent) else 0.
+    # Descriptive path evidence is frozen separately from the existing rule
+    # feature vector. It cannot silently change a fitted model's input contract.
+    result['trendEvidence'] = compute_trend_evidence(current, end, vwap_series)
     previous_five = window(current,end-timedelta(minutes=1),5)
     if previous_five:
         prior_high = max(row['high'] for row in previous_five)

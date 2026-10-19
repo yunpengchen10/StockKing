@@ -107,6 +107,7 @@ $hiddenImports = @(
   'src.services.yao_scout.decision_policy',
   'src.services.yao_scout.minute_integrity',
   'src.services.yao_scout.v11_factors',
+  'src.services.yao_scout.trend_evidence',
   'src.services.software_market',
   'multipart',
   'multipart.multipart',
