@@ -2,6 +2,7 @@
 from copy import deepcopy
 
 import pytest
+from tests.primary_fixture import make_primary_evidence
 
 from src.services.yao_scout.local_algorithm import algorithm_contract, is_entry_eligible, is_research_eligible
 from src.services.yao_scout.precision_policy import evaluate, V11_VERSION
@@ -29,12 +30,12 @@ def test_contract_freezes_defaults_and_fingerprints_all_parameters(monkeypatch):
 
 
 def _eligible_candidate():
-    return {'scoreVersion': SCORE_VERSION, 'status': 'conditional', 'evidenceEligible': True,
+    return make_primary_evidence({'scoreVersion': SCORE_VERSION, 'status': 'conditional', 'evidenceEligible': True,
             'strategyBranch': '分钟局部突破观察', 'finalScore': 61,
             'quote': {'price': 10, 'pre_close': 9.8, 'limit_up': 10.78, 'limit_down': 8.82}, 'baselineHistoryDays': 20,
             'priceHistoricalCoverageDays': 20, 'factorScores': {key: 60 for key in ('M','V','W','B')},
             'dataEligibility': {'status': 'formal'}, 'structureRewardRisk': 3,
-            'evidenceChecks': {'minute_structure': True}}
+            'evidenceChecks': {'minute_structure': True}})
 
 
 CONTEXT = {'financials': {'profit': 10000, 'eps': 1, 'cashPerShare': .5},

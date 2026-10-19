@@ -4,7 +4,9 @@ No credentials are persisted in signals and no remote endpoint is accepted.
 """
 from __future__ import annotations
 import os
+import re
 from datetime import datetime
+from time import monotonic
 from urllib.parse import urlparse
 import requests
 
@@ -55,6 +57,68 @@ class SoftwareMarketClient:
                            stale=not result.get('complete', False), complete=bool(result.get('complete')),
                            source_time_meaning=result.get('source_time_meaning'))
         frame.attrs.update({key: result.get(key) for key in ('expected_count','unique_count','received_count','pages')})
+        return frame
+
+    def enrich_snapshot_quotes(self, snapshot, *, timeout=12, deadline=None, clock=None):
+        """Attach same-observation prices/clocks for the full mainboard universe.
+
+        This is a separate bounded stage: the existing universe snapshot never
+        disappears because quote enrichment is slow. A quote's timestamp does
+        not date the old turnover/volume-ratio fields. Missing batches retain
+        their rows and denominator; receipt time is never used as source time.
+        """
+        from .public_market_quotes import TZ
+        from .yao_scout.minute_history import bounded_fetch_map
+        frame = snapshot.copy(deep=True)
+        frame.attrs = dict(getattr(snapshot, 'attrs', {}) or {})
+        now = clock or (lambda: datetime.now(TZ))
+        if not {'code', 'name'}.issubset(frame.columns):
+            frame.attrs['market_quote_enrichment'] = {'status':'unavailable', 'reason':'universe_fields_missing'}
+            return frame
+        records = frame.to_dict('records')
+        codes = list(dict.fromkeys(str(row['code']).zfill(6) for row in records
+            if re.fullmatch(r'(?:600|601|603|605|000|001|002|003)\d{3}', str(row['code']).zfill(6))
+            and not re.search(r'ST|退|整理|停牌', str(row['name']), re.I)))
+        code_set = set(codes)
+        budget = max(0., min(float(timeout), deadline-monotonic())) if deadline is not None else max(0., float(timeout))
+        end = monotonic()+budget
+        groups = [codes[index:index+20] for index in range(0, len(codes), 20)]
+        def fetch(group):
+            remaining = end-monotonic()
+            if remaining <= 0:
+                return []
+            # Per-worker clients avoid mutating another in-flight call's timeout.
+            client = SoftwareMarketClient(self.url, self.token, read_timeout=min(3., remaining))
+            return client.quotes(group, clock=now).get('quotes', [])
+        batches, missing = bounded_fetch_map(fetch, groups, workers=8, timeout=budget)
+        observations = {}
+        received = now()
+        for batch in batches:
+            for assessed in batch:
+                quote = assessed.get('quote') or {}
+                code = str(assessed.get('code', ''))
+                if code not in code_set or quote.get('code') != code or quote.get('source') not in {'tencent', 'sina'}:
+                    continue
+                if 'cross_source_price_conflict' in assessed.get('issues', []):
+                    continue
+                try:
+                    stamp = datetime.fromisoformat(str(quote.get('source_time', '')))
+                    if stamp.tzinfo is None or stamp > received or stamp.astimezone(TZ).date() != received.astimezone(TZ).date():
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                observations[code] = {key:quote.get(key) for key in (
+                    'code', 'price', 'previous_close', 'high', 'low', 'change_pct',
+                    'limit_up', 'limit_down', 'source', 'source_time', 'fetched_at')}
+        frame['market_quote'] = [observations.get(str(row['code']).zfill(6)) for row in records]
+        frame.attrs['market_quote_source'] = 'software:go/' + '+'.join(sorted({
+            observation['source'] for observation in observations.values()}))
+        frame.attrs['market_quote_received_at'] = received.isoformat()
+        frame.attrs['market_quote_enrichment'] = {
+            'status':'complete' if len(observations) == len(codes) and codes else 'partial',
+            'requested':len(codes), 'observed':len(observations),
+            'missing_batches':len(missing), 'source_time_meaning':'provider_quote_update_time',
+            'price_fields_scope':'market_quote only; original selection fields retain original dates'}
         return frame
 
     def sectors(self):

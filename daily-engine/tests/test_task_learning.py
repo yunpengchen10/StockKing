@@ -128,7 +128,7 @@ def test_no_fit_timestamp_for_checks_and_no_fake_model_at_cold_start(tmp_path):
     state = service.train_and_evaluate(_clock(DAY))
     assert state['lastLearningCheckAt'] == _clock(DAY).isoformat()
     assert state['lastFitCompletedAt'] is None and state['lastTrainingAt'] is None
-    assert len(state['taskStates']) == 3
+    assert len(state['taskStates']) == 3 + len(learning.MORNING_QUEUES)
     assert all(row['stage'] == 'rules_cold_start' for row in state['taskStates'])
     with service._connect() as db:
         assert db.execute('SELECT count(*) FROM model_versions').fetchone()[0] == 0

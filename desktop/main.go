@@ -14,6 +14,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"time"
+	_ "time/tzdata" // Installed Windows builds must not depend on a developer GOROOT for exchange time zones.
 
 	"github.com/duke-git/lancet/v2/convertor"
 	"github.com/duke-git/lancet/v2/slice"

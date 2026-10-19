@@ -7,16 +7,20 @@ from .recommendation_evidence import VERSION as EVIDENCE_VERSION
 from .v11_factors import EARLY_WEIGHTS, MAIN_WEIGHTS, RISK_WEIGHTS, SCORE_VERSION, RISK_PENALTY_COEFFICIENT
 from .research_policy import parameter_contract
 from .decision_policy import PORTFOLIO_POLICY_VERSION, portfolio_parameters, prediction_entry_allowed
+from .primary_policy import evaluate_primary_admission, policy_contract
 
 
 def algorithm_contract():
     from .task_learning import task_contract, NEXT_DAY_TASK_ID
+    from .morning_task import MORNING_TASK_ID, MORNING_QUEUES
     payload = {
-        'schemaVersion': 3,
-        'primaryTask': 'entry_today_exit_next_session',
+        'schemaVersion': 4,
+        'primaryTask': 'session_specific_morning_T0_plus_T1_risk',
         'learningTaskContracts': [task_contract()['taskContractId']] + [
             task_contract(NEXT_DAY_TASK_ID, queue)['taskContractId']
-            for queue in ('first_board', 'continuation')],
+            for queue in ('first_board', 'continuation')] + [
+            task_contract(MORNING_TASK_ID, queue)['taskContractId'] for queue in MORNING_QUEUES],
+        'primaryAdmissionPolicy': policy_contract(),
         'portfolioPolicyVersion': PORTFOLIO_POLICY_VERSION,
         'portfolioParameters': portfolio_parameters(),
         'dataQualityPolicy': 'request_response_identity_and_whole_session_quarantine_v1',
@@ -35,7 +39,10 @@ def algorithm_contract():
         'entryConditions': ['当前评分版本', '有效报价与正常交易条件', '完整可计算分钟结构',
                             'evidenceEligible=true', 'status=conditional', 'finalScore为有限值',
                             '量与价同刻历史均至少20日', 'M/V/W/B关键因子有效', 'dataEligibility.status=formal',
-                            '对应档位entryEligible=true', '供应商前收盘及涨跌停价完整且一致', '完成时重新核验报价'],
+                            '分钟全依赖来源verified', '同窗板块共振及资金方向通过',
+                            '新鲜全市场广度不弱且不存在弱势情绪否决',
+                            '上午独立T0模型通过验证并允许入选，否则仅研究',
+                            '对应档位entryEligible=true', '供应商前收盘及涨跌停价完整且一致', '完成时重新核验报价与全部主准入条件'],
         'profilePolicy': '三档执行乖离、ATR、结构盈亏比、解禁和财务门槛；激进档独立核验分钟突破时允许上方压力及RR未知并披露，不编目标；已知RR仍须达标；未知事件覆盖只观察，已知利空独立否决',
         'entryRiskPolicy': '空间比风险分母取到可观察支撑距离与已对齐ATR14波动下限的较大值；局部分钟支撑不代表T+1可按此价退出',
         'structureInvalidationPolicy': '最近完整分钟突破失败为100时等待新完整分钟确认；不只扣分后继续正式推荐',
@@ -55,6 +62,7 @@ Rejected model choices must remain controls; otherwise training would only see
 the earlier model's positive predictions and silently lose its false negatives.
 """
     return bool(v11_entry_ready(candidate)
+                and evaluate_primary_admission(candidate)['eligible']
                 and (candidate.get('precisionDecision') or {}).get('version') == V11_VERSION
                 and ((candidate.get('precisionDecision') or {}).get('profiles') or {})
                 .get(profile, {}).get('entryEligible') is True)
@@ -62,4 +70,6 @@ the earlier model's positive predictions and silently lose its false negatives.
 
 def is_entry_eligible(candidate, profile='regular'):
     """Final live decision adds validated absolute-edge admission to evidence."""
-    return bool(is_research_eligible(candidate, profile) and prediction_entry_allowed(candidate))
+    morning = candidate.get('morningSignal')
+    return bool(is_research_eligible(candidate, profile) and prediction_entry_allowed(candidate)
+                and (morning is None or morning.get('selectionEligible') is True))

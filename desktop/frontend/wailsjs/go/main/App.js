@@ -410,6 +410,10 @@ export function GetDailyOperationPlanList(arg1) {
   return window['go']['main']['App']['GetDailyOperationPlanList'](arg1);
 }
 
+export function GetDisplayedKingPicks() {
+  return window['go']['main']['App']['GetDisplayedKingPicks']();
+}
+
 export function GetEngineStatus() {
   return window['go']['main']['App']['GetEngineStatus']();
 }
@@ -518,16 +522,8 @@ export function GetKingPicksHistory(arg1) {
   return window['go']['main']['App']['GetKingPicksHistory'](arg1);
 }
 
-export function StartKingPicksRefresh(arg1) {
-  return window['go']['main']['App']['StartKingPicksRefresh'](arg1);
-}
-
 export function GetKingPicksRefreshTask(arg1) {
   return window['go']['main']['App']['GetKingPicksRefreshTask'](arg1);
-}
-
-export function GetDisplayedKingPicks() {
-  return window['go']['main']['App']['GetDisplayedKingPicks']();
 }
 
 export function GetLatestKingPicks(arg1) {
@@ -1092,6 +1088,10 @@ export function SetTradingPrice(arg1, arg2, arg3, arg4, arg5) {
 
 export function StartFeishuBot() {
   return window['go']['main']['App']['StartFeishuBot']();
+}
+
+export function StartKingPicksRefresh(arg1) {
+  return window['go']['main']['App']['StartKingPicksRefresh'](arg1);
 }
 
 export function StartQuantBacktest(arg1) {

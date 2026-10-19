@@ -10,9 +10,10 @@ from types import MappingProxyType
 from src.services.akshare_context import number
 from src.services.yao_scout.v11_factors import SCORE_VERSION
 from .research_policy import DEFAULT_PARAMETERS, VALIDATION_STATUS
+from .primary_policy import evaluate_primary_admission
 
 VERSION = "king-precision-v1"
-V11_VERSION = "king-precision-v1.2-r2"
+V11_VERSION = "king-precision-v1.3-primary"
 
 
 def execution_quote_data(candidate):
@@ -100,10 +101,14 @@ def evaluate(candidate, context, daily=None):
     premarket = candidate.get("status") == "premarket" or "盘前" in str(candidate.get("strategyBranch", ""))
     current_rules = candidate.get('scoreVersion') == SCORE_VERSION
     execution_data = execution_quote_data(candidate)
+    primary = evaluate_primary_admission(candidate) if current_rules else None
     policies = {}
     for key, rule in POLICIES.items():
         blocked, waiting = [], []
         uncertainties = []
+        if primary:
+            blocked.extend(primary['reasons'])
+            waiting.extend(primary['missingReasons'])
         if current_rules and not v11_entry_ready(candidate):
             waiting.append('正式候选须20/20日量价基准、M/V/W/B关键因子及新鲜完整分钟结构；5—19日仅观察')
         if current_rules and execution_data['status'] != 'complete':
@@ -154,6 +159,7 @@ def evaluate(candidate, context, daily=None):
                          "uncertainties": uncertainties,
                          "thresholds": asdict(rule)}
     return {"version": V11_VERSION if current_rules else VERSION, "validationStatus": VALIDATION_STATUS, "probability": None,
+            "primaryAdmission": primary,
             "executionQuoteData": execution_data,
             "metrics": {"biasMa5Pct": bias, "atrExtension": extension, "trendConfirmed": trend,
                         "rewardRisk": rr, "unlock14dPct": unlock if context.get("coverage", {}).get("unlock") else None},

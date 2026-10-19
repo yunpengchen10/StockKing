@@ -7,6 +7,7 @@ Fund flows are vendor estimates, not verified institutional account movements.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from math import ceil
 import json
 import os
 from pathlib import Path
@@ -20,7 +21,8 @@ import requests
 from src.patches.eastmoney_patch import original_request
 
 from .intraday_evidence import _datetime, SHANGHAI
-from .minute_history import MinuteArchive, fetch_recent_bars, normalize_bars, window, number, bounded_fetch_map
+from .minute_history import (MinuteArchive, fetch_recent_bars, fetch_software_bars,
+                             normalize_bars, window, number, bounded_fetch_map)
 
 BASE = 'https://push2.eastmoney.com/api/qt/'
 HEADERS = {'User-Agent':'Mozilla/5.0','Referer':'https://quote.eastmoney.com/'}
@@ -192,7 +194,7 @@ def discover_sina_sectors(codes, cutoff, cache_dir, *, getter=None, deadline=Non
     return membership,{board['code']:board['members'] for board in all_boards if board['code'] in selected}
 
 
-def compute_sector_evidence(code, stock_minutes, sector, peers, minute_rows, cutoff):
+def compute_sector_evidence(code, stock_minutes, sector, peers, minute_rows, cutoff, *, _peer_returns=None):
     provider=sector.get('provider','Eastmoney') if sector else 'unknown'
     result = {'metrics':{},'source':provider+'行业成分 + 已核验代码的同刻1分钟K线', 'asOf':None,
               'sector':sector, 'gaps':[], 'scope':provider+'主行业；全部沪深成分，候选股自身从板块统计剔除',
@@ -208,12 +210,17 @@ def compute_sector_evidence(code, stock_minutes, sector, peers, minute_rows, cut
         result['gaps'].append('个股5分钟证据或所属行业未核实')
         return result
     codes = sorted(set(peers)-{code})
-    returns = {}
-    for peer in codes:
-        rows = normalize_bars(minute_rows.get(peer,[]),cutoff)
-        part = window(rows,end,6)
-        if part:
-            returns[peer] = (part[-1]['close']/part[0]['close']-1)*100
+    if _peer_returns is None:
+        returns = {}
+        for peer in codes:
+            rows = normalize_bars(minute_rows.get(peer,[]),cutoff)
+            part = window(rows,end,6)
+            if part:
+                returns[peer] = (part[-1]['close']/part[0]['close']-1)*100
+    else:
+        # Internal batch cache, computed from normalized six-bar windows at this
+        # exact end time. Exclude self separately for every candidate.
+        returns = {peer: _peer_returns[peer] for peer in codes if peer in _peer_returns}
     coverage = 100*len(returns)/len(codes) if codes else 0
     result.update(asOf=end.isoformat(),peerCount=len(returns),totalPeers=len(codes),peerReturns=returns)
     metrics = result['metrics']
@@ -236,7 +243,14 @@ def prepare_sector_membership(codes, cutoff, cache_dir, *, getter=None, timeout=
         if remaining <= 0:
             raise requests.Timeout('行业成员采集达到时间预算')
         kwargs['timeout'] = min(float(kwargs.get('timeout',4)),remaining)
-        return (getter or public_get)(url,**kwargs)
+        # Some transports ignore or exceed socket timeouts (DNS, patched
+        # clients). Bound each uncached request, while preserving the cached
+        # memberships already collected by the outer discovery operation.
+        responses, _ = bounded_fetch_map(lambda _: (getter or public_get)(url, **kwargs),
+                                         [None], workers=1, timeout=remaining)
+        if not responses:
+            raise requests.Timeout('行业成员请求未在截止时间完成')
+        return responses[0]
     try:
         membership, peers = discover_sectors(codes,cutoff,cache_dir,getter=bounded_get,deadline=deadline)
     except Exception:
@@ -260,41 +274,165 @@ def prepare_sector_membership(codes, cutoff, cache_dir, *, getter=None, timeout=
     return membership, peers
 
 
-def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_fetcher=None, prepared=None, timeout=20, deadline=None):
-    deadline = min(deadline, monotonic()+max(0,timeout)) if deadline is not None else monotonic()+max(0,timeout)
+def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_fetcher=None,
+                       prepared=None, timeout=20, deadline=None, on_result=None):
+    """Collect shared peers and publish independently usable candidate packets.
+
+    The caller may retain ``on_result(code, packet)`` snapshots if its own outer
+    deadline expires. Peer I/O stops before that deadline so completed evidence
+    can be computed and returned; an unfinished industry never changes another
+    industry's denominator or makes an incomplete window pass.
+    """
+    codes = list(dict.fromkeys(codes))
+    started = monotonic()
+    deadline = min(deadline, started+max(0,timeout)) if deadline is not None else started+max(0,timeout)
+    return_reserve = min(2., max(0, deadline-started)*.2)
+    collection_deadline = deadline-return_reserve
     try:
         membership, boards = prepared or prepare_sector_membership(codes,cutoff,cache_dir,getter=getter,
-                                                                   timeout=max(0,deadline-monotonic()))
+                                                                   timeout=max(0,collection_deadline-monotonic()))
     except Exception as exc:
-        return {code:{'metrics':{},'gaps':['板块成员源读取失败：'+type(exc).__name__]} for code in codes}
-    all_codes = sorted({code for members in boards.values() for code in members})
+        results = {code:{'metrics':{}, 'reasonCodes':['sector_membership_unavailable'],
+                         'requestedCutoffAt':_datetime(cutoff).isoformat(),
+                         'gaps':['板块成员源读取失败：'+type(exc).__name__]} for code in codes}
+        if on_result:
+            for code, packet in results.items():
+                on_result(code, packet)
+        return results
     archive = MinuteArchive(Path(cache_dir)/'minute_history') if bar_fetcher is None else None
     requested_ends = {}
+    selected_boards = {}
     for code in codes:
         try:
             end = _datetime(intraday[code]['asOf'])
+            if not 0 <= (_datetime(cutoff)-end).total_seconds() < 300:
+                continue
+            if number((intraday[code].get('metrics') or {}).get('speed_5m_pct')) is None:
+                continue
         except (KeyError, ValueError, TypeError):
             continue
-        for peer in boards.get(membership.get(code,{}).get('code'),[]):
+        board = membership.get(code,{}).get('code')
+        selected_boards[board] = boards.get(board, [])
+        for peer in selected_boards[board]:
             requested_ends.setdefault(peer, set()).add(end)
+    # Start local reads with small industries, deduplicating overlapping peers.
+    # Spreading a short collection budget over every industry can leave all of
+    # them below the unchanged 80% threshold. Network priority is refined using
+    # actual cached coverage below, without looking at any peer's return.
+    ordered_boards = sorted(selected_boards, key=lambda board: (len(selected_boards[board]), str(board)))
+    all_codes = list(dict.fromkeys(peer for board in ordered_boards
+                                  for peer in sorted(set(selected_boards[board]))))
     def sufficient(code, bars):
         normalized = normalize_bars(bars, cutoff)
         ends = requested_ends.get(code) or {_datetime(cutoff)}
         return all(window(normalized, end, 6) for end in ends)
+    def cached_minutes(code):
+        try:
+            with _recent_sector_lock:
+                saved = _recent_sector_bars.get(code)
+            if saved and 0 <= monotonic()-saved[0] < 10 and sufficient(code, saved[1]):
+                return code, saved[1]
+            return code, archive.read_recent(code, cutoff, minutes=20)
+        except Exception:
+            return code, []
+    # Separate local reads from network calls, so a few slow providers cannot
+    # prevent later candidates from using already archived peer evidence.
+    cached, _ = bounded_fetch_map(cached_minutes, all_codes if archive else [], workers=8,
+        timeout=min(2., max(0,collection_deadline-monotonic())*.25))
+    rows = dict(cached)
+    missing = {code for code in all_codes if not sufficient(code, rows.get(code, []))}
+    errors = {}
+    targets, remainder = [], []
+    priorities = []
+    for board in ordered_boards:
+        peers = set(selected_boards[board])
+        absent = sorted(peers.intersection(missing))
+        available = len(peers)-len(absent)
+        # Include one extra constituent for each candidate's self exclusion.
+        # This is only an I/O priority; compute_sector_evidence still evaluates
+        # the full denominator and exact window separately for every stock.
+        required = min(len(peers), max(4, ceil(.8*max(0, len(peers)-1))+1))
+        needed = max(0, required-available)
+        priorities.append((needed, len(absent), str(board), absent))
+    for needed, _, _, absent in sorted(priorities):
+        targets.extend(absent[:needed])
+        remainder.extend(absent[needed:])
+    fetch_order = list(dict.fromkeys(targets+remainder))
+
+    def publish(unfinished, phase):
+        normalized = {peer: normalize_bars(part, cutoff) for peer, part in rows.items()}
+        shared_windows, results = {}, {}
+        for code in codes:
+            sector = membership.get(code, {})
+            board = sector.get('code')
+            peers = set(boards.get(board, [])) - {code}
+            try:
+                end = _datetime(intraday[code]['asOf'])
+            except (KeyError, ValueError, TypeError):
+                end = None
+            key = (board, end)
+            if key not in shared_windows:
+                returns, sources = {}, {}
+                if end is not None:
+                    for peer in boards.get(board, []):
+                        part = window(normalized.get(peer, {}), end, 6)
+                        if part:
+                            returns[peer] = (part[-1]['close']/part[0]['close']-1)*100
+                            sources[peer] = {str(row.get('source') or 'unknown') for row in part}
+                shared_windows[key] = returns, sources
+            returns, sources = shared_windows[key]
+            result = compute_sector_evidence(code, intraday.get(code, {}), sector,
+                boards.get(board, []), {}, cutoff, _peer_returns=returns)
+            unfinished_peers = len(peers.intersection(unfinished))
+            failed_peers = {peer: errors[peer] for peer in peers if peer in errors}
+            result.update(requestedCutoffAt=_datetime(cutoff).isoformat(),
+                sourceIds=sorted({source for peer in peers for source in sources.get(peer, set())}),
+                collectionPhase=phase,
+                fetchBudget={'seconds':timeout, 'returnReserveSeconds':return_reserve,
+                    'priority':'closest_to_full_denominator_coverage',
+                    'unfinishedPeers':unfinished_peers, 'failedPeers':len(failed_peers)})
+            result['reasonCodes'] = []
+            if not sector:
+                result['reasonCodes'].append('sector_membership_unavailable')
+            if unfinished_peers:
+                result['reasonCodes'].append('sector_peer_collection_pending' if phase == 'cache_snapshot'
+                                             else 'sector_peer_deadline_exhausted')
+                result['gaps'].append(f'行业分钟采集尚有{unfinished_peers}只成分未返回；完整成分分母与80%覆盖门槛保持不变')
+                if phase != 'cache_snapshot':
+                    result['gaps'].append('行业分钟采集达到时间预算，已保留完成部分')
+            if failed_peers:
+                result['reasonCodes'].append('sector_peer_source_failed')
+                result['peerFetchErrors'] = failed_peers
+            if result.get('peerCount', 0) < 3 or result.get('metrics', {}).get('sector_coverage_pct', 0) < 80:
+                result['reasonCodes'].append('sector_peer_coverage_insufficient')
+            results[code] = result
+            if on_result:
+                on_result(code, result)
+        return results
+
+    if not missing:
+        return publish(set(), 'complete')
+    # Publish cached results before any network wait. Packets are replaced, not
+    # mutated, so a caller can safely freeze its latest completed snapshot.
+    publish(missing, 'cache_snapshot')
+
     def get_minutes(code):
         try:
-            if bar_fetcher is None:
-                with _recent_sector_lock:
-                    saved = _recent_sector_bars.get(code)
-                    if saved and 0 <= monotonic()-saved[0] < 10 and sufficient(code, saved[1]):
-                        return code, saved[1]
-                cached = archive.read_recent(code, cutoff, minutes=20)
-                if sufficient(code, cached):
-                    return code, cached
-            if monotonic() >= deadline:
-                return code, []
-            bars = (bar_fetcher(code,count=20) if bar_fetcher is not None else
-                    fetch_recent_bars(code,count=20,cutoff=cutoff,deadline=deadline))
+            if monotonic() >= collection_deadline:
+                raise TimeoutError('行业分钟采集达到时间预算')
+            if bar_fetcher is not None:
+                bars = bar_fetcher(code,count=20)
+            else:
+                bars = []
+                try:
+                    software = fetch_software_bars(code, count=20,
+                        timeout=max(.1, min(4., collection_deadline-monotonic())))
+                    if sufficient(code, software):
+                        bars = software
+                except (requests.RequestException, RuntimeError, ValueError, TypeError, KeyError):
+                    pass
+                if not bars:
+                    bars = fetch_recent_bars(code,count=20,cutoff=cutoff,deadline=collection_deadline)
             if bar_fetcher is None:
                 # Route fresh peers through the same quarantine rules as stock
                 # evidence. Unverified is observable; tainted sessions are not.
@@ -304,23 +442,18 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
                     if len(_recent_sector_bars) >= 6000:
                         _recent_sector_bars.clear()
                     _recent_sector_bars[code] = (monotonic(),bars)
-            return code, bars
-        except Exception:
-            return code, []
-    completed, missing = bounded_fetch_map(get_minutes,all_codes,workers=8,
-                                           timeout=max(0,deadline-monotonic()))
-    rows = dict(completed)
-    results = {code:compute_sector_evidence(code,intraday.get(code,{}),membership.get(code,{}),
-                boards.get(membership.get(code,{}).get('code'),[]),rows,cutoff) for code in codes}
-    for code, result in results.items():
-        peers = set(boards.get(membership.get(code,{}).get('code'),[])) - {code}
-        missing_peers = len(peers.intersection(missing))
-        result['fetchBudget'] = {'seconds':timeout,'unfinishedPeers':missing_peers}
-        result['requestedCutoffAt'] = _datetime(cutoff).isoformat()
-        result['sourceIds'] = sorted({str(row.get('source') or 'unknown') for peer in peers for row in rows.get(peer,[])})
-        if missing_peers:
-            result['gaps'].append(f'行业分钟采集达到时间预算，{missing_peers}只成分未返回；完整成分分母与80%覆盖门槛保持不变')
-    return results
+            return code, bars, None if bars else 'empty_source'
+        except Exception as exc:
+            return code, [], type(exc).__name__
+    completed, unfinished = bounded_fetch_map(get_minutes,fetch_order,workers=8,
+                                              timeout=max(0,collection_deadline-monotonic()))
+    for code, bars, error in completed:
+        # A failed refresh cannot erase an already valid earlier cutoff window.
+        if bars:
+            rows[code] = bars
+        if error:
+            errors[code] = error
+    return publish(set(unfinished), 'deadline_partial' if unfinished else 'complete')
 
 
 def compute_fund_evidence(code, data, cutoff):

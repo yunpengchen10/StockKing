@@ -53,6 +53,8 @@ def inspect_session(code, day, rows, verification=None):
     reasons = []
     ordered = sorted(rows, key=lambda row: row['end'])
     for row in ordered:
+        if str(row.get('end', ''))[:10] != day:
+            reasons.append('session_date_mismatch')
         if row.get('data_quality_status') == 'tainted' or row.get('conflicting_observations'):
             reasons.append('conflicting_source_observations')
         identity = row.get('identity_evidence') or {}
@@ -75,7 +77,8 @@ def inspect_session(code, day, rows, verification=None):
     if evidence:
         try:
             at = datetime.fromisoformat(str(evidence.get('observed_at', '')))
-            sources = {_source_family(row.get('source')) for row in ordered}
+            sources = {_source_family(source) for row in ordered
+                       for source in [row.get('source'), *(row.get('sources') or [])]}
             family = _source_family(evidence.get('source'))
             independent = family in {'tdx','sina','tencent','eastmoney','tushare'} and family not in sources
             kind = evidence.get('kind')

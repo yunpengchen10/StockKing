@@ -89,12 +89,12 @@ def test_membership_budget_survives_an_unresponsive_provider(tmp_path):
         release.set()
 
 
-@pytest.mark.parametrize('fresh,count', [(True,240),(False,8000)])
-def test_only_fresh_warm_archive_reduces_minute_download(monkeypatch,tmp_path,fresh,count):
+@pytest.mark.parametrize('fresh,history_count,count', [(True,20,240),(True,5,8000),(False,20,8000)])
+def test_only_fresh_warm_archive_reduces_minute_download(monkeypatch,tmp_path,fresh,history_count,count):
     days = [NOW.date()-timedelta(days=i) for i in range(1,21)]
     monkeypatch.setattr(minute_history, '_prior_sessions', lambda day: days)
     archive = minute_history.MinuteArchive(tmp_path)
-    archive.save('600000', [row for day in days[:5] for row in bars(day)] + (bars() if fresh else []), NOW)
+    archive.save('600000', [row for day in days[:history_count] for row in bars(day)] + (bars() if fresh else []), NOW)
     calls = []
     class Client:
         available = True
@@ -104,8 +104,8 @@ def test_only_fresh_warm_archive_reduces_minute_download(monkeypatch,tmp_path,fr
     monkeypatch.setattr(SoftwareMarketClient, 'from_environment', lambda: Client())
     result = minute_history.fetch_bar_evidence('600000',NOW,tmp_path,backfill=False)
     assert calls == [{'period':'1','count':count}]
-    assert result['historyDays'] == 5
-    assert len(archive.read('600000', NOW)) == 102
+    assert result['historyDays'] == history_count
+    assert len(archive.read('600000', NOW)) == (history_count+1)*17
 
 
 def test_gateway_timeout_is_explicit_and_bounded():

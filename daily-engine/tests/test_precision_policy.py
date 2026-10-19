@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 import pandas as pd
 import pytest
+from tests.primary_fixture import make_primary_evidence
 
 from src.services.akshare_context import AkshareContextProvider, for_stock, TZ
 from src.services.yao_scout.precision_policy import evaluate
@@ -154,12 +155,12 @@ def test_old_positive_financials_do_not_hide_incomplete_latest_coverage():
 
 def v12_candidate(price=10):
     from src.services.yao_scout.v11_factors import SCORE_VERSION
-    return {**candidate(price), 'scoreVersion':SCORE_VERSION, 'finalScore':70,
+    return make_primary_evidence({**candidate(price), 'scoreVersion':SCORE_VERSION, 'finalScore':70,
             'quote': {'price': price, 'pre_close': 9.8, 'limit_up': 10.78, 'limit_down': 8.82},
             'strategyBranch':'分钟局部突破观察', 'baselineHistoryDays':20,
             'priceHistoricalCoverageDays':20, 'dataEligibility':{'status':'formal'},
             'factorScores':{key:60 for key in ('M','V','W','B')},
-            'indicatorEvidence':[{'key':'local_high_5m','value':9.99,'status':'observed'}]}
+            'indicatorEvidence':[{'key':'local_high_5m','value':9.99,'status':'observed'}]})
 
 
 def test_v12_three_profiles_execute_distinct_price_limits():

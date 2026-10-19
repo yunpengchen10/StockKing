@@ -6,6 +6,7 @@ import pytest
 
 from src.services.yao_scout.signal_learning import SignalLearningService, TZ
 from src.services.yao_scout.local_algorithm import algorithm_contract
+from tests.primary_fixture import make_primary_evidence
 
 
 @pytest.fixture(autouse=True)
@@ -23,7 +24,7 @@ def _clock(day: date, hour: int = 9, minute: int = 40, second: int = 35) -> date
 
 def _candidate(code: str, day: date, *, price: float = 10.0) -> dict:
     contract = algorithm_contract()
-    return {
+    return make_primary_evidence({
         "algorithmContractId": contract["contractId"], "scoreVersion": contract["scoreVersion"],
         "status": "conditional", "evidenceEligible": True,
         "precisionDecision": {"version": contract["entryPolicyVersion"],
@@ -38,7 +39,7 @@ def _candidate(code: str, day: date, *, price: float = 10.0) -> dict:
                   "source_time": _clock(day, second=25).isoformat()},
         "tradability": {"status": "unverified"}, "finalScore": 70.0,
         "v11Inputs": {"r3_pct": 0.5}, "factorScores": {"M": 75.0, "V": 75.0, "W": 75.0, "B": 75.0},
-    }
+    })
 
 
 def _bars(days: list[date], *, locked_entry: bool = False) -> list[dict]:

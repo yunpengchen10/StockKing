@@ -13,7 +13,7 @@ import pandas as pd
 from .daily_opportunities import finite, quote_check, is_market_open
 from .research_policy import DEFAULT_PARAMETERS
 
-VERSION = 'king-evidence-20261012'
+VERSION = 'king-evidence-20261015'
 
 
 def research_queue_limit(universe_size: int) -> int:
@@ -65,7 +65,7 @@ def daily_evidence(frame, cutoff):
         result['gaps'].append(f'仅{len(data)}个已完成交易日，20日结构不足')
         return result
     previous_session = cutoff.date() - timedelta(days=1)
-    while not is_market_open('cn', previous_session):
+    while previous_session.weekday() >= 5 or not is_market_open('cn', previous_session):
         previous_session -= timedelta(days=1)
     if data.date.iloc[-1] != previous_session or frame.attrs.get('daily_stale'):
         result['gaps'].append('历史行情陈旧，未用于当前结构判断')
@@ -81,8 +81,12 @@ def daily_evidence(frame, cutoff):
     close = data.close
     tr = pd.concat([data.high-data.low, (data.high-close.shift()).abs(), (data.low-close.shift()).abs()], axis=1).max(axis=1)
     result['asOf'] = data.date.iloc[-1].isoformat()
+    price_basis = frame.attrs.get('daily_adjustment') or frame.attrs.get('adjustment')
+    # The desktop gateway explicitly names unadjusted prices "none". This is
+    # a provider enum, not a missing value; keep unknown/absent enums unknown.
+    price_basis = 'unadjusted' if price_basis == 'none' else price_basis
     result['previousSession'] = {'asOf': result['asOf'], 'preCloseAsOf': data.date.iloc[-2].isoformat(), 'source': result['source'],
-        'priceBasis': frame.attrs.get('daily_adjustment') or frame.attrs.get('adjustment'),
+        'priceBasis': price_basis,
         'preClose': float(close.iloc[-2]), 'close': float(close.iloc[-1]), 'high': float(data.high.iloc[-1])}
     m = result['metrics']
     m.update(history_sessions=len(data), last_close=float(close.iloc[-1]),
@@ -93,6 +97,32 @@ def daily_evidence(frame, cutoff):
              drawdown20_pct=float((close.tail(20)/close.tail(20).cummax()-1).min()*100))
     for days in (5, 20):
         m[f'return{days}_pct'] = float((close.iloc[-1]/close.iloc[-days-1]-1)*100) if len(close)>days else None
+    # Optional completed-session liquidity, never an auction or minute proxy.
+    # Ratios use 20 earlier sessions and preserve provider volume units; missing
+    # volume/amount does not discard otherwise valid historical price structure.
+    liquidity_fields = {}
+    for field, canonical in (('volume', 'volume_shares'), ('amount', 'amount_cny')):
+        # The desktop gateway and its existing scan caches use canonical unit
+        # names. Prefer those explicit units without mixing provider-native
+        # values into the same 20-session ratio when both columns exist.
+        source_field = canonical if canonical in data else field
+        liquidity_fields[field] = source_field
+        if source_field not in data:
+            continue
+        values = pd.to_numeric(data[source_field], errors='coerce')
+        valid = values.notna() & (values > 0) & values.map(lambda value: math.isfinite(value) if pd.notna(value) else False)
+        m['last_' + field] = float(values.iloc[-1]) if valid.iloc[-1] else None
+        prior = values.iloc[-21:-1]
+        prior_valid = valid.iloc[-21:-1]
+        median = float(prior.median()) if len(prior) == 20 and prior_valid.all() else None
+        m['prior20_median_' + field] = median
+        m['relative_' + field + '_last_vs_prior20'] = m['last_' + field] / median if m['last_' + field] and median else None
+    result['liquidityEvidence'] = {
+        'source': result['source'], 'asOf': result['asOf'],
+        'volumeUnit': 'shares' if liquidity_fields['volume'] == 'volume_shares' else frame.attrs.get('volume_unit') or 'provider_native',
+        'amountUnit': 'CNY' if liquidity_fields['amount'] == 'amount_cny' else frame.attrs.get('amount_unit') or 'provider_native',
+        'fields': liquidity_fields,
+        'meaning': '上一交易日量额及此前20日同源日线中位数比；不代表竞价匹配量或开盘成交'}
     return result
 
 
@@ -297,7 +327,7 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
     if not v11:
         gaps.append('催化事件及预期差尚未独立核验，不作为本轮入选理由')
     if not sector_ok:
-        gaps.append('行业同刻共振未完整确认；降低置信度，不作为单项否决' if v11 else
+        gaps.append('行业同刻共振未完整确认；仅研究，不进入主推荐' if v11 else
                     '未同时满足行业同刻上涨、半数同业上涨及个股相对领先；不按孤立脉冲推荐')
     if not baseline_ok:
         gaps.append('同刻20日基准尚未齐全；5—19日仅观察，少于5日不评分；正式候选另须通过关键因子和分档风险检查' if v11 else
@@ -305,7 +335,7 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
     elif not volume_confirmed:
         risks.append('近3分钟成交额未超过20日同刻中位数，即时放量未确认')
     if not funds_ok:
-        gaps.append('新鲜主动买卖量分类或近3分钟主力估算净额>0未核实；降低置信度' if v11 else
+        gaps.append('新鲜主动买卖量分类或近3分钟主力估算净额>0未核实；仅研究，不进入主推荐' if v11 else
                     '新鲜主动买卖量分类或近3分钟主力估算净额>0未核实')
     if resistance is None:
         gaps.append('上方可比压力/剩余空间未量化，不编造目标价')
@@ -326,7 +356,7 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
                               (True if v11 else sector_ok and volume_confirmed and funds_ok))))
     if not immediate and not premarket:
         gaps.append('未取得3/5分钟持续转强及VWAP承接或局部突破的独立证据，本轮不因日涨幅高而入选')
-    triggers = [f'复核VWAP {vwap:.2f}元附近承接及连续3/5分钟转强；板块联动作为加分证据' if vwap else '开盘后取得连续分钟突破证据，并核验正常可成交性'] if v11 else [f'复核VWAP {vwap:.2f}元附近承接、3/5分钟持续转强及板块联动后再评估' if vwap else '开盘后取得有效VWAP和连续分钟成交证据，再核验板块联动']
+    triggers = [f'复核VWAP {vwap:.2f}元附近承接及连续3/5分钟转强；板块联动与资金同窗转正须同时通过' if vwap else '开盘后取得连续分钟突破证据，并核验板块、资金和正常可成交性'] if v11 else [f'复核VWAP {vwap:.2f}元附近承接、3/5分钟持续转强及板块联动后再评估' if vwap else '开盘后取得有效VWAP和连续分钟成交证据，再核验板块联动']
     invalidations = [f'跌破{support:.2f}元则原支撑逻辑失效' if support else '失效价位未核实前不形成买入计划',
                      '板块联动消失、放量下跌或报价过期时重新评估']
     no_chase = f'接近{resistance:.2f}元且剩余空间不再大于失效距离时不追' if resistance else '未核实上方空间时不追；封死涨停仅作风向标'

@@ -48,10 +48,14 @@ def display_counts(run: dict[str, Any]) -> dict[str, Any]:
     return {
         "displayRunId": run.get("run_id") or run.get("runId"),
         "tradeCandidateCount": len(trade),
+        "dailyCandidateCount": len(trade) if run.get("primarySelectionMode") == "daily_conditional" else 0,
         "nextDayCandidateCount": len(watch),
         "continuationCandidateCount": len(continuation),
-        # Continuations are an auxiliary queue, not a first-board recommendation.
-        "savedRecommendationCount": len(trade | watch),
+        "premarketCandidateCount": len(codes("premarketCandidates")),
+        # Preserve legacy counters as recorded; under the primary-admission
+        # contract, research observations never inflate recommendation counts.
+        "savedRecommendationCount": len(trade) if (run.get('recommendationPolicy')
+            or run.get("primarySelectionMode") == "daily_conditional") else len(trade | watch),
     }
 
 
@@ -60,7 +64,7 @@ def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
     run = payload.get("adaptive")
     if not isinstance(run, dict):
         return payload
-    shown = {key: value for key, value in run.items() if key not in {"controls", "windvanes"}}
+    shown = {key: value for key, value in run.items() if key not in {"controls", "windvanes", "morningResearch"}}
     if isinstance(run.get("precisionWatchlist"), list):
         shown["precisionWatchlist"] = []
         for pick in run["precisionWatchlist"]:
@@ -76,6 +80,44 @@ def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
     return {**payload, "adaptive": shown}
 
 
+def _daily_assessment_valid(run: dict[str, Any]) -> bool:
+    """Validate at publication; opening an old saved result never refreshes it."""
+    from src.services.yao_scout.daily_primary import TASK_ID, VERSION
+    from src.services.yao_scout.daily_opportunities import is_market_open
+    from src.services.yao_scout.premarket import previous_session
+
+    assessment = run.get("dailyAssessment")
+    if not isinstance(assessment, dict):
+        return False
+
+    def period(stamp):
+        clock = stamp.time().replace(tzinfo=None)
+        return ("morning" if time(9, 30) <= clock <= time(11, 30) else
+                "afternoon" if time(13) <= clock < time(14, 57) else None)
+
+    try:
+        decision = datetime.fromisoformat(assessment.get("asOf") or "")
+        if decision.tzinfo is None:
+            return False
+        decision = decision.astimezone(_SHANGHAI_TZ)
+        generated = _generated_at(run).astimezone(_SHANGHAI_TZ)
+        daily, quotes, count = (assessment.get(key) for key in
+                                ("dailyUsableCount", "quoteUsableCount", "count"))
+        return bool(run.get("primaryObjective") == TASK_ID
+            and assessment.get("version") == VERSION and assessment.get("taskId") == TASK_ID
+            and assessment.get("status") in {"completed", "no_daily_candidates"}
+            and assessment.get("minuteDataRequired") is False
+            and all(type(value) is int for value in (daily, quotes, count))
+            and daily >= quotes > 0 and 0 <= count <= quotes
+            and decision.date() == generated.date()
+            and 0 <= (generated-decision).total_seconds() <= 300
+            and period(decision) and period(decision) == period(generated)
+            and is_market_open("cn", decision.date())
+            and assessment.get("baselineAsOf") == previous_session(decision).isoformat())
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def displayable_run(run: Any) -> bool:
     """A source outage is not an empty selection. Old snapshots do not expire here."""
     if not isinstance(run, dict) or run.get("status") not in _VALID_STATUSES:
@@ -85,11 +127,35 @@ def displayable_run(run: Any) -> bool:
     if not isinstance(run.get("candidates"), list):
         return False
     quality = run.get("dataQuality") or run.get("data_quality") or {}
+    if run.get('premarketAssessment'):
+        # A validated previous-session plan can be saved before trades/minutes
+        # exist. Merely labelling a broken intraday scan "premarket" cannot
+        # bypass its normal source/coverage checks.
+        from src.services.yao_scout.premarket import VERSION, opening_phase, previous_session
+        assessment = run['premarketAssessment']
+        try:
+            decision = datetime.fromisoformat(assessment.get('decisionAt') or '')
+            generated = _generated_at(run).astimezone(_SHANGHAI_TZ)
+            expires = datetime.fromisoformat(assessment.get('expiresAt') or '')
+            return bool(assessment.get('version') == VERSION and decision.tzinfo and expires.tzinfo
+                and opening_phase(decision) and decision <= generated < expires
+                and expires.astimezone(_SHANGHAI_TZ).time() == time(9, 35)
+                and expires.astimezone(_SHANGHAI_TZ).date() == generated.date()
+                and assessment.get('baselineSession') == previous_session(decision).isoformat()
+                and assessment.get('dailyUsableCount', 0) > 0
+                and assessment.get('snapshotUsage') == 'stock_directory_and_research_priority_only'
+                and not run['candidates'])
+        except (TypeError, ValueError, OverflowError):
+            return False
     if quality.get("stale") or quality.get("snapshot_count") == 0:
         return False
     coverage = quality.get("quote_coverage") or {}
     if coverage.get("requested", 0) > 0 and not coverage.get("fresh", 0):
         return False
+    if run.get("primarySelectionMode") == "daily_conditional":
+        # Minute availability cannot veto this independent daily task. The
+        # branch label alone is insufficient: its own evidence must be usable.
+        return _daily_assessment_valid(run)
     minutes = quality.get("minute_coverage") or {}
     if (minutes.get("requested", 0) > 0 and not minutes.get("usable", 0)
             and not run.get("nextDayWatchlist") and not run.get("nextDayContinuationWatchlist")):
@@ -167,13 +233,17 @@ class LocalPicksDisplayStore:
             minutes = (run.get("dataQuality") or run.get("data_quality") or {}).get("minute_coverage") or {}
             quote_missing = coverage.get("requested", 0) > 0 and not coverage.get("fresh", 0)
             minute_missing = minutes.get("requested", 0) > 0 and not minutes.get("usable", 0)
-            if quote_missing or minute_missing:
+            if run.get('premarketAssessment'):
+                message = '昨夜已完成日线不足或开盘预案窗口已结束，本轮未生成有效预案；已保留上次结果'
+            elif run.get('primarySelectionMode') == 'daily_conditional':
+                message = '本轮日线、当日报价或本时段日线评估尚未核验完成；已保留上次结果'
+            elif quote_missing or minute_missing:
                 message = ("本轮全部实时报价缺失或过期，无法核验推荐；已保留上次结果" if quote_missing
                            else "本轮全部有效分钟价格结构缺失，无法核验推荐；已保留上次结果")
                 try:
                     stamp = datetime.fromisoformat(run.get("generatedAt") or run.get("as_of") or "")
-                    if stamp.time() < time(9, 30):
-                        message = "09:30 开盘前缺少当日分钟信号，当前本地规则无法形成盘中推荐；已保留上次结果"
+                    if stamp.tzinfo is not None and stamp.astimezone(_SHANGHAI_TZ).time() < time(9, 30):
+                        message = "盘前预案所需的昨夜数据尚未核验完成；已保留上次结果"
                 except (TypeError, ValueError):
                     pass
             raise ValueError(message)

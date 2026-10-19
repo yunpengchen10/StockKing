@@ -316,7 +316,7 @@ def test_premarket_missing_quotes_explains_why_and_atomic_write_failure_preserve
     _, db, _, _ = runtime
     store = LocalPicksDisplayStore(db)
     old = store.save(scan())
-    with pytest.raises(ValueError, match="09:30.*分钟"):
+    with pytest.raises(ValueError, match="盘前预案.*昨夜数据"):
         store.save(scan(None, generatedAt="2026-09-30T09:19:45+08:00",
                         dataQuality={"quote_coverage": {"requested": 30, "fresh": 0}}))
     import src.services.stock_king_display as module

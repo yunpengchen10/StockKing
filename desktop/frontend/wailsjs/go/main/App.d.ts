@@ -210,6 +210,8 @@ export function GetDailyOperationPlanByID(arg1:number):Promise<models.DailyOpera
 
 export function GetDailyOperationPlanList(arg1:models.DailyOperationPlanQuery):Promise<models.DailyOperationPlanPageData>;
 
+export function GetDisplayedKingPicks():Promise<Record<string, any>>;
+
 export function GetEngineStatus():Promise<main.EngineStatus>;
 
 export function GetExecutableBacktestReport(arg1:string):Promise<Record<string, any>>;
@@ -264,11 +266,7 @@ export function GetKingPicks(arg1:number,arg2:boolean):Promise<Record<string, an
 
 export function GetKingPicksHistory(arg1:number):Promise<Record<string, any>>;
 
-export function StartKingPicksRefresh(arg1:number):Promise<Record<string, any>>;
-
 export function GetKingPicksRefreshTask(arg1:string):Promise<Record<string, any>>;
-
-export function GetDisplayedKingPicks():Promise<Record<string, any>>;
 
 export function GetLatestKingPicks(arg1:string):Promise<Record<string, any>>;
 
@@ -551,6 +549,8 @@ export function SetStockSort(arg1:number,arg2:string):Promise<void>;
 export function SetTradingPrice(arg1:string,arg2:number,arg3:number,arg4:number,arg5:number):Promise<string>;
 
 export function StartFeishuBot():Promise<string>;
+
+export function StartKingPicksRefresh(arg1:number):Promise<Record<string, any>>;
 
 export function StartQuantBacktest(arg1:Array<number>):Promise<Record<string, any>>;
 

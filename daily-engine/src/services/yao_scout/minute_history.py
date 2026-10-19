@@ -10,6 +10,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import closing
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache
 import json
 import math
 import os
@@ -235,7 +236,30 @@ def supplement_bars(primary, extra, cutoff, *, diagnostics=None):
             for at, row in result.items()]
 
 
-def read_archive_rows(directory, code, cutoff, *, lookback_days=None):
+@lru_cache(maxsize=256)
+def _checked_session_rows(code, day, payload, verification_json, cutoff_key, quality_version):
+    """Cache immutable checked bytes, never eligibility detached from its inputs.
+
+    The database payload and independent anchor are part of the key. Callers
+    still read the current quarantine flag on every access, and decode a fresh
+    result so modifying returned rows cannot corrupt the cache. The size bound
+    limits this to recent sessions; it is not a persistent validation shortcut.
+    """
+    stored = json.loads(zlib.decompress(payload))
+    evidence = json.loads(verification_json) if verification_json else None
+    if inspect_session(code, day, stored, evidence)['status'] == 'tainted':
+        return b'[]', 'tainted', None
+    cleaned = list(normalize_bars(stored, _datetime(cutoff_key)).values())
+    scoped = inspect_session(code, day, cleaned, evidence)
+    if scoped['status'] == 'tainted':
+        return b'[]', 'tainted', None
+    # Legacy sessions have no quality-row revision: compute it ONCE per day.
+    revision = session_revision(code, day, cleaned)
+    return (json.dumps(cleaned, separators=(',', ':'), ensure_ascii=False).encode(),
+            scoped['status'], revision)
+
+
+def read_archive_rows(directory, code, cutoff, *, lookback_days=None, required_days=None):
     """Read features/label bars without schema writes or bypassing quarantine."""
     path = Path(directory) / 'minute-bars-v2.sqlite3'
     if not path.is_file():
@@ -246,6 +270,12 @@ def read_archive_rows(directory, code, cutoff, *, lookback_days=None):
     if lookback_days is not None:
         where += ' AND s.day>=?'
         parameters.append((cutoff-timedelta(days=max(0,int(lookback_days)))).date().isoformat())
+    if required_days is not None:
+        days = sorted({str(day)[:10] for day in required_days})
+        if not days:
+            return []
+        where += ' AND s.day IN (' + ','.join('?' for _ in days) + ')'
+        parameters.extend(days)
     with closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=5)) as db:
         if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").fetchone():
             return []
@@ -259,21 +289,22 @@ def read_archive_rows(directory, code, cutoff, *, lookback_days=None):
         if status == 'tainted':
             continue
         try:
-            stored = json.loads(zlib.decompress(payload))
-            evidence = json.loads(verification_json) if verification_json else None
-            # Even a legacy conflict after the requested prefix taints the day.
-            if inspect_session(code,day,stored,evidence)['status'] == 'tainted':
+            # Historical session prefixes are stable across today's cutoffs.
+            session_cutoff = min(cutoff, _datetime(day + 'T15:00:00+08:00'))
+            checked, scoped_status, computed_revision = _checked_session_rows(
+                code, day, payload, verification_json, session_cutoff.isoformat(), DATA_QUALITY_VERSION)
+            if scoped_status == 'tainted':
                 continue
-            cleaned = list(normalize_bars(stored,cutoff).values())
-            scoped = inspect_session(code,day,cleaned,evidence)
-            if scoped['status'] == 'tainted':
-                continue
-            rows.extend({**row,'raw_data_revision':revision or session_revision(code,day,cleaned),
-                         'data_quality_version':DATA_QUALITY_VERSION,'data_quality_status':scoped['status']}
+            cleaned = json.loads(checked)
+            raw_revision = revision or computed_revision
+            rows.extend({**row,'raw_data_revision':raw_revision,
+                         'data_quality_version':DATA_QUALITY_VERSION,'data_quality_status':scoped_status}
                         for row in cleaned)
         except (KeyError,TypeError,ValueError,zlib.error):
             continue
-    return list(normalize_bars(rows,cutoff).values())
+    # Each day was normalized above and its security/session identity checked;
+    # session keys cannot overlap, so a second full-history pass is redundant.
+    return rows
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -454,7 +485,7 @@ class MinuteArchive:
             revision = self._quality(db, code, day, rows, {'status':'tainted', 'reasonCodes':[reason]}, event='quarantine')
         return {'code':code, 'day':day, 'revision':revision, 'status':'tainted'}
 
-    def rebuild(self, code, day, rows, cutoff, *, verification, expected_revision):
+    def rebuild(self, code, day, rows, cutoff, *, verification, expected_revision, allow_tainted=True):
         """Publish a new full-session version only after independent verification.
 
         This never fetches data or silently amends an old recommendation. The
@@ -480,6 +511,9 @@ class MinuteArchive:
             old_rows = json.loads(zlib.decompress(old[0]))
             if session_revision(code, day, old_rows) != expected_revision:
                 raise ValueError('repair target revision changed')
+            old_quality = db.execute('SELECT status FROM session_quality WHERE code=? AND day=?', (code, day)).fetchone()
+            if not allow_tainted and old_quality and old_quality[0] == 'tainted':
+                raise ValueError('quarantined repair requires explicit authorization')
             repair_id = canonical_hash([expected_revision, datetime.now(SHANGHAI).isoformat(), verification])
             normalized = [{**row, 'integrity_revision': repair_id} for row in normalized]
             self._evidence(db, code, day, old_rows, 'before_verified_rebuild')
@@ -488,6 +522,48 @@ class MinuteArchive:
                        (zlib.compress(json.dumps(normalized,separators=(',',':')).encode()), code, day))
             revision = self._quality(db, code, day, normalized, quality, verification, 'verified_rebuild')
         return {'code':code, 'day':day, 'revision':revision, 'previousRevision':expected_revision, 'status':'verified'}
+
+    def replace_unknown_session(self, code, day, rows, cutoff, *, verification, expected_revision):
+        """Replace unverified legacy bytes with a genuinely re-fetched subset.
+
+        Missing minutes stay missing. This cannot repair a quarantined session,
+        which still requires the full 240-minute rebuild above. Price bounds and
+        security identities must be independently verified before the CAS write.
+        """
+        verification = {key:value for key,value in verification.items() if key != 'known_at'}
+        original, conflicts = list(rows), set()
+        normalized = list(normalize_bars(original, cutoff, conflicts=conflicts).values())
+        if not normalized or conflicts or any(row['end'][:10] != day for row in normalized):
+            raise ValueError('replacement requires nonconflicting actual session rows')
+        if verification.get('kind') != 'daily_ohlc' or verification.get('day') != day:
+            raise ValueError('replacement requires independent historical daily prices')
+        quality = inspect_session(code, day, normalized, verification)
+        if quality['status'] != 'verified':
+            raise ValueError('replacement requires verified identity and independent prices')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            old = db.execute('SELECT s.payload,q.status,q.verification_json FROM sessions s '
+                'LEFT JOIN session_quality q ON q.code=s.code AND q.day=s.day '
+                'WHERE s.code=? AND s.day=?', (code, day)).fetchone()
+            if not old:
+                raise ValueError('replacement target missing')
+            old_rows = json.loads(zlib.decompress(old[0]))
+            if session_revision(code, day, old_rows) != expected_revision:
+                raise ValueError('replacement target revision changed')
+            old_quality = inspect_session(code, day, old_rows, json.loads(old[2]) if old[2] else None)
+            if old[1] == 'tainted' or old_quality['status'] == 'tainted':
+                raise ValueError('quarantined session requires full verified rebuild')
+            if old[1] == 'verified' or old_quality['status'] == 'verified':
+                raise ValueError('verified session must not be downgraded to a partial replacement')
+            repair_id = canonical_hash([expected_revision, datetime.now(SHANGHAI).isoformat(), verification])
+            normalized = [{**row, 'integrity_revision':repair_id} for row in normalized]
+            self._evidence(db, code, day, old_rows, 'before_verified_legacy_replacement')
+            self._evidence(db, code, day, original, 'verified_legacy_replacement', verification)
+            db.execute('UPDATE sessions SET payload=? WHERE code=? AND day=?',
+                (zlib.compress(json.dumps(normalized, separators=(',',':')).encode()), code, day))
+            revision = self._quality(db, code, day, normalized, quality, verification, 'verified_legacy_replacement')
+        return {'code':code, 'day':day, 'revision':revision, 'previousRevision':expected_revision,
+                'status':'verified', 'actualMinutes':len(normalized), 'fullSessionRebuild':False}
 
     def attempted(self, code, day, source):
         with self.connect() as db:
@@ -791,9 +867,96 @@ def _formal_history_ready(evidence):
                for key in ('historyDays', 'priceHistoryDays'))
 
 
+def read_bar_evidence(code, cutoff, cache_dir, *, required_days=None):
+    """Recompute a frozen cutoff from the archive, without network/schema writes.
+
+    Read today's session first. Missing/stale current data cannot use a baseline,
+    so it must not pay to decode 65 calendar days. When current data is usable,
+    only the exact prior exchange sessions used by the formula are loaded.
+    Whole-session integrity is still checked before taking any feature window.
+    """
+    cutoff = _datetime(cutoff)
+    started = monotonic()
+    rows = read_archive_rows(cache_dir, code, cutoff, lookback_days=0)
+    result = compute_bar_evidence(rows, cutoff, expected_dates=[])
+    if result.get('asOf') and result.get('sourceAgeSeconds', MINUTE_MAX_AGE) < MINUTE_MAX_AGE:
+        dates = sorted({str(day)[:10] for day in _prior_sessions(cutoff.date())
+                        if str(day)[:10] < cutoff.date().isoformat()})[-FORMAL_HISTORY_DAYS:]
+        if len(dates) == FORMAL_HISTORY_DAYS:
+            historical = read_archive_rows(cache_dir, code, cutoff, required_days=dates)
+            # The longest historical feature is a 30-minute return (31 prices).
+            # The complete session was already inspected, including conflicts
+            # outside this window; trim only the redundant feature input.
+            end = _datetime(result['asOf'])
+            feature_rows = []
+            for row in historical:
+                at = _datetime(row['end'])
+                same_clock = end.replace(year=at.year, month=at.month, day=at.day)
+                if same_clock-timedelta(minutes=30) <= at <= same_clock:
+                    feature_rows.append(row)
+            result = compute_bar_evidence(feature_rows + rows, cutoff, expected_dates=dates)
+    dependency_days = required_days or result['dependencyDays']
+    result.update(code=code, archivePath=str(Path(cache_dir) / 'minute-bars-v2.sqlite3'),
+                  dataLineage=read_archive_lineage(cache_dir, code, dependency_days, cutoff=cutoff))
+    if required_days:
+        coverage_rows = read_archive_rows(cache_dir, code, cutoff, required_days=required_days)
+        result['requiredCoverage'] = minute_coverage(coverage_rows, cutoff, required_days)
+    result['readEvidenceMs'] = round((monotonic()-started)*1000, 3)
+    return result
+
+
+def _fetch_scan_bar_evidence(code, cutoff, cache_dir, *, getter=None, required_days=None, deadline=None):
+    """Incremental scan path: fetch current bars first, read history once last."""
+    def remaining(maximum):
+        return maximum if deadline is None else max(0., min(maximum, deadline-monotonic()))
+    started = monotonic()
+    errors, software_fetched = [], False
+    supplemental = {'attempted': False}
+    if remaining(1) > 0:
+        archive = MinuteArchive(cache_dir)
+        if getter is None:
+            from src.services.software_market import SoftwareMarketClient
+            client = SoftwareMarketClient.from_environment()
+            client.read_timeout = max(.1, remaining(4))
+            if client.available and remaining(1) > 0:
+                try:
+                    bars = fetch_software_bars(code, count=240, client=client)
+                    normalized = normalize_bars(bars, cutoff)
+                    if not normalized:
+                        raise ValueError('no usable software minute bars')
+                    archive.save(code, list(normalized.values()), cutoff)
+                    software_fetched = True
+                except (requests.RequestException, RuntimeError, ValueError, TypeError, KeyError) as exc:
+                    errors.append('软件分钟更新失败：'+type(exc).__name__)
+        if not software_fetched and remaining(1) > 0:
+            supplemental['attempted'] = True
+            try:
+                bars = fetch_sina_bars(code, getter=getter, count=240, timeout=max(.1, remaining(5)))
+                if not normalize_bars(bars, cutoff):
+                    raise ValueError('Sina returned no usable complete minutes')
+                supplemental.update(archive.save(code, bars, cutoff), status='fetched')
+            except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+                errors.append('Sina分钟更新失败：'+type(exc).__name__)
+                supplemental.update(status='failed', error=type(exc).__name__)
+    else:
+        errors.append('分钟采集已到截止时间，仅读缓存，未追加历史回填')
+    fetch_ms = round((monotonic()-started)*1000, 3)
+    result = read_bar_evidence(code, cutoff, cache_dir, required_days=required_days)
+    result.update(fetchedAt=datetime.now(SHANGHAI).isoformat(), softwareMarketUsed=software_fetched,
+                  supplementalMinuteFetch=supplemental, historyBackfill={
+                      'status':'disabled_during_scan', 'pages':0, 'newBars':0, 'requestedEnds':[], 'pageCoverage':[]},
+                  fetchTimingsMs={'currentFetchAndArchive':fetch_ms, 'readEvidence':result['readEvidenceMs']},
+                  historyAccess='configured' if os.getenv('TUSHARE_TOKEN') or os.getenv('TUSHARE_API_TOKEN') else 'public_archive_warming')
+    result['gaps'].extend(errors)
+    return result
+
+
 def fetch_bar_evidence(code, cutoff, cache_dir, *, getter=None, poster=None, backfill=True, software_count=8000,
                        required_days=None, deadline=None):
     cutoff = _datetime(cutoff)
+    if not backfill and software_count <= 240:
+        return _fetch_scan_bar_evidence(code, cutoff, cache_dir, getter=getter,
+                                       required_days=required_days, deadline=deadline)
     archive = MinuteArchive(cache_dir)
     def remaining(maximum):
         return maximum if deadline is None else max(0., min(maximum, deadline-monotonic()))

@@ -37,6 +37,7 @@ def make_service(monkeypatch, start, tmp_path, fetch=None, batch=None):
                 'amount': 980000000, 'volume':100000000, 'provider_timestamp': tick[0].isoformat(),
                 'active_buy_share_pct':60,'active_flow_source':'fixture','active_flow_as_of':tick[0].isoformat()}
     service = local.LocalOpportunityService(yao, {'api_key': 'must-not-be-used'},
+        selection_mode='intraday',  # These fixtures exercise the minute contract explicitly.
         context_provider=SimpleNamespace(collect=lambda now: {'tables': [
             {'kind': kind, 'status': 'available', 'observedAt': now.isoformat(), 'source': 'fixture', 'rows': rows}
             for kind, rows in [('financials', [{'股票代码': '600001', '最新公告日期': '2026-08-30',
@@ -57,21 +58,130 @@ def make_service(monkeypatch, start, tmp_path, fetch=None, batch=None):
     return service, tick, events, saved
 
 
+def enable_primary_evidence(service):
+    """Supply verified full-universe evidence for entry-path integration tests."""
+    original = service.minute_fetcher
+    service.minute_fetcher = lambda *args: {**original(*args), 'dataLineage': {'status': 'verified'}}
+    service._observe_market_emotion = lambda frame, received: {
+        'source': 'test_full_mainboard', 'asOf': received.isoformat(), 'status': 'insufficient',
+        'score': None, 'regime': 'unknown', 'features': {
+            'source_coverage': 1, 'universe_count': 3000, 'advancing_pct': 65}}
+
+
+def test_complete_morning_evidence_without_validated_model_keeps_primary_empty(monkeypatch, tmp_path):
+    from src.services.yao_scout.signal_learning import SignalLearningService
+    start = datetime(2026, 9, 14, 9, 40, tzinfo=base.TZ)
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path)
+    enable_primary_evidence(service)
+    # Isolate the archive's independently tested verification result. All live
+    # evidence, profile and morning model admission gates remain production code.
+    monkeypatch.setattr(SignalLearningService, '_learning_quality', lambda self, row, published: {
+        'eligible': True, 'qualityKnownAt': published.isoformat(),
+        'checkedAt': published.isoformat(), 'immutable': True})
+    result = service.run('0940', official=True)
+    assert result['primaryObjective'] == 'morning_signal_to_same_session_close'
+    assert result['candidates'] == []
+    assert not any(result['profileCandidates'].values())
+    assert result['morningResearch']
+    research = result['morningResearch'][0]
+    assert research['primaryAdmission']['eligible'] is True
+    assert research['precisionDecision']['profiles']['regular']['entryEligible'] is True
+    assert research['morningSignal']['researchEligibleAtDecision'] is True
+    assert research['morningSignal']['learningStatus'] == 'rules_unvalidated'
+    assert research['morningSignal']['selectionEligible'] is False
+    assert research['morningSignal']['ruleBaselineSelected'] is True
+    assert research['morningSignal']['upProbability'] is None
+    assert research['firstReferenceTime'] is None
+    assert result['nextDayWatchlist']  # Separate research cannot refill main picks.
+    assert result['learningLedger']['selectedCount'] == 0
+
+
+def test_official_preopen_preparation_keeps_target_morning_objective(monkeypatch, tmp_path):
+    start = datetime(2026, 9, 14, 9, 20, tzinfo=base.TZ)
+    service, tick, events, _ = make_service(monkeypatch, start, tmp_path)
+    enable_primary_evidence(service)
+    result = service.run('0940', official=True)
+    target = start.replace(minute=40)
+    assert events[0] == ('snapshot', start)
+    assert tick[0] == target
+    assert result['delivery']['target_at'] == target.isoformat()
+    assert result['primaryObjective'] == 'morning_signal_to_same_session_close'
+    assert result['morningAssessment']['queue'] == '0940'
+    assert result['morningResearch']
+    assert result['candidates'] == []
+    assert not any(result['profileCandidates'].values())
+
+
+def test_scan_crossing_morning_end_preserves_research_and_does_not_recommend(monkeypatch, tmp_path):
+    from src.services.yao_scout.signal_learning import SignalLearningService
+    start = datetime(2026, 9, 14, 11, 29, 50, tzinfo=base.TZ)
+    service, tick, _, _ = make_service(monkeypatch, start, tmp_path)
+    enable_primary_evidence(service)
+    original_rank = SignalLearningService.rank_candidates
+    def slow_rank(self, *args, **kwargs):
+        rows = original_rank(self, *args, **kwargs)
+        tick[0] += timedelta(seconds=20)
+        return rows
+    monkeypatch.setattr(SignalLearningService, 'rank_candidates', slow_rank)
+    result = service.run('live')
+    assert tick[0] == start + timedelta(seconds=20)
+    assert result['primaryObjective'] == 'morning_signal_to_same_session_close'
+    assert result['morningAssessment']['learningStatuses'] == ['morning_window_closed']
+    assert result['morningResearch']
+    assert all(row['morningSignal']['selectionEligible'] is False for row in result['morningResearch'])
+    assert result['candidates'] == []
+    assert not any(result['profileCandidates'].values())
+
+
+def test_final_primary_source_expiry_updates_profile_counts_even_with_fresh_quote(monkeypatch, tmp_path):
+    from src.services.yao_scout.signal_learning import SignalLearningService
+    from src.services.yao_scout.primary_policy import evaluate_primary_admission
+    start = datetime(2026, 9, 14, 13, 17, tzinfo=base.TZ)
+    service, tick, _, _ = make_service(monkeypatch, start, tmp_path)
+    enable_primary_evidence(service)
+    original_quote = service.quote_fetcher
+    service.quote_fetcher = lambda code: {**original_quote(code),
+        'active_flow_as_of': (start - timedelta(seconds=29)).isoformat()}
+    original_finish, before_finish = service._finish_quotes, []
+    def observe_finish(run, quality):
+        before_finish.append(len(run['candidates']))
+        return original_finish(run, quality)
+    service._finish_quotes = observe_finish
+    original_rank = SignalLearningService.rank_next_day_candidates
+    def slow_next_day_rank(self, *args, **kwargs):
+        rows = original_rank(self, *args, **kwargs)
+        tick[0] += timedelta(seconds=2)
+        return rows
+    monkeypatch.setattr(SignalLearningService, 'rank_next_day_candidates', slow_next_day_rank)
+    result = service.run('live')
+    assert before_finish == [1, 1]  # Evidence passed before the final source expiry.
+    assert result['dataQuality']['quote_coverage']['fresh'] == 1
+    assert result['dataQuality']['minute_coverage']['usable'] == 1
+    admission = evaluate_primary_admission(result['precisionResearch'][0], tick[0])
+    assert admission['eligible'] is False
+    assert admission['missingReasons'] == ['active_flow_classification_missing_or_stale']
+    assert result['candidates'] == []
+    assert not any(result['profileCandidates'].values())
+    assert result['dataQuality']['precision_policy']['profile_counts'] == {
+        profile: len(rows) for profile, rows in result['profileCandidates'].items()}
+
+
 @pytest.mark.parametrize('slot,hour,minute', [('0920', 9, 20), ('1030', 10, 30), ('1455', 14, 55)])
 def test_scheduled_local_scan_prepares_early_then_refreshes_at_target(monkeypatch, tmp_path, slot, hour, minute):
     start = datetime(2026, 9, 14, hour, minute, tzinfo=base.TZ) - timedelta(minutes=10)
     service, tick, events, saved = make_service(monkeypatch, start, tmp_path)
     result = service.run(slot, official=True)
     target = start + timedelta(minutes=10)
-    assert events == [('snapshot', start), ('snapshot', target-timedelta(seconds=90)), ('quote', target)]
+    assert events == ([('snapshot', start), ('quote', target)] if slot == '0920' else
+                      [('snapshot', start), ('snapshot', target-timedelta(seconds=90)), ('quote', target)])
     assert result['delivery']['decision_at'] == target.isoformat()
-    records = result['candidates'] or result['precisionWatchlist']
+    records = result['premarketCandidates'] if slot == '0920' else result['candidates'] or result['precisionWatchlist']
     assert records[0]['quote']['provider_timestamp'] == target.isoformat()
     assert result['generatedAt'] == target.isoformat()
     assert result['dataQuality']['quote_coverage']['fresh'] == 1
     assert result['llmUsed'] is False and result['delivery']['received_at'] is None
     assert result['learningLedger']['trainingEligible'] is (slot != '0920')
-    assert result['learningLedger']['researchCount'] == 1
+    assert result['learningLedger']['researchCount'] == (0 if slot == '0920' else 1)
     if slot == '0920':
         assert records[0]['status'] == 'premarket'
         assert not any(result['profileCandidates'].values())
@@ -180,6 +290,8 @@ def test_local_daily_history_reuses_software_chart_provider(monkeypatch, tmp_pat
     dates = pd.bdate_range(end=start.date()-timedelta(days=1),periods=60)
     class Client:
         available=True
+        def enrich_snapshot_quotes(self, frame, **kwargs):
+            return frame
         def bars(self,code,period,count):
             assert (code,period,count)==('600001','101',260)
             return {'source':'fixture','adjustment':'none','bars':[
@@ -245,10 +357,11 @@ def test_scan_reads_prior_review_reminders_without_changing_rank(monkeypatch, tm
     monkeypatch.setattr(local, 'read_observation_reminders_batch',
                         lambda db, codes, now: {code: ['历史缺口需重新核验'] for code in codes})
     result = service.run('1030')
-    candidate = result['candidates'][0]
+    candidate = result['precisionResearch'][0]
     assert candidate['observationReminders'] == ['历史缺口需重新核验']
     assert '历史缺口需重新核验' in candidate['risks']
-    assert candidate['rank'] == 1 and result['llmUsed'] is False
+    assert candidate['code'] == '600001' and result['llmUsed'] is False
+    assert not result['candidates']  # Research reminders cannot bypass the morning model gate.
 
 
 def test_daily_review_wires_observations_and_new_ledger(monkeypatch, tmp_path):
@@ -379,8 +492,9 @@ def test_optional_evidence_cannot_extend_global_scan_deadline(monkeypatch, tmp_p
 
 @pytest.mark.parametrize('minute_age, eligible', [(299, True), (300, False)])
 def test_completion_requires_fresh_minutes_even_when_quotes_are_fresh(monkeypatch, tmp_path, minute_age, eligible):
-    start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
+    start = datetime(2026, 9, 14, 13, 17, tzinfo=base.TZ)
     service, _, _, _ = make_service(monkeypatch, start, tmp_path)
+    enable_primary_evidence(service)
     result = service.run('live')
     assert result['candidates']
     collections = [result.get(key, []) for key in
@@ -439,8 +553,9 @@ def test_official_expanded_stage_budgets_stay_inside_delivery_deadline(monkeypat
 def test_timed_out_quote_group_keeps_already_completed_groups(monkeypatch, tmp_path):
     from threading import Event
     from src.services import software_market
-    start = datetime(2026, 9, 14, 10, 17, tzinfo=base.TZ)
+    start = datetime(2026, 9, 14, 13, 17, tzinfo=base.TZ)
     service, _, _, _ = make_service(monkeypatch, start, tmp_path)
+    enable_primary_evidence(service)
     codes = [f'{600001 + i:06d}' for i in range(45)]
     frame = pd.DataFrame({'code': codes, 'name': ['测试股'] * 45, 'price': [10] * 45})
     service.yao._fetch_snapshot = lambda: frame

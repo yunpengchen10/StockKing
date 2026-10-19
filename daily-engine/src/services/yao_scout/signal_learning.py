@@ -174,11 +174,19 @@ def _snapshot(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "rank", "rankingTieBreakOrder",
         "researchFactors", "dataEligibility", "priceHistoricalCoverageDays",
         "factorCoverage", "missingFactors", "scoreStage", "selectedScoreBranch",
-        "nextDaySignal", "dailyLastClose", "dailyPreviousSession", "nextDaySelected", "nextDayContinuationSelected", "recommendationKinds",
+        "nextDaySignal", "morningSignal", "firstReferenceTime", "firstReferencePrice", "currentSignalState", "primaryAdmission",
+        "dailyLastClose", "dailyPreviousSession", "nextDaySelected", "nextDayContinuationSelected", "recommendationKinds",
         "rawStructureRewardRisk", "entryRiskDistance", "entryRiskFloorAtr", "entryRiskBasis",
         "prediction", "learningDecision", "learningTaskContractId", "dataLineage",
         "portfolioWeight", "portfolioWeightKind", "portfolioPolicy", "plannedWeight",
         "factorCutoffAt", "factorAvailability", "marketRegime", "learningDataEligibility",
+        "minuteSourceTime", "sectorEvidence", "fundEvidence", "evidenceChecks",
+        "dailySignal", "dailyEvidence", "dailyEvidenceStatus", "dailyProfileDecision",
+        "dailyFirstReferenceTime", "dailyFirstReferencePrice", "dailyCurrentSignalState",
+        "stateLabel", "strategyId", "strategyBranch", "validationStatus", "horizon", "horizonId",
+        "support", "resistance", "atr14", "structureRewardRisk", "biasMa5Pct", "atrExtension",
+        "eventAssessment", "marketBreadth", "rankMeaning", "riskProfile", "executionQuoteData",
+        "trainingEligible", "minuteModelTrainingEligible", "entryEligible", "executable",
     )
     return {key: candidate[key] for key in keys if key in candidate}
 
@@ -190,18 +198,31 @@ _COMPACT_KEYS = (
     "dataConfidence", "baselineHistoryDays", "scoreVersion", "selectionReasons", "riskReasons",
     "triggerConditions", "invalidationConditions", "algorithmContractId", "learningRankVersion",
     "learningRankScore", "rank", "rankingTieBreakOrder", "dataEligibility", "factorCoverage",
-    "missingFactors", "scoreStage", "selectedScoreBranch", "nextDaySignal", "nextDaySelected",
+    "missingFactors", "scoreStage", "selectedScoreBranch", "nextDaySignal", "morningSignal",
+    "firstReferenceTime", "firstReferencePrice", "currentSignalState", "primaryAdmission", "nextDaySelected",
     "nextDayContinuationSelected", "recommendationKinds",
     "rawStructureRewardRisk", "entryRiskDistance", "entryRiskFloorAtr", "entryRiskBasis",
     "prediction", "learningDecision", "learningTaskContractId", "dataLineage",
     "portfolioWeight", "portfolioWeightKind", "portfolioPolicy", "plannedWeight", "marketRegime",
+    "dailySignal", "dailyEvidence", "dailyEvidenceStatus", "dailyProfileDecision",
+    "dailyFirstReferenceTime", "dailyFirstReferencePrice", "dailyCurrentSignalState",
+    "stateLabel", "strategyId", "strategyBranch", "validationStatus", "horizon", "horizonId",
+    "support", "resistance", "atr14", "structureRewardRisk", "biasMa5Pct", "atrExtension",
+    "eventAssessment", "marketBreadth", "rankMeaning", "riskProfile",
 )
 
 
 def _json_projection(column: str, keys: Iterable[str]) -> str:
     """Project known fields inside SQLite; never transport raw minute evidence."""
-    return "json_object(" + ",".join(
-        f"'{key}',json_extract({column},'$.{key}')" for key in keys) + ")"
+    # Older SQLite builds cap function arguments at 127. Keep each object
+    # below that bound even as independently versioned signal fields grow.
+    keys = list(keys)
+    chunks = ["json_object(" + ",".join(f"'{key}',json_extract({column},'$.{key}')"
+               for key in keys[start:start + 50]) + ")" for start in range(0, len(keys), 50)]
+    result = chunks[0] if chunks else "json_object()"
+    for chunk in chunks[1:]:
+        result = f"json_patch({result},{chunk})"
+    return result
 
 
 def _compact_features(payload: Mapping[str, Any]) -> dict[str, float]:
@@ -228,14 +249,44 @@ def _scan_records(result: Mapping[str, Any]):
     selected = {_code(item.get("code")) for item in result.get("candidates", []) if isinstance(item, Mapping)}
     selected.discard(None)
     records: dict[str, dict[str, Any]] = {}
-    for collection in ("candidates", "controls", "precisionResearch", "windvanes", "evidenceInsufficient"):
+    for collection in ("candidates", "controls", "precisionResearch", "morningResearch", "invalidatedCandidates", "windvanes", "evidenceInsufficient"):
         for item in result.get(collection, []) or []:
             if isinstance(item, Mapping) and (code := _code(item.get("code"))):
                 if code not in records or collection == "candidates":
                     records[code] = dict(item)
     # Research-only rows do not gain execution/training eligibility by existing
     # in a watchlist. Existing candidates/controls keep their original contract.
-    execution_sources = set(records)
+    execution_sources = {code for code, row in records.items() if not _is_daily_signal(row)}
+    # A profile-only daily recommendation must be frozen too. A daily record
+    # takes precedence over a same-code minute control: this ledger has one
+    # row per stock/run and must never combine the two training contracts.
+    daily_profiles: dict[str, set[str]] = defaultdict(set)
+    for mapping in (result.get('profileCandidates'), result.get('dailyProfileCandidates')):
+        if not isinstance(mapping, Mapping):
+            continue
+        for profile, rows in mapping.items():
+            for row in rows or []:
+                if isinstance(row, Mapping) and _is_daily_signal(row) and (code := _code(row.get('code'))):
+                    daily_profiles[code].add(str(profile))
+                    if not _is_daily_signal(records.get(code) or {}):
+                        records[code] = dict(row)
+    for row in result.get('dailyCandidates') or []:
+        if isinstance(row, Mapping) and _is_daily_signal(row) and (code := _code(row.get('code'))):
+            daily_profiles[code].add('regular')
+            if not _is_daily_signal(records.get(code) or {}):
+                records[code] = dict(row)
+    for code, record in records.items():
+        if _is_daily_signal(record):
+            execution_sources.discard(code)
+            # These fields belong to the separate minute contract, even if an
+            # upstream caller accidentally copied them onto a daily candidate.
+            for key in ('morningSignal', 'algorithmContractId', 'learningTaskContractId',
+                        'prediction', 'learningDecision', 'dataLineage', 'v11Inputs', 'factorScores'):
+                record.pop(key, None)
+            record['dailySignal'] = {**record['dailySignal'],
+                'selected': bool(code in selected or daily_profiles.get(code)),
+                'selectedProfiles': sorted(daily_profiles.get(code, set())),
+                'trainingEligibleAtSignal': False}
     watch, continuation = set(), set()
     for collection, selection in (("nextDayWatchlist", watch), ("nextDayContinuationWatchlist", continuation)):
         for item in result.get(collection, []) or []:
@@ -254,12 +305,46 @@ def _scan_records(result: Mapping[str, Any]):
             (continuation if signal.get("queue") == "continuation" else watch).add(code)
         record["nextDaySelected"] = code in watch
         record["nextDayContinuationSelected"] = code in continuation
-        record["recommendationKinds"] = (["execution"] if code in selected else []) + (
+        record["recommendationKinds"] = _primary_kinds(record, code in selected) + (
             ["next_day_watch"] if code in watch else []) + (["next_day_continuation"] if code in continuation else [])
     return selected, records, watch, continuation, execution_sources
 
 
+def _is_daily_signal(candidate: Mapping[str, Any]) -> bool:
+    return isinstance(candidate.get('dailySignal'), Mapping)
+
+
+def _primary_kinds(candidate: Mapping[str, Any], selected: bool) -> list[str]:
+    if _is_daily_signal(candidate):
+        return ['daily_condition'] if selected or candidate['dailySignal'].get('selected') is True else []
+    return ['execution'] if selected else []
+
+
+def _freeze_daily_signal(candidate, published_at, *, previous=None):
+    """Freeze daily reference prices independently of all morning queues."""
+    signal = dict(candidate['dailySignal'])
+    prior = (previous or {}).get('dailySignal') or {}
+    selected = signal.get('selected') is True
+    repeated = bool(prior.get('selected') is True and prior.get('firstReferenceTime')
+                    and _number(prior.get('firstReferencePrice'), positive=True))
+    reference = _number(candidate.get('referencePrice') or candidate.get('signalPrice'), positive=True)
+    source = _source_time(candidate)
+    quote_price = _number((candidate.get('quote') or {}).get('price'), positive=True)
+    verified = bool(reference and quote_price and abs(reference - quote_price) <= .000001
+                    and source and 0 <= (published_at - _at(source)).total_seconds() <= 30)
+    return {**signal, 'publishedAt': published_at.isoformat(),
+        'firstReferenceTime': prior['firstReferenceTime'] if repeated else published_at.isoformat() if selected else None,
+        'firstReferencePrice': prior['firstReferencePrice'] if repeated else reference if selected else None,
+        'currentSignalState': ('continued' if repeated else 'new') if selected else 'invalidated' if repeated else 'observation',
+        'isRepeatedSignal': repeated, 'referencePrice': reference, 'referenceSourceTime': source,
+        'referenceVerifiedAtPublication': verified, 'trainingEligibleAtSignal': False,
+        'validationStatus': 'unvalidated_rules', 'probability': None,
+        'reviewStatus': 'daily_observation_only'}
+
+
 def _current_entry_eligible(candidate: Mapping[str, Any]) -> bool:
+    if _is_daily_signal(candidate):
+        return False
     from .local_algorithm import algorithm_contract, is_research_eligible
     # Training controls are defined before the learned admission decision. A
     # model rejecting an otherwise tradable candidate cannot erase its label.
@@ -272,6 +357,9 @@ def _current_entry_eligible(candidate: Mapping[str, Any]) -> bool:
 def _signal_preflight(candidate: Mapping[str, Any], published_at: datetime) -> bool:
     """Admit only signal-time usable examples; later no-fills stay in the sample."""
     if not _current_entry_eligible(candidate):
+        return False
+    from .primary_policy import evaluate_primary_admission
+    if evaluate_primary_admission(candidate, published_at).get('eligible') is not True:
         return False
     code = _code(candidate.get("code"))
     if code is None or not _feature_values(candidate):
@@ -390,6 +478,10 @@ class SignalLearningService:
                     model_version TEXT NOT NULL, rank_score REAL NOT NULL,
                     created_at TEXT NOT NULL, PRIMARY KEY(signal_id,model_version)
                 );
+                CREATE TABLE IF NOT EXISTS morning_outcomes(
+                    signal_id TEXT PRIMARY KEY REFERENCES signal_events(signal_id),
+                    reviewed_at TEXT NOT NULL, result_json TEXT NOT NULL
+                );
                 """
             )
             columns = {row[1] for row in db.execute("PRAGMA table_info(signal_events)")}
@@ -436,6 +528,15 @@ class SignalLearningService:
         # Also freeze the contract of an empty (cash-only) official scan.
         scan_meta["algorithmContractId"] = (contract["contractId"]
                                              if scan_version == contract["scoreVersion"] else None)
+        if (result.get('primarySelectionMode') == 'daily_conditional'
+                or records and all(_is_daily_signal(row) for row in records.values())):
+            # A daily-only publication is not an observed minute-task session.
+            scan_meta['algorithmContractId'] = None
+        from .morning_task import MORNING_TASK_ID, MORNING_QUEUES, MORNING_VERSION, morning_queue, freeze_morning_signal
+        from .task_learning import task_contract
+        morning_slot = morning_queue(slot, published_at)
+        if morning_slot and official and run_usable and scan_meta['algorithmContractId']:
+            scan_meta['morningTaskContractId'] = task_contract(MORNING_TASK_ID, morning_slot)['taskContractId']
         registry = self._registry()
         forward_models = {}
         if official and run_usable and slot in ENTRY_SLOTS:
@@ -446,8 +547,11 @@ class SignalLearningService:
                     if artifact:
                         forward_models[version] = artifact
             from .task_learning import TaskLearner, NEXT_DAY_TASK_ID
-            for queue in ('first_board', 'continuation'):
-                task = TaskLearner(self, NEXT_DAY_TASK_ID, queue)
+            specs = [(NEXT_DAY_TASK_ID, queue) for queue in ('first_board', 'continuation')]
+            if morning_slot:
+                specs.append((MORNING_TASK_ID, morning_slot))
+            for task_id, queue in specs:
+                task = TaskLearner(self, task_id, queue)
                 task_registry = task.registry()
                 for key in ('championVersion', 'shadowVersion', 'rollbackVersion'):
                     version = task_registry.get(key)
@@ -455,6 +559,8 @@ class SignalLearningService:
                     if artifact:
                         forward_models[version] = artifact
         existing = False
+        frozen_morning = {}
+        frozen_daily = {}
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT 1 FROM signal_runs WHERE run_id=?", (run_id,)).fetchone() is not None
@@ -465,12 +571,63 @@ class SignalLearningService:
                      str(result.get("status") or "unknown"), _json(scan_meta), published_at.isoformat()),
                 )
                 for code, item in records.items():
-                    quality = self._learning_quality(item, published_at)
+                    daily = _is_daily_signal(item)
+                    quality = ({'eligible': False, 'qualityKnownAt': None,
+                        'checkedAt': published_at.isoformat(), 'immutable': True,
+                        'reason': 'independent_daily_task_not_minute_training'} if daily
+                        else self._learning_quality(item, published_at))
                     item = {**item,'learningDataEligibility':quality}
                     if item.get('nextDaySignal'):
                         item['nextDaySignal'] = {**item['nextDaySignal'],
                             'trainingEligibleAtSignal':bool(quality['eligible'] and item['nextDaySignal'].get('sourceUsableAtCompletion') is not False),
                             'qualityKnownAt':quality.get('qualityKnownAt')}
+                    previous = None
+                    if not daily and (item.get('morningSignal') or morning_slot):
+                        previous = db.execute("SELECT snapshot_json FROM signal_events WHERE code=? "
+                            "AND substr(decision_at,1,10)=? "
+                            "AND json_extract(snapshot_json,'$.morningSignal.selected')=1 "
+                            "ORDER BY json_extract(snapshot_json,'$.morningSignal.publishedAt'),signal_id LIMIT 1",
+                            (code, day)).fetchone()
+                    if previous and morning_slot and not item.get('morningSignal'):
+                        # A formerly selected name can now fail before ranking.
+                        # Preserve that invalidation, without manufacturing a
+                        # qualified training signal or erasing its first price.
+                        item['morningSignal'] = {'version': MORNING_VERSION,
+                            'queue': morning_slot, 'learningTaskId': MORNING_TASK_ID,
+                            'learningTaskContractId': task_contract(MORNING_TASK_ID, morning_slot)['taskContractId'],
+                            'researchEligibleAtDecision': False, 'selectionEligible': False,
+                            'learningStatus': 'data_rejected', 'upProbability': None,
+                            'expectedPriceReturn': None, 'expectedMae': None, 'utility': None,
+                            'ruleBaselineSelected': False, 'ruleBaselineRank': None}
+                    if item.get('morningSignal'):
+                        prior = json.loads(previous[0]) if previous else None
+                        morning_quality = {**quality, 'eligible': bool(quality['eligible'] and _signal_preflight(item, published_at))}
+                        item['morningSignal'] = freeze_morning_signal(item, published_at, slot, morning_quality,
+                            selected=code in selected, official=official and run_usable,
+                            previous=prior)
+                        for key in ('firstReferenceTime', 'firstReferencePrice', 'currentSignalState'):
+                            item[key] = item['morningSignal'][key]
+                        frozen_morning[code] = {key: item[key] for key in
+                            ('morningSignal', 'firstReferenceTime', 'firstReferencePrice', 'currentSignalState')}
+                    if daily:
+                        prior = db.execute("SELECT snapshot_json FROM signal_events WHERE code=? "
+                            "AND substr(decision_at,1,10)=? "
+                            "AND json_extract(snapshot_json,'$.dailySignal.selected')=1 "
+                            "AND json_extract(snapshot_json,'$.dailySignal.taskId') IS ? "
+                            "ORDER BY json_extract(snapshot_json,'$.dailySignal.publishedAt'),signal_id LIMIT 1",
+                            (code, day, item['dailySignal'].get('taskId'))).fetchone()
+                        item['dailySignal'] = _freeze_daily_signal(item, published_at,
+                            previous=json.loads(prior[0]) if prior else None)
+                        for key in ('firstReferenceTime', 'firstReferencePrice', 'currentSignalState'):
+                            item[key] = item['dailySignal'][key]
+                            item['daily' + key[0].upper() + key[1:]] = item['dailySignal'][key]
+                        item.update(trainingEligible=False, training_eligible=False, minuteModelTrainingEligible=False)
+                        frozen_daily[code] = {key: item[key] for key in (
+                            'dailySignal', 'firstReferenceTime', 'firstReferencePrice', 'currentSignalState',
+                            'dailyFirstReferenceTime', 'dailyFirstReferencePrice', 'dailyCurrentSignalState',
+                            'trainingEligible', 'training_eligible', 'minuteModelTrainingEligible', 'learningDataEligibility')}
+                        if item.get('nextDaySignal'):
+                            frozen_daily[code]['nextDaySignal'] = item['nextDaySignal']
                     supplied_decision = item.get("decision_at")
                     try:
                         decision = _at(supplied_decision or timestamp)
@@ -482,7 +639,7 @@ class SignalLearningService:
                         decision = timestamp
                         eligible = False
                     else:
-                        eligible = bool(code in execution_sources and official and run_usable and slot in ENTRY_SLOTS
+                        eligible = bool(not daily and code in execution_sources and official and run_usable and slot in ENTRY_SLOTS
                                         and _signal_preflight(item, published_at) and quality['eligible'])
                     signal_id = sha256(f"{run_id}:{code}".encode()).hexdigest()[:32]
                     snap = _snapshot(item)
@@ -493,26 +650,57 @@ class SignalLearningService:
                         (signal_id, run_id, code, str(item.get("name") or code), int(code in selected),
                          decision.isoformat(), _source_time(item),
                          _number(item.get("signalPrice") or item.get("referencePrice"), positive=True),
-                         int(eligible), int(reviewable_run and code in execution_sources), _json(_feature_values(item)), _json(snap),
-                         "pending" if reviewable_run and code in execution_sources else "observation_only"),
+                         int(eligible), int(not daily and reviewable_run and code in execution_sources),
+                         _json({} if daily else _feature_values(item)), _json(snap),
+                         "daily_observation_only" if daily else "pending" if reviewable_run and code in execution_sources else "observation_only"),
                     )
-                    if eligible or official and run_usable and slot in ENTRY_SLOTS and item.get('nextDaySignal'):
+                    if not daily and (eligible or official and run_usable and slot in ENTRY_SLOTS and (item.get('nextDaySignal') or item.get('morningSignal'))):
                         for version, artifact in forward_models.items():
                             try:
                                 from .task_learning import ENTRY_TASK_ID, lineage_valid
                                 is_entry = artifact.get('taskId') == ENTRY_TASK_ID
-                                signal = item.get('nextDaySignal') or {}
+                                is_morning = artifact.get('taskId') == MORNING_TASK_ID
+                                signal = item.get('morningSignal' if is_morning else 'nextDaySignal') or {}
                                 if (is_entry and not eligible or not is_entry and
                                         (signal.get('learningTaskContractId') != artifact.get('taskContractId')
                                          or signal.get('trainingEligibleAtSignal') is not True
                                          or not lineage_valid(self, item.get('dataLineage')))):
                                     continue
                                 score, _ = self._predict_artifact(
-                                    artifact, [{"features": _feature_values(item) if is_entry else self._next_features(item)}])
+                                    artifact, [{"features": _feature_values(item) if is_entry or is_morning else self._next_features(item)}])
+                                predicted_at = _at(self.clock())
+                                if is_morning and predicted_at >= _at(signal['observationStartAt']):
+                                    continue  # A shadow prediction must precede its outcome path.
                                 db.execute("INSERT INTO forward_predictions VALUES(?,?,?,?)",
-                                           (signal_id, version, float(score[0]), _at(self.clock()).isoformat()))
+                                           (signal_id, version, float(score[0]), predicted_at.isoformat()))
                             except (ImportError, ValueError):
                                 continue
+                if frozen_morning or frozen_daily:
+                    result = dict(result)
+                    def frozen_row(row):
+                        code = _code(row.get('code'))
+                        if _is_daily_signal(row):
+                            # Use the sanitized daily record, preserving local
+                            # profile rank while excluding copied minute state.
+                            clean = dict(row)
+                            for key in ('morningSignal', 'algorithmContractId', 'learningTaskContractId',
+                                        'prediction', 'learningDecision', 'dataLineage', 'v11Inputs', 'factorScores'):
+                                clean.pop(key, None)
+                            return {**clean, **frozen_daily.get(code, {})}
+                        return {**row, **frozen_morning.get(code, {})}
+                    for collection in ('candidates', 'controls', 'precisionResearch', 'morningResearch',
+                                       'invalidatedCandidates', 'evidenceInsufficient', 'windvanes', 'dailyCandidates'):
+                        if collection in result:
+                            result[collection] = [frozen_row(row) for row in result[collection]]
+                    for mapping in ('profileCandidates', 'dailyProfileCandidates'):
+                        if isinstance(result.get(mapping), Mapping):
+                            result[mapping] = {profile: [frozen_row(row) for row in candidates]
+                                for profile, candidates in result[mapping].items()}
+                    if frozen_morning:
+                        result['invalidatedCandidates'] = [{**records[code], **frozen}
+                            for code, frozen in frozen_morning.items() if frozen['currentSignalState'] == 'invalidated']
+                    scan_meta['result'] = result
+                    db.execute('UPDATE signal_runs SET scan_json=? WHERE run_id=?', (_json(scan_meta), run_id))
             else:
                 saved = db.execute("SELECT scan_json FROM signal_runs WHERE run_id=?", (run_id,)).fetchone()
                 canonical = json.loads(saved[0]).get("result") if saved else None
@@ -520,13 +708,16 @@ class SignalLearningService:
                     result = canonical
                     selected, records, next_day, continuation, execution_sources = _scan_records(result)
         output = dict(result)
+        daily_selected = {code for code, row in records.items()
+                          if _is_daily_signal(row) and row['dailySignal'].get('selected') is True}
         output["learningLedger"] = {
             "version": LEDGER_VERSION, "runId": run_id, "official": official,
             "idempotentReplay": existing, "selectedCount": len(selected),
             "nextDaySelectedCount": len(next_day), "continuationSelectedCount": len(continuation),
-            "savedRecommendationCount": len(selected | next_day),
-            "researchCount": len(records), "trainingEligible": bool(official and run_usable and slot in ENTRY_SLOTS),
-            "reviewEligible": reviewable_run,
+            "dailySelectedCount": len(daily_selected), "minuteSelectedCount": len(selected & execution_sources),
+            "savedRecommendationCount": len(selected | next_day | daily_selected),
+            "researchCount": len(records), "trainingEligible": bool(execution_sources and official and run_usable and slot in ENTRY_SLOTS),
+            "reviewEligible": bool(execution_sources and reviewable_run),
         }
         return output
 
@@ -568,6 +759,8 @@ class SignalLearningService:
             for row in db.execute("SELECT signal_id,horizon,status,reason,details_json FROM signal_outcomes"):
                 execution[row["signal_id"]][row["horizon"]] = row
             next_day = {}
+            morning = {row['signal_id']: json.loads(row['result_json']).get('status')
+                       for row in db.execute('SELECT signal_id,result_json FROM morning_outcomes')}
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='next_day_outcomes'").fetchone():
                 for row in db.execute("SELECT signal_id,result_json FROM next_day_outcomes"):
                     try:
@@ -587,6 +780,9 @@ class SignalLearningService:
             if max(_at(row["decision_at"]), _at(row["published_at"])) > timestamp:
                 continue
             signal_id = row["signal_id"]
+            morning_signal = json.loads(row['snapshot_json']).get('morningSignal') or {}
+            if morning_signal.get('publishedAt') and morning.get(signal_id) != 'mature_price_observation':
+                require(row['code'], _at(morning_signal['publishedAt']).date(), horizon=0)
             outcomes = execution[signal_id]
             if row["review_eligible"] and any(
                     horizon not in outcomes or outcomes[horizon]["status"] not in terminal
@@ -664,7 +860,8 @@ class SignalLearningService:
                         "signalId": event["signal_id"], "code": event["code"], "name": event["name"],
                         "selected": bool(event["selected"]), "decisionAt": event["decision_at"],
                         "nextDaySelected": watch_selected, "nextDayContinuationSelected": continuation_selected,
-                        "recommendationKinds": (["execution"] if event["selected"] else []) + (
+                        "dailySelected": bool(_primary_kinds(snapshot, bool(event['selected'])) == ['daily_condition']),
+                        "recommendationKinds": _primary_kinds(snapshot, bool(event['selected'])) + (
                             ["next_day_watch"] if watch_selected else []) + (
                             ["next_day_continuation"] if continuation_selected else []),
                         "sourceTime": event["source_time"], "signalPrice": event["signal_price"],
@@ -764,6 +961,7 @@ class SignalLearningService:
                     chosen = sorted(next_day | continuation)
                     watch_clause = " OR e.code IN (" + ",".join("?" for _ in chosen) + ")" if chosen else ""
                     event_where.append("(e.selected=1 OR json_extract(e.snapshot_json,'$.nextDaySignal.selected')=1"
+                                       " OR json_extract(e.snapshot_json,'$.dailySignal.selected')=1"
                                        + watch_clause + ")")
                     event_args.extend(chosen)
                 events = db.execute(
@@ -785,7 +983,8 @@ class SignalLearningService:
                     signals.append({"signalId": event["signal_id"], "code": event["code"], "name": event["name"],
                         "selected": bool(event["selected"]), "decisionAt": event["decision_at"],
                         "nextDaySelected": bool(watch), "nextDayContinuationSelected": bool(follow),
-                        "recommendationKinds": (["execution"] if event["selected"] else [])
+                        "dailySelected": bool(_primary_kinds(snapshot, bool(event['selected'])) == ['daily_condition']),
+                        "recommendationKinds": _primary_kinds(snapshot, bool(event['selected']))
                             + (["next_day_watch"] if watch else []) + (["next_day_continuation"] if follow else []),
                         "sourceTime": event["source_time"], "signalPrice": event["signal_price"],
                         "firstTradablePrice": None, "reviewStatus": event["review_status"],
@@ -850,7 +1049,8 @@ class SignalLearningService:
             ).fetchall()
         items = [self._outcome_dict(row) for row in rows]
         from .next_day_watch import read_next_day_reviews
-        return {"items": items, "count": len(items), "nextDayReview": read_next_day_reviews(self, filters)}
+        return {"items": items, "count": len(items), "nextDayReview": read_next_day_reviews(self, filters),
+                "morningReview": self.morning_reviews(filters)}
 
     @staticmethod
     def _outcome_dict(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1229,8 +1429,10 @@ class SignalLearningService:
                            (review_status, event["signal_id"]))
         from .next_day_watch import review_next_day_signals
         next_day = review_next_day_signals(self, timestamp, cache)
+        from .morning_task import review_morning_signals
+        morning = review_morning_signals(self, timestamp, cache)
         return {"items": changed, "updated": len(changed), "asOf": timestamp.isoformat(),
-                "nextDayReview": next_day, "statusCounts": dict(Counter(row["status"] for row in changed)),
+                "nextDayReview": next_day, "morningReview": morning, "statusCounts": dict(Counter(row["status"] for row in changed)),
                 "waitingHorizons": waiting, "calendarUnavailableHorizons": calendar_gaps,
                 "scope": "按交易日历分别结算T+1/T+3/T+5；缺数据保持待补，无法成交保持原拒绝；不改变历史训练资格"}
 
@@ -1307,10 +1509,11 @@ class SignalLearningService:
 
     @scoped_lineage_validation
     def learning_state(self, as_of: datetime | str | None = None) -> dict[str, Any]:
-        from .task_learning import TaskLearner, NEXT_DAY_TASK_ID
+        from .task_learning import TaskLearner, NEXT_DAY_TASK_ID, MORNING_TASK_ID, MORNING_QUEUES
         now = _at(as_of or self.clock())
         states = [TaskLearner(self).state(now)] + [TaskLearner(self, NEXT_DAY_TASK_ID, queue).state(now)
-                    for queue in ('first_board', 'continuation')]
+                    for queue in ('first_board', 'continuation')] + [TaskLearner(self, MORNING_TASK_ID, queue).state(now)
+                    for queue in MORNING_QUEUES]
         return {**states[0], 'taskStates': states}
 
     @staticmethod
@@ -1650,6 +1853,9 @@ class SignalLearningService:
             decision = _at(sample["decisionAt"])
             if not decision <= created <= decision + timedelta(minutes=5):
                 return None
+            if sample.get('observationStartAt') and not (
+                    _at(sample['publishedAt']) <= created < _at(sample['observationStartAt'])):
+                return None
             score = float(row["rank_score"])
             if not math.isfinite(score) or not 0 <= score <= 100:
                 return None
@@ -1669,20 +1875,23 @@ class SignalLearningService:
 
     @scoped_lineage_validation
     def train_and_evaluate(self, as_of: datetime | str | None = None, *, task_id=None, queue=None) -> dict[str, Any]:
-        from .task_learning import TaskLearner, NEXT_DAY_TASK_ID
+        from .task_learning import TaskLearner, NEXT_DAY_TASK_ID, MORNING_TASK_ID, MORNING_QUEUES
         now = _at(as_of or self.clock())
         if task_id is not None:
             return TaskLearner(self, task_id, queue).train(now)
         states = [TaskLearner(self).train(now)] + [TaskLearner(self, NEXT_DAY_TASK_ID, item).train(now)
-                  for item in ('first_board', 'continuation')]
+                  for item in ('first_board', 'continuation')] + [TaskLearner(self, MORNING_TASK_ID, item).train(now)
+                  for item in MORNING_QUEUES]
         return {**states[0], 'taskStates': states}
 
     @scoped_lineage_validation
     def rank_candidates(self, candidates: Iterable[Mapping[str, Any]],
                         as_of: datetime | str | None = None, *, task_id=None, queue=None) -> list[dict[str, Any]]:
-        from .task_learning import TaskLearner, ENTRY_TASK_ID, NEXT_DAY_TASK_ID, predict_model, lineage_valid
+        from .task_learning import TaskLearner, ENTRY_TASK_ID, NEXT_DAY_TASK_ID, MORNING_TASK_ID, predict_model, lineage_valid
         if task_id == NEXT_DAY_TASK_ID:
             return self.rank_next_day_candidates(candidates, as_of)
+        if task_id == MORNING_TASK_ID:
+            return self.rank_morning_candidates(candidates, as_of, slot=queue or 'live')
         learner = TaskLearner(self, task_id or ENTRY_TASK_ID, queue)
         artifact = learner.artifact(learner.registry())
         rows = [dict(row) for row in candidates]
@@ -1725,6 +1934,126 @@ class SignalLearningService:
             return value if value is not None else -1e9
         return sorted(rows,key=lambda row:(id(row) not in eligible_ids,row['prediction']['entryEligible'] is False,
             -rank_value(row)))
+
+    @scoped_lineage_validation
+    def rank_morning_candidates(self, candidates, as_of=None, *, slot='live'):
+        """Independent T0 admission; cold-start remains research, never main picks.
+
+        Preserve qualified controls irrespective of this model's prediction. A
+        frozen rule top-five is a comparator, explicitly not a recommendation.
+        """
+        from .task_learning import TaskLearner, MORNING_TASK_ID, predict_model, lineage_valid
+        from .morning_task import MORNING_VERSION, morning_queue, morning_signal_state
+        now = _at(as_of or self.clock())
+        queue = morning_queue(slot, now)
+        rows = [dict(row) for row in candidates]
+        if queue is None:
+            prior = self._morning_first_references(now)
+            for row in rows:
+                state = morning_signal_state(row, prior.get(str(row.get('code'))), selected=False)
+                row['morningSignal'] = {'version': MORNING_VERSION, 'queue': None,
+                    'actualSlot': str(slot), 'learningTaskId': MORNING_TASK_ID,
+                    'learningTaskContractId': None, 'selectionEligible': False,
+                    'researchEligibleAtDecision': False, 'learningStatus': 'morning_window_closed',
+                    'learningRankVersion': None, 'ruleBaselineSelected': False,
+                    'upProbability': None, 'expectedPriceReturn': None, 'expectedMae': None,
+                    'returnQ10': None, 'utility': None, 'selected': False,
+                    'reason': 'completion_outside_morning_session', **state}
+                row.update({key: state[key] for key in ('firstReferenceTime', 'firstReferencePrice', 'currentSignalState')})
+            return rows
+        learner = TaskLearner(self, MORNING_TASK_ID, queue)
+        artifact = learner.artifact(learner.registry())
+        prior = self._morning_first_references(now)
+        qualified = []
+        for index, row in enumerate(rows):
+            admission = row.get('primaryAdmission')
+            admitted = (admission is None or admission.get('researchEligible', admission.get('eligible')) is True)
+            research = bool(admitted and _signal_preflight(row, now)
+                            and self._learning_quality(row, now).get('eligible') is True)
+            row['morningSignal'] = {'version': MORNING_VERSION, 'queue': queue,
+                'actualSlot': str(slot), 'learningTaskId': MORNING_TASK_ID,
+                'learningTaskContractId': learner.contract['taskContractId'],
+                'researchEligibleAtDecision': research, 'learningStatus': 'rules_unvalidated' if research else 'data_rejected',
+                'learningRankVersion': 'morning_rules_unvalidated', 'selectionEligible': False,
+                'expectedPriceReturn': None, 'upProbability': None, 'returnQ10': None,
+                'expectedMae': None, 'utility': None, 'ruleScore': _number(row.get('finalScore')),
+                'ruleBaselineSelected': False, 'ruleBaselineRank': None, 'selected': False,
+                'rankMeaning': '上午发布后至当日收盘的独立模型；未验证时不发布正式推荐',
+                'probabilityMeaning': '发布时冻结的推荐参考价至当日收盘上涨概率；非成交盈利概率',
+                'T1RiskRequiredSeparately': True, 'executionEligible': False,
+                'tieBreakOrder': index}
+            if research:
+                qualified.append(row)
+        rule_order = sorted(qualified, key=lambda row: (-(_number(row.get('finalScore')) or 0),
+                                                       row['morningSignal']['tieBreakOrder']))
+        for rank, row in enumerate(rule_order, 1):
+            row['morningSignal'].update(ruleBaselineRank=rank, ruleBaselineSelected=rank <= 5)
+        if artifact and qualified:
+            usable = [row for row in qualified if lineage_valid(self, row.get('dataLineage'))]
+            for row in qualified:
+                if row not in usable:
+                    row['morningSignal'].update(learningStatus='data_rejected', selectionEligible=False)
+            if usable:
+                try:
+                    prediction = predict_model(artifact, [{'features': _feature_values(row)} for row in usable])
+                    for index, row in enumerate(usable):
+                        row['morningSignal'].update(learningStatus='active', learningRankVersion=artifact['version'],
+                            learningRankScore=float(prediction['rank'][index]),
+                            expectedPriceReturn=float(prediction['net'][index]),
+                            upProbability=float(prediction['probability'][index]), returnQ10=float(prediction['tail'][index]),
+                            expectedMae=float(prediction['expectedMae'][index]), utility=float(prediction['utility'][index]),
+                            selectionEligible=bool(prediction['eligible'][index]))
+                except (ValueError, KeyError, ImportError):
+                    for row in usable:
+                        row['morningSignal'].update(learningStatus='prediction_failed', selectionEligible=False)
+        for row in rows:
+            previous = prior.get(str(row.get('code')))
+            state = morning_signal_state(row, previous,
+                                         selected=row['morningSignal']['selectionEligible'] is True)
+            if not previous:
+                # Ranking has not chosen the final list. Publication owns the
+                # first actual reference; prospective candidates have none yet.
+                state.update(firstReferenceTime=None, firstReferencePrice=None)
+            row.update({key: state[key] for key in ('firstReferenceTime', 'firstReferencePrice', 'currentSignalState')})
+            row['morningSignal'].update(state)
+        return sorted(rows, key=lambda row: (row['morningSignal']['selectionEligible'] is not True,
+            -(row['morningSignal'].get('learningRankScore') or 0),
+            row['morningSignal'].get('ruleBaselineRank') or math.inf,
+            row['morningSignal']['tieBreakOrder']))
+
+    def _morning_first_references(self, as_of):
+        with self._connect() as db:
+            rows = db.execute("SELECT code,snapshot_json FROM signal_events WHERE substr(decision_at,1,10)=? "
+                "AND json_extract(snapshot_json,'$.morningSignal.selected')=1 "
+                "AND json_extract(snapshot_json,'$.morningSignal.publishedAt')<=? "
+                "ORDER BY json_extract(snapshot_json,'$.morningSignal.publishedAt'),signal_id",
+                (as_of.date().isoformat(), as_of.isoformat())).fetchall()
+        first = {}
+        for row in rows:
+            first.setdefault(row['code'], json.loads(row['snapshot_json']))
+        return first
+
+    def morning_reviews(self, filters=None):
+        from .morning_task import MORNING_VERSION, summarize_morning_records
+        filters = dict(filters or {})
+        where, args = ["json_extract(e.snapshot_json,'$.morningSignal.version')=?"], [MORNING_VERSION]
+        if filters.get('date'):
+            where.append('substr(e.decision_at,1,10)=?')
+            args.append(str(filters['date']))
+        if filters.get('symbol'):
+            where.append('e.code=?')
+            args.append(_code(filters['symbol']) or '')
+        with self._connect() as db:
+            rows = db.execute("SELECT e.signal_id,e.code,e.decision_at,e.snapshot_json,o.result_json,o.reviewed_at "
+                "FROM signal_events e LEFT JOIN morning_outcomes o ON o.signal_id=e.signal_id WHERE "
+                + ' AND '.join(where) + ' ORDER BY e.decision_at,e.code', args).fetchall()
+        items = []
+        for row in rows:
+            signal = json.loads(row['snapshot_json'])['morningSignal']
+            result = json.loads(row['result_json']) if row['result_json'] else {'status': 'pending'}
+            items.append({**signal, **result, 'signalId': row['signal_id'], 'code': row['code'],
+                          'decisionAt': row['decision_at'], 'reviewedAt': row['reviewed_at']})
+        return {'items': items, 'count': len(items), 'summary': summarize_morning_records(items)}
 
     @scoped_lineage_validation
     def rank_next_day_candidates(self, candidates, as_of=None):

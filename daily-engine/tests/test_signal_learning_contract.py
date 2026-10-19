@@ -125,7 +125,7 @@ def test_live_ranking_and_saved_provenance_use_only_shared_eligible_rows(tmp_pat
     monkeypatch.setattr(task_learning,'lineage_valid',lambda *_:True)
     monkeypatch.setattr(task_learning,'predict_model',predict)
     good = _candidate('000001',DAY)
-    good['researchFactors'] = {'C': {'value': 55, 'source': 'announcement', 'availableAt': _clock(DAY).isoformat()}}
+    good['researchFactors'] = {**good['researchFactors'], 'C': {'value': 55, 'source': 'announcement', 'availableAt': _clock(DAY).isoformat()}}
     good['factorCoverage'] = {'early': .9}
     blocked = {**_candidate('000002',DAY),'evidenceEligible':False,'finalScore':99}
     ranked = service.rank_candidates([blocked,good])

@@ -310,6 +310,8 @@ class MarketEmotionArchive:
         if not {'code', 'name', 'price'}.issubset(frame.columns):
             out['gaps'].append('全主板快照字段不完整')
             return out
+        if 'market_quote' in frame.columns:
+            source = attrs.get('market_quote_source') or source
         frame['code'] = frame.code.astype(str).str.zfill(6)
         frame = frame.loc[frame.code.str.match(r'^(?:600|601|603|605|000|001|002|003)\d{3}$')
                           & ~frame.name.astype(str).str.contains(r'ST|退|整理|停牌', case=False, regex=True)]
@@ -323,7 +325,17 @@ class MarketEmotionArchive:
         aggregate = _source_at(attrs.get('provider_timestamp') or attrs.get('source_time'))
         data, stamps, close_flags = {}, [], []
         for row in frame.to_dict('records'):
-            raw_stamp = row.get('source_time') or row.get('provider_timestamp')
+            # Enrichment attaches an entire provider observation. Never borrow
+            # its clock for the older universe-selection price or high/low.
+            observation = row
+            if 'market_quote' in row:
+                packet = row.get('market_quote')
+                if not isinstance(packet, dict) or packet.get('code') != row['code']:
+                    continue
+                observation = packet
+            raw_stamp = observation.get('source_time') or observation.get('provider_timestamp')
+            if observation is not row and raw_stamp is None:
+                continue
             stamp = _source_at(raw_stamp) if raw_stamp is not None else aggregate
             if stamp is None or stamp > received or stamp.date() != now.date():
                 continue
@@ -331,16 +343,16 @@ class MarketEmotionArchive:
             if not closing and ((now - stamp).total_seconds() > self.policy['maxSourceAgeSeconds']
                                 or (received - stamp).total_seconds() > self.policy['maxReceiptLagSeconds']):
                 continue
-            price = _number(row.get('price'))
-            previous = _number(row.get('pre_close') or row.get('previous_close'))
+            price = _number(observation.get('price'))
+            previous = _number(observation.get('pre_close') or observation.get('previous_close'))
             previous = previous if previous is not None and previous > 0 else None
-            change = _number(row.get('change_pct'))
+            change = _number(observation.get('change_pct'))
             if not price or price <= 0 or (previous is None and change is None):
                 continue
             if previous is not None and previous > 0:
                 change = (price / previous - 1) * 100
-            high = _number(row.get('high'))
-            upper, lower = _number(row.get('limit_up')), _number(row.get('limit_down'))
+            high = _number(observation.get('high'))
+            upper, lower = _number(observation.get('limit_up')), _number(observation.get('limit_down'))
             # Explicit pre-close permits a declared normal-mainboard 10% estimate.
             if previous and previous > 0:
                 upper = upper or _limit_price(previous, 10)

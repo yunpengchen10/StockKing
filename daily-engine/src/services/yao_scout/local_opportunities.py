@@ -5,6 +5,7 @@ from time import monotonic
 import json
 import os
 import sqlite3
+from threading import Lock
 from uuid import uuid4
 import pandas as pd
 from src.services.yao_scout.daily_opportunities import DailyOpportunityService, mainboard, clean, validate_candidate, quote_check
@@ -13,15 +14,19 @@ from src.services.yao_scout.recommendation_evidence import VERSION, research_que
 from src.services.yao_scout.v11_factors import SCORE_VERSION, score_v11
 from src.services.yao_scout.minute_history import bounded_fetch_map
 from src.services.yao_scout.local_algorithm import algorithm_contract, is_entry_eligible
+from src.services.yao_scout.primary_policy import evaluate_primary_admission, policy_contract
 
 class LocalOpportunityService(DailyOpportunityService):
     persistent_claims = True
-    def __init__(self, yao, ai_config=None, *, minute_fetcher=None, sector_fetcher=None, fund_fetcher=None, context_provider=None, progress_callback=None, **kwargs):
+    def __init__(self, yao, ai_config=None, *, minute_fetcher=None, sector_fetcher=None, fund_fetcher=None, context_provider=None, progress_callback=None, selection_mode='auto', **kwargs):
         super().__init__(yao, None, **kwargs)
         self.minute_fetcher = minute_fetcher
         self.sector_fetcher, self.fund_fetcher = sector_fetcher, fund_fetcher
         self.context_provider = context_provider
         self.progress_callback = progress_callback
+        if selection_mode not in ('auto', 'intraday'):
+            raise ValueError('selection_mode must be auto or intraday')
+        self.selection_mode = selection_mode
 
     def _progress(self, progress, message):
         if self.progress_callback:
@@ -162,6 +167,24 @@ class LocalOpportunityService(DailyOpportunityService):
         return _lineage(sessions)
 
     def _scan(self, run, quality, history, dlm, previous, now, slot, top_n):
+        from .premarket import opening_phase
+        target = run['delivery'].get('target_at')
+        objective_at = datetime.fromisoformat(target) if run.get('official') and target else now
+        opening_mode = opening_phase(objective_at) is not None
+        overnight = []
+        if opening_mode:
+            from .premarket import previous_session
+            baseline = previous_session(objective_at)
+            for record in history:
+                saved = record.get('result') or {}
+                try:
+                    at = datetime.fromisoformat(saved.get('generatedAt') or record.get('as_of') or '')
+                    if at.tzinfo is None or at > now or at.astimezone(objective_at.tzinfo).date() != baseline:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                for key in ('nextDayWatchlist', 'nextDayContinuationWatchlist', 'candidates'):
+                    overnight.extend(row for row in saved.get(key) or [] if isinstance(row, dict))
         stage_started = monotonic()
         stage_name = 'snapshot'
         quality['stageTimingsMs'] = {}
@@ -207,24 +230,47 @@ class LocalOpportunityService(DailyOpportunityService):
             return results
         self._progress(12, '正在读取全市场行情')
         snapshots = fetch_batch('snapshot', lambda _: self.yao._fetch_snapshot(), [None], 25)
-        if not snapshots:
+        if not snapshots and opening_mode and overnight:
+            snapshot = pd.DataFrame(overnight).drop_duplicates('code')
+            snapshot.attrs.update(stale=True, snapshot_source='previous_session_saved_research')
+            quality['snapshot_fallback'] = 'overnight_directory_only'
+        elif not snapshots:
             raise ValueError('全市场行情请求超时或失败，本轮保留历史结果')
-        snapshot = snapshots[0]
+        else:
+            snapshot = snapshots[0]
         snapshot_received_at = self.clock()
         frame = mainboard(snapshot)
+        if frame.empty and opening_mode and overnight:
+            snapshot = pd.DataFrame(overnight).drop_duplicates('code')
+            snapshot.attrs.update(stale=True, snapshot_source='previous_session_saved_research')
+            frame = mainboard(snapshot)
+            quality['snapshot_fallback'] = 'overnight_directory_only'
         quality.update(self.yao._snapshot_meta(snapshot, point_in_time_ok=False))
         quality.update(snapshot_count=len(snapshot), mainboard_count=len(frame), llm_calls=0)
-        if frame.empty or snapshot.attrs.get('stale'):
+        if frame.empty or (snapshot.attrs.get('stale') and not opening_mode):
             raise ValueError('全市场行情为空或陈旧，本轮保留历史结果')
-        emotion = self._observe_market_emotion(frame, snapshot_received_at)
+        emotion = self._observe_market_emotion(frame, snapshot_received_at) if not opening_mode else {}
         # The former heat score is no longer a fallback recommendation engine.
         # A queue gives several forms of activity a chance to be researched;
         # independent price, structure and remaining-space evidence decides entry.
         queued = clean(research_queue(frame))
+        if opening_mode:
+            # Overnight selections seed the research queue, never the new result.
+            # Recheck every name against completed daily bars and today's quote.
+            seeds = [str(row.get('code')) for row in overnight]
+            lookup = {row['code']: row for row in clean(frame.to_dict('records'))}
+            order = list(dict.fromkeys([*seeds, *(row['code'] for row in queued)]))
+            queued = [lookup[code] for code in order if code in lookup][:research_queue_limit(len(frame))]
+            quality['overnight_seed_count'] = len(set(seeds) & set(lookup))
         self._research_coverage(quality, frame, queued)
         run.update(model_version=SCORE_VERSION, modelVersion=SCORE_VERSION, recommendationLogicVersion=SCORE_VERSION,
                    evidenceVersion=VERSION,
                    algorithm=algorithm_contract(), aiAudit=[], aiReviewStatus='not_requested', evidenceInsufficient=[])
+        from .morning_task import MORNING_TASK_ID, morning_queue
+        objective_at = datetime.fromisoformat(target_at) if run.get('official') and target_at else now
+        is_morning = morning_queue(slot, objective_at) is not None
+        run['primaryObjective'] = MORNING_TASK_ID if is_morning else 'entry_today_exit_next_session'
+        run['recommendationPolicy'] = policy_contract()
         old = {p.get('code') for p in previous.get('candidates', [])}
         quality.update(model_universe_count=0,
                        selection_method='成交额/快照量比/换手/开盘修复各自名次并集安排深研；无涨幅权重总分',
@@ -295,6 +341,135 @@ class LocalOpportunityService(DailyOpportunityService):
             evidence['collectionMode'] = 'incremental' if saved is not None else 'initial_daily_snapshot'
             return item['code'], evidence
         daily = dict(fetch_batch('daily_history', history_for, queued, 25))
+        from .history_preparation import read_preparation_status
+        preparation = read_preparation_status(self.yao.data_dir/'minute_history', self.clock())
+        prepared_details = preparation.get('details') or {}
+        prepared_clocks = sorted({row.get('baselineClock') for row in prepared_details.values() if row.get('baselineClock')})
+        preparation['baselineClock'] = prepared_clocks[0] if len(prepared_clocks) == 1 else None
+        preparation_clock = objective_at.replace(second=0, microsecond=0).time().replace(tzinfo=None).isoformat()
+        minute_pool_prepared = bool(queued) and preparation.get('targetSession') == objective_at.date().isoformat() and all(
+            (prepared_details.get(row['code']) or {}).get('ready') and (
+                (prepared_details[row['code']]).get('fullSessionReady') or
+                (prepared_details[row['code']]).get('baselineClock') == preparation_clock)
+            for row in queued)
+        def publish_daily(contexts, quotes, completed):
+            from .daily_primary import build_daily_candidates, TASK_ID
+            if target_at and run.get('official') and (completed-datetime.fromisoformat(target_at)).total_seconds() >= 120:
+                raise ValueError('错过计划时点，未用后续行情补造日线推荐')
+            packet = build_daily_candidates(queued, daily, quotes, completed,
+                top_n=top_n, contexts=contexts, market_evidence=emotion)
+            assessment = packet['dailyAssessment']
+            run.update(packet)
+            run.update(primarySelectionMode='daily_conditional', primaryObjective=TASK_ID,
+                candidates=packet['dailyCandidates'], profileCandidates=packet['dailyProfileCandidates'],
+                status='completed_observations' if assessment['dailyUsableCount'] else 'no_candidates_with_coverage_limits',
+                message=assessment.get('message', '当前不在日线条件推荐的连续交易时段。'),
+                marketSummary='依据已完成日K、最新报价及已披露风险筛选日线条件推荐；分钟与上午模型独立准备，规则排序未校准为上涨概率。')
+            run['recommendationPolicy'] = {'version': assessment['version'], 'minuteRequired': False,
+                'morningModelRequired': False, 'validationStatus': 'unvalidated_rules',
+                'missingPolicy': 'daily_source_quote_and_event_risk_required'}
+            run['historyPreparation'] = {key: preparation.get(key) for key in
+                ('status', 'ready', 'requested', 'pending', 'updatedAt', 'targetSession', 'baselineClock', 'reason')}
+            run['historyPreparation']['message'] = '分钟历史在后台补取，不影响独立日线条件筛选。'
+            run['historyPreparationCodes'] = [row['code'] for row in queued]
+            quality['daily_selection'] = assessment
+            quality['deep_research_count'] = len(daily)
+            quality['quote_coverage'] = {'requested': len(queued),
+                'fresh': sum(not quote_check(quotes.get(row['code']) or {}, row['code'], completed) for row in queued),
+                'missing': sum(bool(quote_check(quotes.get(row['code']) or {}, row['code'], completed)) for row in queued),
+                'providers': sorted({q['source'] for q in quotes.values() if q.get('source')})}
+            quality['stageTimingsMs'][stage_name] = round((monotonic()-stage_started)*1000)
+            run['cutoff_at'] = completed.isoformat()
+            run['delivery']['decision_at'] = completed.isoformat()
+            run['delivery']['expires_at'] = (completed+timedelta(seconds=30)).isoformat()
+            if target_at:
+                run['delivery']['late_seconds'] = max(0, (completed-datetime.fromisoformat(target_at)).total_seconds())
+        if opening_mode:
+            from .premarket import build_premarket_candidates
+            from src.services.akshare_context import AkshareContextProvider, for_stock
+            # The opening path has no minute, sector-minute or fund-minute I/O.
+            # Those windows do not yet exist and cannot confirm an auction.
+            stage('opening_context', 55, '正在核验昨夜结构与已披露风险，准备集合竞价条件推荐')
+            provider = self.context_provider or AkshareContextProvider(
+                self.yao.data_dir / 'akshare-context', clock=self.clock, timeout=10)
+            bundles = fetch_batch('opening_context', lambda _: provider.collect(self.clock()), [None], 10)
+            contexts = {row['code']: for_stock(bundles[0], row['code'], self.clock()) for row in queued} if bundles else {}
+            self._await_target(run)
+            stage('final_quotes', 88, '正在核验集合竞价或开盘报价，分钟线不作为盘前前提')
+            codes = [row['code'] for row in queued]
+            batches = fetch_batch('final_quotes', self._quotes,
+                [codes[start:start+20] for start in range(0, len(codes), 20)], 15)
+            quotes = {code: quote for batch in batches for code, quote in batch.items()}
+            completed = self.clock()
+            if target_at and run.get('official') and (completed-datetime.fromisoformat(target_at)).total_seconds() >= 120:
+                raise ValueError('错过计划时点，不使用后续行情补造盘前推荐')
+            if opening_phase(completed) is None:
+                raise ValueError('开盘预案窗口已结束，请刷新获取盘中信号')
+            packet = build_premarket_candidates(queued, daily, quotes, completed,
+                                               top_n=top_n, contexts=contexts)
+            run.update(packet)
+            assessment = run['premarketAssessment']
+            assessment['overnightSeedCount'] = quality.get('overnight_seed_count', 0)
+            assessment['snapshotUsage'] = 'stock_directory_and_research_priority_only'
+            run.update(primaryObjective='previous_session_to_opening_conditional_plan',
+                candidates=[], profileCandidates={key: [] for key in ('conservative','regular','aggressive')},
+                scoreVersion=SCORE_VERSION, status='completed_observations',
+                message=f'本轮形成{len(run["premarketCandidates"])}只集合竞价/开盘条件推荐；以昨夜已完成数据为基准，竞价撮合待核验。')
+            # This is a separate evidence contract; it never weakens intraday admission.
+            run['recommendationPolicy'] = {'version': assessment['version'],
+                'missingPolicy': 'previous_session_plan_with_explicit_quote_gaps',
+                'minuteRequired': False, 'validationStatus': 'rules_unvalidated'}
+            quality['opening_evidence'] = assessment
+            quality['deep_research_count'] = len(daily)
+            quality['minute_coverage'] = {'requested': 0, 'usable': 0, 'missing': 0,
+                'required': False, 'reason': 'opening_uses_completed_previous_session'}
+            quote_coverage = assessment.get('quoteCoverage') or {}
+            quality['quote_coverage'] = {'requested': len(codes),
+                'fresh': quote_coverage.get('freshCount', 0),
+                'missing': quote_coverage.get('missing', 0),
+                'providers': sorted({quote['source'] for quote in quotes.values() if quote.get('source')}),
+                'meaning': 'ordinary quotes only; missing quotes do not verify auction matching'}
+            quality['stageTimingsMs'][stage_name] = round((monotonic()-stage_started)*1000)
+            run['cutoff_at'] = completed.isoformat()
+            run['delivery']['decision_at'] = completed.isoformat()
+            run['delivery']['expires_at'] = assessment['expiresAt']
+            if target_at:
+                run['delivery']['late_seconds'] = max(0, (completed-datetime.fromisoformat(target_at)).total_seconds())
+            return
+        # A first install downloads existing daily history immediately. This
+        # routing hint only saves minute I/O; each daily candidate has its own
+        # source, quote and event contract. It never grants minute admission.
+        if self.selection_mode == 'auto' and not minute_pool_prepared:
+            from src.services.akshare_context import AkshareContextProvider, for_stock
+            stage('daily_context', 55, '正在核验日线条件与已披露风险；分钟历史将后台补齐')
+            provider = self.context_provider or AkshareContextProvider(
+                self.yao.data_dir/'akshare-context', clock=self.clock, timeout=25)
+            bundles = fetch_batch('daily_context', lambda _: provider.collect(self.clock()), [None], 25)
+            if run.get('official') and target_at:
+                self._await_target(run)
+                snapshots = fetch_batch('daily_final_snapshot', lambda _: self.yao._fetch_snapshot(), [None], 20)
+                if not snapshots or snapshots[0].attrs.get('stale'):
+                    raise ValueError('目标时点全市场行情不可用，未沿用准备名单')
+                frame = mainboard(snapshots[0])
+                if frame.empty:
+                    raise ValueError('目标时点主板目录为空')
+                queued = clean(research_queue(frame))
+                self._research_coverage(quality, frame, queued)
+                emotion = self._observe_market_emotion(frame, self.clock())
+                new_items = [row for row in queued if row['code'] not in daily]
+                daily.update(dict(fetch_batch('daily_new_history', history_for, new_items, 20)))
+                quality['final_universe_refreshed'] = True
+            contexts = {row['code']: for_stock(bundles[0], row['code'], self.clock()) for row in queued} if bundles else {}
+            stage('final_quotes', 88, '正在核验日线候选的最新报价与交易限制')
+            codes = [row['code'] for row in queued]
+            batches = fetch_batch('final_quotes', self._quotes,
+                [codes[start:start+20] for start in range(0, len(codes), 20)], 15)
+            quotes = {code: quote for batch in batches for code, quote in batch.items()}
+            quality['minute_coverage'] = {'requested': 0, 'usable': 0, 'missing': 0,
+                'required': False, 'reason': 'independent_daily_selection_while_minute_history_prepares'}
+            run['controls'] = []
+            publish_daily(contexts, quotes, self.clock())
+            return
         prepared_sectors = None
         stage('sector_membership', 32, '正在读取行业成分与行业证据')
         if not self.sector_fetcher:
@@ -357,6 +532,12 @@ class LocalOpportunityService(DailyOpportunityService):
                            delivery_limit='目标前90秒启动全池复核；实际源时间、决策与延迟另记，不保证分钟数据秒级同步')
         # Archive the whole mainboard, never only the selected or rising stocks.
         # Reception time is an availability boundary, not a quote timestamp.
+        if getattr(software_market, 'available', False):
+            stage('market_breadth', 53, '正在补强全主板实际报价时间与市场广度')
+            frame = software_market.enrich_snapshot_quotes(frame,
+                timeout=budget_for('market_breadth', 12), deadline=scan_deadline-15, clock=self.clock)
+            emotion = self._observe_market_emotion(frame, self.clock())
+            quality['marketQuoteEnrichment'] = frame.attrs.get('market_quote_enrichment', {})
         run['marketEmotion'] = emotion
         codes = [row['code'] for row in queued]
         # Context tables, theme breadth and saved reminders can be large. Finish
@@ -397,15 +578,47 @@ class LocalOpportunityService(DailyOpportunityService):
             intraday.setdefault(code, {'metrics': {}, 'requestedCutoffAt':minute_cutoff.isoformat(),
                 'reasonCodes':[quality['stageMissingReasons'].get('minute_evidence','minute_provider_failed')],
                 'gaps':['分钟证据请求超时或失败；本轮不以缺失数据推断信号']})
+        # Verify identities before deriving S/F. Verification of metadata alone
+        # cannot resurrect features that were omitted while lineage was unknown.
+        if not self.minute_fetcher:
+            stage('minute_identity', 66, '正在独立核验分钟身份并重算固定截止窗口')
+            early_verification = self._verify_archived_quotes(codes, self.clock(),
+                timeout=budget_for('minute_identity', 10), lineage_cutoff=minute_cutoff)
+            verified_codes = list(early_verification.pop('lineages'))
+            from .minute_history import read_bar_evidence
+            def recalculate(code):
+                packet = read_bar_evidence(code, minute_cutoff, self.yao.data_dir/'minute_history')
+                return code, {**packet, 'requestedCutoffAt': minute_cutoff.isoformat()}
+            intraday.update(dict(fetch_batch('verified_minute_features', recalculate, verified_codes, 6)))
+            quality['initialMinuteVerification'] = early_verification
         from .sector_fund_evidence import fetch_sector_batch, fetch_fund_evidence
         sector_fetch = self.sector_fetcher or fetch_sector_batch
         stage('sector_evidence', 72, '正在核验同一完成分钟的行业同步表现')
+        sector_partial, sector_errors = {}, []
+        sector_lock = Lock()
+        def collect_sector(code, packet):
+            with sector_lock:
+                sector_partial[code] = packet
         def sectors_for(_, deadline):
-            return sector_fetch(codes,intraday,minute_cutoff,self.yao.data_dir,
-                **({'prepared':prepared_sectors, 'deadline':deadline,
-                    'timeout':max(0,deadline-monotonic())} if not self.sector_fetcher else {}))
+            try:
+                return sector_fetch(codes,intraday,minute_cutoff,self.yao.data_dir,
+                    **({'prepared':prepared_sectors, 'deadline':deadline,
+                        'timeout':max(0,deadline-monotonic()), 'on_result': collect_sector}
+                       if not self.sector_fetcher else {}))
+            except Exception as error:
+                with sector_lock:
+                    sector_errors.append(type(error).__name__)
+                return {}
         sector_packets = fetch_batch('sector_evidence', sectors_for, [None], 10, deadline_aware=True)
-        sectors = sector_packets[0] if sector_packets else {}
+        with sector_lock:
+            sectors = dict(sector_partial)
+            errors = list(sector_errors)
+        sectors.update(sector_packets[0] if sector_packets else {})
+        quality['sectorCollection'] = {'requested': len(codes), 'returned': len(sectors),
+            'partialResultsRetained': bool(sectors) and (not sector_packets or bool(errors)),
+            'usable': sum((packet.get('metrics') or {}).get('sector_return_5m_pct') is not None
+                          for packet in sectors.values()),
+            'providerErrors': errors, 'missing': len(codes)-len(sectors)}
         def funds_for(code, deadline):
             cutoff = (intraday.get(code) or {}).get('asOf')
             if not cutoff:
@@ -490,6 +703,7 @@ class LocalOpportunityService(DailyOpportunityService):
                                               confidenceStatus=candidate['confidenceStatus'])
             candidate['precisionDecision'] = evaluate_precision(
                 candidate, context, daily.get(code))
+            candidate['primaryAdmission'] = candidate['precisionDecision']['primaryAdmission']
             candidate['data_quality']['executionQuoteData'] = candidate['precisionDecision']['executionQuoteData']
             if candidate['precisionDecision']['executionQuoteData']['status'] != 'complete':
                 message = '前收盘或供应商涨跌停价缺失/冲突；未开放正式交易候选资格'
@@ -516,6 +730,13 @@ class LocalOpportunityService(DailyOpportunityService):
         from .signal_learning import SignalLearningService
         learning = SignalLearningService(self.yao.data_dir)
         ordered = learning.rank_candidates(ordered, self.clock())
+        if is_morning:
+            ordered = learning.rank_morning_candidates(ordered, self.clock(), slot=slot)
+            run['morningResearch'] = ordered
+            run['morningAssessment'] = {
+                'taskId': MORNING_TASK_ID, 'queue': morning_queue(slot, objective_at),
+                'learningStatuses': sorted({p['morningSignal'].get('learningStatus', 'rules_unvalidated') for p in ordered}),
+                'meaning': '上午主推荐以发布后到当日收盘为独立任务；未通过时间外检验与影子验证的模型仅保留研究，T+1风险另行记录'}
         ranked_by_code = {candidate['code']: candidate for candidate in ordered}
         researched = [ranked_by_code.get(candidate['code'], candidate) for candidate in researched]
         run['precisionResearch'] = ordered  # Keep nonselected controls for later comparisons.
@@ -560,19 +781,24 @@ class LocalOpportunityService(DailyOpportunityService):
         quality['precision_policy'] = {'version': run['algorithm']['entryPolicyVersion'], 'status': 'rules_unvalidated',
             'profile_counts': {key: len(value) for key, value in run['profileCandidates'].items()},
             'watch_count': len(run['precisionWatchlist']), 'context_completed_at': context_bundle.get('completedAt')}
-        run['marketSummary']='未触板潜伏与已触板延续独立排序。潜伏池要求当日涨跌-3%至5%、尚未触及10%模式价、距该价至少4%，并具备日线平台或修复承接；已知昨日收涨停形态不列潜伏。昨日历史口径未知时不声称已验证首板。已触板股票单列延续，不占潜伏名额。分数不是概率，正式交易条件单独核验。'
+        run['marketSummary']='主推荐须通过分钟来源、量价历史、同窗板块与资金、市场广度及分档风险检查；上午另须通过当天收盘任务的独立模型验证。条件不足可为空。次日潜伏与延续单列研究，不补入主推荐，规则分不代表概率。'
         run['status']='completed_observations' if any(run['profileCandidates'].values()) else 'no_candidates_with_coverage_limits'
         def finish_profiles():
             self._finish_quotes(run, quality)
             # Completion can remove stale quotes or whole profiles; recompute
             # weights only from the surviving, model-admitted candidates.
             for profile, rows in run['profileCandidates'].items():
-                allocation = allocate_portfolio(rows)
+                for row in rows:
+                    row['primaryAdmission'] = evaluate_primary_admission(row, self.clock())
+                allocation = allocate_portfolio([row for row in rows
+                    if row['primaryAdmission']['eligible'] and is_entry_eligible(row, profile)])
                 run['profileCandidates'][profile] = allocation['candidates']
                 run['profilePortfolioPolicies'][profile] = allocation['policy']
             run['candidates'] = run['profileCandidates']['regular']
             run['portfolioPolicy'] = run['profilePortfolioPolicies']['regular']
             run.setdefault('adaptive', {})['portfolioPolicy'] = run['portfolioPolicy']
+            quality['precision_policy']['profile_counts'] = {
+                profile: len(rows) for profile, rows in run['profileCandidates'].items()}
             for rank, candidate in enumerate(run['candidates'], 1):
                 candidate['rank'] = rank
         finish_profiles()
@@ -587,6 +813,16 @@ class LocalOpportunityService(DailyOpportunityService):
         finish_profiles()
         reviewable = run['status'] in {'completed_observations', 'no_candidates_with_coverage_limits'}
         completion_at = self.clock()
+        for candidate in researched:
+            candidate['primaryAdmission'] = evaluate_primary_admission(candidate, completion_at)
+        quality['primary_admission'] = {
+            'version': policy_contract()['version'],
+            'evidence_passed': sum(p['primaryAdmission']['eligible'] for p in researched),
+            'primary_count': len(run['candidates']),
+            'reasonCounts': {reason: sum(reason in (p['primaryAdmission']['reasons'] +
+                p['primaryAdmission']['missingReasons']) for p in researched)
+                for reason in sorted({reason for p in researched for reason in
+                    p['primaryAdmission']['reasons'] + p['primaryAdmission']['missingReasons']})}}
         for row in next_research:
             source_usable = not quote_check(row.get('quote') or {}, row['code'], completion_at)
             row['nextDaySignal']['sourceUsableAtCompletion'] = source_usable
@@ -625,11 +861,13 @@ class LocalOpportunityService(DailyOpportunityService):
                 for reason in ((p.get('factorAvailability',{}).get(key) or {}).get('reasonCodes') or [])})}
             for key in ('M','V','T','F','W','S','B','C','G','E','H','L')}
         if reviewable:
-            if run['nextDayWatchlist'] or run['nextDayContinuationWatchlist']:
+            if run['candidates']:
                 run['status'] = 'completed_observations'
-            run['message'] = (f'本轮有{len(run["nextDayWatchlist"])}只未触板潜伏观察、'
-                              f'{len(run["nextDayContinuationWatchlist"])}只已触板延续观察；'
-                              f'通过均衡档交易条件{len(run["candidates"])}只。观察排序未校准为涨停概率。')
+            else:
+                run['status'] = 'no_candidates_with_coverage_limits'
+            run['message'] = (f'本轮主推荐{len(run["candidates"])}只；缺证据、风险未通过或上午模型未验证时不补位。'
+                              f'研究区另有{len(run["nextDayWatchlist"])}只次日潜伏、'
+                              f'{len(run["nextDayContinuationWatchlist"])}只延续观察；观察排序未校准为上涨概率。')
         selected_codes = {candidate['code'] for candidate in run['candidates']}
         run['controls'] = [candidate for candidate in researched if candidate['code'] not in selected_codes]
         run['scoreVersion'] = SCORE_VERSION
@@ -673,6 +911,37 @@ class LocalOpportunityService(DailyOpportunityService):
                                   and aligned_factor(code, funds[code]) for code in codes))
         quality['stageTimingsMs'][stage_name] = round((monotonic()-stage_started)*1000)
 
+        from .admission_diagnostics import build_admission_diagnostics
+        run['admissionDiagnostics'] = build_admission_diagnostics(
+            researched, run['candidates'], quality, morning=is_morning)
+        quality['admission_diagnostics'] = run['admissionDiagnostics']
+        from .history_preparation import read_preparation_status
+        preparation = read_preparation_status(self.yao.data_dir/'minute_history', self.clock())
+        run['historyPreparation'] = {key: preparation.get(key) for key in
+            ('status', 'ready', 'requested', 'pending', 'updatedAt', 'targetSession', 'baselineClock', 'reason')}
+        run['historyPreparation']['message'] = (
+            f"已核验{preparation.get('ready', 0)}/{preparation.get('requested', len(codes))}只股票的20日同刻历史窗口；"
+            + ('等待后台准备。' if preparation.get('status') in ('not_prepared', 'stale')
+               else '待补缺口将在后续后台批次继续处理。'))
+        from .morning_task import morning_readiness
+        from .local_algorithm import is_research_eligible
+        run['morningReadiness'] = morning_readiness(learning, self.clock(),
+            current_candidates=researched if is_morning else None,
+            current_queue=morning_queue(slot, objective_at) if is_morning else None,
+            current_data_eligibility=[is_research_eligible(row) for row in researched] if is_morning else None)
+        if reviewable:
+            run['message'] = (run['admissionDiagnostics']['summary']
+                + f'研究区：{len(run["nextDayWatchlist"])}只次日潜伏、'
+                  f'{len(run["nextDayContinuationWatchlist"])}只延续观察。')
+        if reviewable and self.selection_mode == 'auto' and not any(run['profileCandidates'].values()):
+            # Minute/model qualification and daily qualification are separate
+            # tasks. Re-evaluate actual daily inputs, never promote a watchlist.
+            stage('final_quotes', 96, '正在重新核验日线分支报价')
+            quote_batches = fetch_batch('final_quotes', self._quotes,
+                [codes[start:start+20] for start in range(0, len(codes), 20)], 15)
+            quotes = {code: quote for batch in quote_batches for code, quote in batch.items()}
+            publish_daily(prepared_context, quotes, self.clock())
+
     def _persist_run(self, run):
         """Finish research and ledger work inside the official slot claim."""
         from .signal_learning import SignalLearningService
@@ -714,6 +983,7 @@ class LocalOpportunityService(DailyOpportunityService):
             except Exception:
                 universe, universe_gap = [], '本轮股票目录刷新失败，继续采集已登记全量股票池'
             try:
+                archived_codes = []
                 result['minuteArchiveMaintenance'] = archive_universe(
                     universe, self.clock(), self.yao.data_dir/'minute_history', timeout=180)
                 archived_codes = [item['code'] for item in result['minuteArchiveMaintenance'].get('details',[])
@@ -729,6 +999,25 @@ class LocalOpportunityService(DailyOpportunityService):
                 result['minuteArchiveMaintenance'] = {'status': 'failed', 'reason': type(error).__name__}
             if universe_gap:
                 result['minuteArchiveMaintenance']['universeGap'] = universe_gap
+            # Repair the fixed historical window outside the live quote budget.
+            # Keep this bounded and resumable; past publication eligibility is immutable.
+            from .history_preparation import read_preparation_status
+            from .history_maintenance import run_history_preparation
+            try:
+                previous_pool = read_preparation_status(self.yao.data_dir/'minute_history').get('requestedCodes', [])
+                result['historicalPreparation'] = run_history_preparation(
+                    self.yao.data_dir, previous_pool or universe or archived_codes, self.clock(),
+                    timeout=120, max_codes=40)
+            except Exception as error:
+                result['historicalPreparation'] = {'status': 'failed', 'reason': type(error).__name__}
+            from .morning_task import morning_readiness
+            result['reviewProgress'] = {'stage': 'history_prepared', 'at': self.clock().isoformat()}
+            self.db.save_yao_run(clean(result))
+            try:
+                result['morningReadiness'] = morning_readiness(learning, self.clock(), refresh=True)
+            except Exception as error:
+                result['morningReadiness'] = {'status': 'deferred', 'reason': type(error).__name__,
+                    'message': '研究样本统计暂不可用，已保存本轮复盘。'}
             result['reviewProgress'] = {'stage': 'completed', 'at': self.clock().isoformat(),
                 'meaning': '已处理可用证据；缺失样本仍待补齐，不等于模型已学习'}
         elif slot == 'weekly' and result.get('status') == 'audit_only':
@@ -737,4 +1026,16 @@ class LocalOpportunityService(DailyOpportunityService):
             result = SignalLearningService(self.yao.data_dir).persist_scan(
                 result, slot, result.get('cutoff_at') or self.clock(), bool(result.get('official')))
         self.db.save_yao_run(clean(result))
+        if (slot in ('live', '0940', '0955', '1030', '1455')
+                and not result.get('premarketAssessment')
+                and result.get('status') in ('completed_observations', 'no_candidates_with_coverage_limits')):
+            from .history_maintenance import start_history_preparation
+            codes = list(dict.fromkeys([*result.get('historyPreparationCodes', []),
+                *(row['code'] for key in ('controls', 'candidates')
+                  for row in result.get(key, []) if row.get('code'))]))
+            try:
+                start_history_preparation(self.yao.data_dir, codes)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception('Unable to start history preparation; saved scan retained')
         return clean(result)

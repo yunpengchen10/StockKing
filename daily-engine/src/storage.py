@@ -2634,6 +2634,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             header = func.json_extract(
                 YaoRun.result_json, '$.generatedAt', '$.as_of', '$.cutoff_at', '$.scanSlot', '$.status',
                 '$.dataQuality', '$.data_quality',
+                '$.premarketAssessment',
+                '$.primarySelectionMode', '$.primaryObjective', '$.dailyAssessment',
             )
             rows = session.execute(select(
                 YaoRun.run_id, YaoRun.mode, header,
@@ -2645,7 +2647,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             for run_id, mode, encoded, candidate_type, next_day_count, continuation_count in rows:
                 values = json.loads(encoded)
                 metadata = dict(zip(("generatedAt", "as_of", "cutoff_at", "scanSlot", "status",
-                                     "dataQuality", "data_quality"), values))
+                                     "dataQuality", "data_quality", "premarketAssessment",
+                                     "primarySelectionMode", "primaryObjective", "dailyAssessment"), values))
                 metadata.update(candidates=[] if candidate_type == "array" else None,
                                 nextDayWatchlist=[True] if next_day_count else [],
                                 nextDayContinuationWatchlist=[True] if continuation_count else [])

@@ -268,12 +268,18 @@ print(json.dumps(records, ensure_ascii=True))
     $started = Start-Process -FilePath $installedExe -WorkingDirectory $installRoot -WindowStyle Normal -PassThru
     $newAppStarted = $true
     $windowDeadline = (Get-Date).AddSeconds(30)
+    $desktopWindowReady = $false
     do {
         Start-Sleep -Milliseconds 500
-        $started.Refresh()
-        if ($started.HasExited) { throw 'The new desktop process exited during startup; see application logs and the retained backups.' }
-    } while ($started.MainWindowHandle -eq 0 -and (Get-Date) -lt $windowDeadline)
-    if ($started.MainWindowHandle -eq 0) { throw 'The desktop process has no visible window; see application logs and the retained backups.' }
+        # The launched PID supervises a child and owns no desktop window.
+        # Check the exact installed executable's processes, including that child.
+        $desktopProcesses = @(Get-InstalledProcesses | Where-Object { $_.ExecutablePath.Equals($installedExe, [StringComparison]::OrdinalIgnoreCase) })
+        $desktopWindowReady = @($desktopProcesses | ForEach-Object {
+            Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+        } | Where-Object { $_.MainWindowHandle -ne 0 }).Count -gt 0
+        if ($desktopProcesses.Count -eq 0) { throw 'The new desktop process exited during startup; see application logs and the retained backups.' }
+    } while (-not $desktopWindowReady -and (Get-Date) -lt $windowDeadline)
+    if (-not $desktopWindowReady) { throw 'The desktop process has no visible window; see application logs and the retained backups.' }
     $manifest['desktopWindowVerified'] = $true
     } else {
         $manifest['desktopWindowVerified'] = $false

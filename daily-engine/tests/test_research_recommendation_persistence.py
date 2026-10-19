@@ -62,6 +62,16 @@ def test_continuation_only_snapshot_is_saved_separately_from_main_recommendation
     assert saved["adaptive"]["nextDayContinuationWatchlist"] == result["nextDayContinuationWatchlist"]
 
 
+def test_new_primary_contract_counts_do_not_promote_research_observations(tmp_path, monkeypatch):
+    monkeypatch.setenv('YAO_SCOUT_DATA_DIR', str(tmp_path))
+    result = scan()
+    result.update(candidates=[], recommendationPolicy={'version': 'primary-evidence-20261015-v1'})
+    saved = LocalPicksDisplayStore(None).save(result)
+    assert saved['savedRecommendationCount'] == saved['candidateCount'] == 0
+    assert saved['nextDayCandidateCount'] == 2
+    assert saved['continuationCandidateCount'] == 1
+
+
 def test_research_queues_persist_once_without_entry_or_training_promotion(tmp_path, monkeypatch):
     service = ledger.SignalLearningService(tmp_path, clock=lambda: NOW)
     # Even an accidentally entry-shaped watch-only row cannot become training.

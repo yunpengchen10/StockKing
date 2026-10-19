@@ -3,6 +3,7 @@ export const LEDGER_STATUS = {
   pending: '待复盘', pending_review: '待复盘', not_due: '尚未到期', due: '已到期，待执行',
   review_not_run: '已到期，尚未执行', calendar_unavailable: '交易日历待核验',
   mature_price_pattern: '价格模式已观察', observation_only: '仅观察记录',
+  daily_observation_only: '日线记录，尚未作独立效果验证',
   missing_data: '待补齐', pending_data: '待补齐', incomplete: '待补齐',
   complete: '已复盘', completed: '已复盘', reviewed: '已复盘', mature: '已复盘',
   filled: '模拟已成交', unfilled: '未成交', not_filled: '未成交',
@@ -185,6 +186,9 @@ export function nextDaySignalOf(signal = {}) {
 export function isNextDaySelection(signal = {}) {
   return signal.nextDaySelected === true || signal.nextDayContinuationSelected === true || nextDaySignalOf(signal)?.selected === true
 }
+export function isDailySelection(signal = {}) {
+  return signal.dailySelected === true || (Array.isArray(signal.recommendationKinds) && signal.recommendationKinds.includes('daily_condition'))
+}
 export function nextDayQueueLabel(signal = {}) {
   return signal.queue === 'first_board' ? '未触板潜伏' : signal.queue === 'continuation' ? '已触板延续' : '次日观察（旧版未分队列）'
 }
@@ -193,17 +197,76 @@ export function nextDayTouchLabel(signal = {}) {
   return touched === true ? '已触板' : touched === false ? '未触板' : '触板状态未知'
 }
 export function savedRecommendationSummary(run = {}) {
-  const execution = Array.isArray(run.candidates) ? run.candidates : []
+  const execution = primaryRecommendationPicks(run)
   const primary = Array.isArray(run.nextDayWatchlist) ? run.nextDayWatchlist : []
   const continuation = Array.isArray(run.nextDayContinuationWatchlist) ? run.nextDayContinuationWatchlist : []
   const codeOf = pick => recordQuoteCode(pick?.symbol?.code || pick?.code) || String(pick?.symbol?.code || pick?.code || '')
   const count = picks => new Set(picks.map(codeOf).filter(Boolean)).size
-  return { saved: count([...execution, ...primary]), execution: count(execution), primary: count(primary), continuation: count(continuation),
+  return { saved: count(execution), execution: count(execution), primary: count(primary), continuation: count(continuation),
     splitQueues: Array.isArray(run.nextDayContinuationWatchlist) || primary.some(pick => pick.nextDaySignal?.queue === 'first_board') }
+}
+export function isDailyPrimaryRun(run = {}) {
+  return run.primarySelectionMode === 'daily_conditional' && run.primaryObjective === 'daily_structure_to_next_session'
+}
+export function isDailyPrimaryPick(pick = {}) {
+  return pick.dailySignal?.taskId === 'daily_structure_to_next_session'
+}
+export function primaryRecommendationPicks(run = {}, profile = 'regular') {
+  const byProfile = run.profileCandidates?.[profile]
+  const candidates = Array.isArray(byProfile) ? byProfile : Array.isArray(run.candidates) ? run.candidates : []
+  return candidates.filter(pick => {
+    if (['invalidated', 'withdrawn', 'research'].includes(pick.currentSignalState)) return false
+    if (isDailyPrimaryRun(run)) return isDailyPrimaryPick(pick)
+      && !['invalidated', 'withdrawn', 'observation'].includes(pick.dailyCurrentSignalState || pick.dailySignal?.currentSignalState)
+      && pick.dailyProfileDecision?.[profile]?.entryEligible === true && pick.entryEligible !== false
+    if (isDailyPrimaryPick(pick)) return false
+    // Saved old records keep their original contract. Never promote a research
+    // queue, or claim that a missing admission passed the new contract.
+    if (!pick.primaryAdmission) return !run.recommendationPolicy
+    return pick.primaryAdmission.eligible === true
+      && pick.precisionDecision?.profiles?.[profile]?.entryEligible !== false
+  })
+}
+export function primaryRecommendationState(pick = {}) {
+  const savedState = isDailyPrimaryPick(pick) ? pick.dailyCurrentSignalState || pick.dailySignal?.currentSignalState : pick.currentSignalState
+  const state = { new: '首次入选', continuing: '持续跟踪', continued: '持续跟踪', invalidated: '已失效', withdrawn: '已撤销', research: '研究观察', observation: '研究观察' }[savedState]
+  return state || (isDailyPrimaryPick(pick) ? '日线条件推荐'
+    : pick.primaryAdmission?.eligible === true ? '已通过准入' : '旧版候选 · 未按新准入复核')
+}
+const primaryAdmissionReasonLabels = {
+  minute_lineage_not_verified: '完整分钟数据来源尚未核验',
+  minute_window_missing_future_or_stale: '完整分钟数据缺失、时间超前或已过期',
+  S_source_missing_stale_or_misaligned: '板块数据缺失、已过期或未与分钟窗口对齐',
+  F_source_missing_stale_or_misaligned: '资金数据缺失、已过期或未与分钟窗口对齐',
+  active_flow_classification_missing_or_stale: '主动买卖分类数据缺失或已过期',
+  sector_resonance_not_confirmed: '板块共振尚未确认',
+  fund_direction_not_confirmed: '资金方向尚未确认',
+  minute_structure_not_confirmed: '分钟价格结构尚未确认',
+  relative_volume_not_confirmed: '同刻相对成交量尚未确认',
+  latest_completed_minute_failed_breakout: '最近完整分钟出现突破失败',
+  whole_market_breadth_unavailable_or_stale: '全市场涨跌分布数据缺失、覆盖不足或已过期',
+  weak_market_primary_entries_paused: '市场偏弱，本轮暂停新增主推荐',
+}
+export function primaryAdmissionReasons(reasons = []) {
+  return (Array.isArray(reasons) ? reasons : [reasons]).filter(Boolean)
+    .map(reason => primaryAdmissionReasonLabels[reason] || reason)
+}
+export function firstRecommendationEvidence(pick = {}) {
+  // Only persisted first-reference fields establish the anchor. Do not fall
+  // back to this refresh's time or price, even for a continuing recommendation.
+  const daily = isDailyPrimaryPick(pick)
+  const value = daily ? pick.dailyFirstReferencePrice ?? pick.dailySignal?.firstReferencePrice : pick.firstReferencePrice
+  return {
+    time: (daily ? pick.dailyFirstReferenceTime || pick.dailySignal?.firstReferenceTime : pick.firstReferenceTime) || null,
+    price: value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : null,
+  }
 }
 export function signalSelectionLabel(signal = {}) {
   const nextDay = nextDaySignalOf(signal)
-  return signal.selected === true ? '交易条件候选' : isNextDaySelection(signal)
+  const candidate = signal.snapshot || signal.features?.candidate || signal.candidate || signal.features || signal
+  const state = isDailyPrimaryPick(candidate) ? candidate.dailyCurrentSignalState || candidate.dailySignal?.currentSignalState : candidate.currentSignalState
+  if (['invalidated', 'withdrawn'].includes(state)) return primaryRecommendationState(candidate)
+  return isDailySelection(signal) ? '日线条件推荐' : signal.selected === true ? '交易条件候选' : isNextDaySelection(signal)
     ? nextDay?.queue ? `${nextDayQueueLabel(nextDay)}观察` : '次日观察' : '对照'
 }
 export function nextDayPatternValue(review = {}, key) {
@@ -214,7 +277,9 @@ export function nextDayPatternValue(review = {}, key) {
 export function groupSignals(payload, { includeControls = false } = {}) {
   const groups = new Map(), seen = new Set()
   for (const signal of flattenSignals(payload)) {
-    if (!includeControls && signal.selected !== true && !isNextDaySelection(signal)) continue
+    const candidate = signal.snapshot || signal.features?.candidate || signal.candidate || signal.features || signal
+    const wasPrimary = ['invalidated', 'withdrawn'].includes(candidate.currentSignalState || candidate.dailyCurrentSignalState || candidate.dailySignal?.currentSignalState)
+    if (!includeControls && signal.selected !== true && !isDailySelection(signal) && !isNextDaySelection(signal) && !wasPrimary) continue
     const signalId = signal.signalId || signal.signal_id
     if (signalId && seen.has(signalId)) continue
     if (signalId) seen.add(signalId)

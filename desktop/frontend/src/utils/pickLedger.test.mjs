@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { priceObservationPercent } from './pickLedger.mjs'
+import { primaryRecommendationPicks, primaryRecommendationState, firstRecommendationEvidence } from './pickLedger.mjs'
 import { groupSignals, ledgerPercent, ledgerPrice, ledgerSigned, reviewStatusLabel, reviewReasonLabel, visibleReviews, reviewProgress, learningEffect, reviewReturn, shanghaiDate, learningProgress, recordQuoteCode, recordQuoteCodes, signalPriceComparison, createRecordQuoteLoader, nextDaySignalOf, isNextDaySelection, signalSelectionLabel, nextDayPatternValue, savedRecommendationSummary, nextDayQueueLabel, nextDayTouchLabel } from './pickLedger.mjs'
 
 test('saved signals group by Shanghai day, stock and version without losing distinct scans', () => {
@@ -159,17 +160,98 @@ test('a learning-state failure cannot hide saved reviews or falsely retain an ac
   } finally { app.unmount() }
 })
 
-test('saved research counts the persisted primary and execution union, never the continuation pool', () => {
+test('saved main recommendation count excludes both research queues', () => {
   const first = Object.freeze({ code: '600001', nextDaySignal: Object.freeze({ queue: 'first_board' }) })
   const continuation = Object.freeze({ code: '600002', nextDaySignal: Object.freeze({ queue: 'continuation' }) })
   const run = Object.freeze({ candidates: Object.freeze([]), nextDayWatchlist: Object.freeze([first]), nextDayContinuationWatchlist: Object.freeze([continuation]) })
-  assert.deepEqual(savedRecommendationSummary(run), { saved: 1, execution: 0, primary: 1, continuation: 1, splitQueues: true })
+  assert.deepEqual(savedRecommendationSummary(run), { saved: 0, execution: 0, primary: 1, continuation: 1, splitQueues: true })
   assert.equal(savedRecommendationSummary({ ...run, candidates: [{ code: '600001.SH' }] }).saved, 1)
   assert.equal(savedRecommendationSummary({ ...run, nextDayWatchlist: [] }).saved, 0)
   assert.equal(savedRecommendationSummary({ candidates: [], nextDayWatchlist: [{ code: '600003' }] }).splitQueues, false)
   assert.equal(nextDayQueueLabel(first.nextDaySignal), '未触板潜伏')
   assert.equal(nextDayQueueLabel(continuation.nextDaySignal), '已触板延续')
   assert.match(nextDayQueueLabel({}), /旧版未分队列/)
+})
+
+test('new-contract primary display fails closed and respects the selected profile without research fallback', () => {
+  const admitted = Object.freeze({ code: '600001', primaryAdmission: { eligible: true }, currentSignalState: 'continuing' })
+  const blocked = Object.freeze({ code: '600002', primaryAdmission: { eligible: false }, nextDaySignal: { selected: true } })
+  const invalidated = Object.freeze({ code: '600003', primaryAdmission: { eligible: true }, currentSignalState: 'invalidated' })
+  const unverified = Object.freeze({ code: '600004' })
+  const run = Object.freeze({ recommendationPolicy: { version: 'unified-v1' }, candidates: [admitted, blocked, invalidated, unverified], nextDayWatchlist: [blocked], nextDayContinuationWatchlist: [unverified] })
+  assert.deepEqual(primaryRecommendationPicks(run), [admitted])
+  assert.deepEqual(primaryRecommendationPicks({ ...run, profileCandidates: { regular: [] } }), [])
+  assert.deepEqual(primaryRecommendationPicks({ ...run, candidates: [] }), [])
+  assert.deepEqual(primaryRecommendationPicks({ ...run, candidates: [{ ...admitted, precisionDecision: { profiles: { regular: { entryEligible: false } } } }] }), [])
+  assert.equal(savedRecommendationSummary(run).saved, 1)
+  assert.equal(blocked.primaryAdmission.eligible, false)
+})
+
+test('daily recommendations use the independent task and explicit selected-profile decision', () => {
+  const daily = Object.freeze({ code: '600001', dailySignal: { taskId: 'daily_structure_to_next_session' },
+    dailyProfileDecision: { regular: { entryEligible: true }, conservative: { entryEligible: false } } })
+  const blocked = { ...daily, code: '600002', dailyProfileDecision: {} }
+  const minute = { code: '600003', primaryAdmission: { eligible: true } }
+  const run = { primarySelectionMode: 'daily_conditional', primaryObjective: 'daily_structure_to_next_session',
+    recommendationPolicy: { version: 'minute-contract-is-not-the-daily-contract' }, candidates: [daily, blocked, minute] }
+  assert.deepEqual(primaryRecommendationPicks(run), [daily])
+  assert.deepEqual(primaryRecommendationPicks(run, 'conservative'), [])
+  assert.deepEqual(primaryRecommendationPicks({ ...run, profileCandidates: { regular: [] } }), [])
+  assert.deepEqual(primaryRecommendationPicks({ ...run, candidates: [{ ...daily, currentSignalState: 'withdrawn' }] }), [])
+  assert.deepEqual(primaryRecommendationPicks({ ...run, candidates: [{ ...daily, entryEligible: false }] }), [])
+  assert.equal(primaryRecommendationState(daily), '日线条件推荐')
+  assert.equal(savedRecommendationSummary(run).saved, 1)
+  assert.equal(daily.primaryAdmission, undefined)
+})
+
+test('a daily marker cannot promote a candidate outside the independently published daily contract', () => {
+  const daily = { code: '600001', dailySignal: { taskId: 'daily_structure_to_next_session' },
+    dailyProfileDecision: { regular: { entryEligible: true } } }
+  assert.deepEqual(primaryRecommendationPicks({ candidates: [daily] }), [])
+  assert.deepEqual(primaryRecommendationPicks({ primarySelectionMode: 'daily_conditional', candidates: [daily] }), [])
+  assert.deepEqual(primaryRecommendationPicks({ primarySelectionMode: 'daily_conditional',
+    primaryObjective: 'daily_structure_to_next_session', candidates: [{ ...daily, dailySignal: { taskId: 'other' } }] }), [])
+})
+
+test('first-reference presentation uses only persisted anchors and preserves original old records', () => {
+  const old = Object.freeze({ code: '600001', referencePrice: 15, decision_at: '2026-10-15T10:30:00+08:00' })
+  assert.deepEqual(primaryRecommendationPicks({ candidates: [old] }), [old])
+  assert.match(primaryRecommendationState(old), /旧版候选/)
+  assert.deepEqual(firstRecommendationEvidence(old), { time: null, price: null })
+  const first = { ...old, firstReferenceTime: '2026-10-15T09:40:00+08:00', firstReferencePrice: 10, currentSignalState: 'continuing' }
+  assert.deepEqual(firstRecommendationEvidence({ ...first, referencePrice: 17, decision_at: '2026-10-15T11:00:00+08:00' }), { time: first.firstReferenceTime, price: 10 })
+  assert.equal(primaryRecommendationState(first), '持续跟踪')
+})
+
+test('daily first references remain independent of refreshed quotes and minute anchors', () => {
+  const daily = { dailySignal: { taskId: 'daily_structure_to_next_session', firstReferenceTime: '2026-10-16T10:30:00+08:00', firstReferencePrice: 10, currentSignalState: 'continued' },
+    firstReferenceTime: '2026-10-16T09:45:00+08:00', firstReferencePrice: 8, referencePrice: 12, decision_at: '2026-10-16T14:55:00+08:00' }
+  assert.deepEqual(firstRecommendationEvidence(daily), { time: daily.dailySignal.firstReferenceTime, price: 10 })
+  assert.equal(primaryRecommendationState(daily), '持续跟踪')
+  assert.deepEqual(firstRecommendationEvidence({ ...daily, dailySignal: { taskId: 'daily_structure_to_next_session' } }), { time: null, price: null })
+  assert.deepEqual(firstRecommendationEvidence({ ...daily, dailyFirstReferenceTime: '2026-10-16T10:00:00+08:00', dailyFirstReferencePrice: 9 }), { time: '2026-10-16T10:00:00+08:00', price: 9 })
+})
+
+test('daily ledger selections remain visible without claiming minute simulation or hiding controls', () => {
+  const daily = { signalId: 'daily', code: '600001', selected: false, dailySelected: true, reviewStatus: 'daily_observation_only' }
+  const tagged = { signalId: 'tagged', code: '600002', selected: false, recommendationKinds: ['daily_condition'] }
+  const control = { signalId: 'control', code: '600003', selected: false, snapshot: { dailySignal: { taskId: 'daily_structure_to_next_session', selected: false } } }
+  const payload = { items: [{ asOf: '2026-10-16T14:55:00+08:00', signals: [daily, tagged, control] }] }
+  assert.deepEqual(groupSignals(payload).flatMap(group => group.signals).map(row => row.signalId), ['daily', 'tagged'])
+  assert.equal(signalSelectionLabel(daily), '日线条件推荐')
+  assert.equal(signalSelectionLabel(tagged), '日线条件推荐')
+  assert.equal(signalSelectionLabel(control), '对照')
+  assert.equal(reviewStatusLabel(daily.reviewStatus), '日线记录，尚未作独立效果验证')
+  assert.equal(groupSignals(payload, { includeControls: true }).length, 3)
+  assert.equal(daily.selected, false)
+})
+
+test('invalidated recommendations remain visible in the default ledger without becoming active recommendations', () => {
+  const signal = { signalId: 'invalidated', code: '600001', selected: false, snapshot: { currentSignalState: 'invalidated', firstReferenceTime: '2026-10-15T09:40:00+08:00', firstReferencePrice: 10 } }
+  assert.equal(groupSignals({ items: [signal] }).length, 1)
+  assert.equal(signalSelectionLabel(signal), '已失效')
+  assert.deepEqual(primaryRecommendationPicks({ candidates: [signal.snapshot] }), [])
+  assert.equal(signal.selected, false)
 })
 
 test('persisted ledger selection flags surface both named queues without promoting trading eligibility', () => {
