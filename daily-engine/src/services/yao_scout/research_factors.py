@@ -23,6 +23,15 @@ from .research_policy import DEFAULT_PARAMETERS
 
 TZ = ZoneInfo('Asia/Shanghai')
 VERSION = 'research-factors-v1'
+EMOTION_EVIDENCE_VERSION = 'explicit-limit-observations-v2'
+EMOTION_METRICS = {
+    'advancing_pct': ('higher', 'observed_count', '上涨家数 / 有效价格观察家数'),
+    'limit_up_pct': ('higher', 'limit_observed_count', '当前处于显式涨停价的家数 / 有效限价观察家数'),
+    'limit_down_pct': ('lower', 'limit_observed_count', '当前处于显式跌停价的家数 / 有效限价观察家数'),
+    'broken_board_pct': ('lower', 'touched_count', '当日已触及涨停价且当前未封板家数 / 已触板家数；不是炸板次数'),
+    'previous_limit_premium_pct': ('higher', 'previous_limit_matched_count', '昨日收盘涨停群体相对昨日收盘价的当刻平均收益率'),
+    'previous_limit_promotion_pct': ('higher', 'previous_limit_matched_count', '昨日收盘涨停群体当刻再次涨停家数 / 有效匹配群体家数'),
+}
 
 
 def _number(value):
@@ -71,6 +80,83 @@ def _packet(cutoff, **extra):
 
 def _clamp(value):
     return min(100., max(0., value))
+
+
+def _emotion_diagnostics(features, history, expected, policy, cutoff, as_of=None, slot=None):
+    """Independent shadow axes, never a second weighted score or admission gate."""
+    minimum = int(policy['historySessions'])
+    fresh = bool(cutoff and as_of and 0 <= (cutoff - as_of).total_seconds() <= policy['maxSourceAgeSeconds'])
+    metrics = {}
+    for key, (direction, count_key, definition) in EMOTION_METRICS.items():
+        value = _number(features.get(key))
+        samples = [(day.isoformat(), _number(history.get(day.isoformat(), {}).get(key))) for day in expected]
+        samples = [(day, number) for day, number in samples if number is not None]
+        sufficient = len(expected) == minimum and len(samples) == minimum
+        gaps = ([] if value is not None else ['current_measurement_unavailable'])
+        if not sufficient:
+            gaps.append('insufficient_same_slot_history')
+        if not fresh:
+            gaps.append('current_snapshot_unavailable_or_stale')
+        rank = None
+        if sufficient and value is not None and fresh:
+            values = [number for _, number in samples]
+            rank = 100 * (sum(item < value for item in values) + .5 * sum(item == value for item in values)) / len(values)
+        metrics[key] = {
+            'value': value, 'available': value is not None,
+            'definition': definition, 'favorableDirection': direction,
+            'currentSampleCount': features.get(count_key),
+            'historySampleCount': len(samples), 'requiredHistorySessions': minimum,
+            'historyMean': mean(number for _, number in samples) if sufficient else None,
+            'empiricalPercentile': rank,
+            'favorablePercentile': (100 - rank if direction == 'lower' else rank) if rank is not None else None,
+            'missing': gaps,
+        }
+    ranked = sum(item['empiricalPercentile'] is not None for item in metrics.values())
+    return {
+        'version': 'emotion-diagnostics-v1', 'shadowOnly': True,
+        'measurementVersion': EMOTION_EVIDENCE_VERSION,
+        'validationStatus': 'unvalidated_descriptive_diagnostics',
+        'status': 'observed' if ranked == len(metrics) else 'partial' if ranked else 'insufficient' if fresh else 'unavailable',
+        'asOf': as_of.isoformat() if as_of else None,
+        'availableAtCutoff': cutoff.isoformat() if cutoff else None,
+        'baseline': {'slot': slot, 'slotMinutes': policy['slotMinutes'], 'sessions': minimum,
+                     'method': 'previous_exchange_sessions_same_slot_midrank',
+                     'rankDirection': 'empiricalPercentile rises with raw value; favorablePercentile follows favorableDirection'},
+        'metrics': metrics,
+        'missingMetrics': [key for key, item in metrics.items() if item['missing']],
+        'aggregation': 'none; correlated axes are not repeatedly weighted and no trading gate is changed',
+        'interpretationLimits': ['行情代理指标不等同于投资者心理或主力意图', '日内最高价不能识别炸板次数、回封顺序或排队成交能力'],
+    }
+
+
+def _explicit_market_limits(observation, row, previous, price, stamp, received, policy):
+    """Only provider limits from an available observation; no ±10% inference."""
+    if any(str(item.get(key)).lower() in {'true', '1', 'yes'}
+           for item in (observation, row)
+           for key in ('no_price_limit', 'corporate_action', 'suspended')):
+        return None, None
+    upper, lower = (_number(observation.get(key)) if not isinstance(observation.get(key), bool) else None
+                    for key in ('limit_up', 'limit_down'))
+    if (upper is None or lower is None or not 0 < lower < upper
+            or not lower - .005 <= price <= upper + .005
+            or (previous is not None and not lower < previous < upper)):
+        return None, None
+    evidence = observation.get('price_limit_evidence')
+    if evidence is not None:
+        if not isinstance(evidence, dict) or evidence.get('method') != 'explicit_provider_fields' or evidence.get('status') != 'observed':
+            return None, None
+        evidence_at = _source_at(evidence.get('source_time'))
+        if (not evidence.get('source') or evidence_at is None or evidence_at > stamp
+                or evidence_at.date() != stamp.date()
+                or (stamp - evidence_at).total_seconds() > policy['maxSourceAgeSeconds']
+                or evidence_at > received):
+            return None, None
+        evidence_previous = _number(evidence.get('previous_close'))
+        if previous is None or evidence_previous is None or abs(previous - evidence_previous) > .005:
+            return None, None
+        if any(_number(evidence.get(key)) != value for key, value in (('limit_up', upper), ('limit_down', lower))):
+            return None, None
+    return upper, lower
 
 
 def event_factor(context, cutoff, *, half_life_sessions=None, calendar_provider=None):
@@ -297,6 +383,7 @@ class MarketEmotionArchive:
         now, received = _at(cutoff), _at(received_at)
         out = _packet(now, source='archived_full_mainboard_snapshots', regime='unknown',
                       exposureMultiplier=None, socialSentimentAvailable=False)
+        out['emotionDiagnostics'] = _emotion_diagnostics({}, {}, [], self.policy, now)
         attrs = getattr(snapshot, 'attrs', {}) or {}
         received = received or _at(attrs.get('received_at'))
         if now is None or received is None or received > now:
@@ -352,15 +439,12 @@ class MarketEmotionArchive:
             if previous is not None and previous > 0:
                 change = (price / previous - 1) * 100
             high = _number(observation.get('high'))
-            upper, lower = _number(observation.get('limit_up')), _number(observation.get('limit_down'))
-            # Explicit pre-close permits a declared normal-mainboard 10% estimate.
-            if previous and previous > 0:
-                upper = upper or _limit_price(previous, 10)
-                lower = lower or _limit_price(previous, -10)
+            upper, lower = _explicit_market_limits(observation, row, previous, price, stamp, received, self.policy)
             data[row['code']] = {'price': price, 'previous_close': previous, 'change_pct': change,
                 'up': abs(price - upper) < .005 if upper and upper > 0 else None,
                 'down': abs(price - lower) < .005 if lower and lower > 0 else None,
-                'touched': high >= upper - .005 if high is not None and upper and high >= price else None}
+                'limit_evidence': EMOTION_EVIDENCE_VERSION if upper and lower else None,
+                'touched': high >= upper - .005 if high is not None and upper and price <= high <= upper + .005 else None}
             stamps.append(stamp)
             close_flags.append(closing)
         coverage = len(data) / universe if universe else 0
@@ -373,6 +457,7 @@ class MarketEmotionArchive:
         out.update(receivedAt=received.isoformat(), source=str(source))
         features = out['features']
         features['advancing_pct'] = 100 * sum(row['change_pct'] > 0 for row in data.values()) / len(data)
+        features['limit_observed_count'] = sum(row['up'] is not None for row in data.values())
         for label, key in (('limit_up_pct', 'up'), ('limit_down_pct', 'down')):
             known = [row[key] for row in data.values() if row[key] is not None]
             if len(known) / universe >= self.policy['minimumCoverage']:
@@ -384,13 +469,15 @@ class MarketEmotionArchive:
             if count:
                 features['broken_board_pct'] = 100 * sum(row['touched'] and not row['up'] for row in touched) / count
         if 'broken_board_pct' not in features:
-            out['gaps'].append('触板路径或触板样本不足，炸板率未知')
+            out['gaps'].append('显式限价、最高价或触板样本不足，触板后当前未封比例未知；不推断炸板次数')
         slot = f'{at.hour:02d}:{(at.minute // self.policy["slotMinutes"]) * self.policy["slotMinutes"]:02d}'
         calendar = sorted(set(self.calendar(now.date() - timedelta(days=550), now.date())))
         if not calendar or now.date() not in calendar:
             out['gaps'].append('完整交易日历不可用，昨日群体与历史分位为空')
+            calendar = []
         previous_days = [day for day in calendar if day < now.date()]
-        packet = {'features': features, 'rows': data, 'source': str(source)}
+        packet = {'features': features, 'rows': data, 'source': str(source),
+                  'measurementVersion': EMOTION_EVIDENCE_VERSION}
         digest = hashlib.sha256(json.dumps([at.isoformat(), packet], sort_keys=True).encode()).hexdigest()
         with self._database() as db:
             # Never replace first receipt or replay a snapshot before it was known.
@@ -400,14 +487,22 @@ class MarketEmotionArchive:
                                'WHERE source_at < ? AND received_at <= ? ORDER BY source_at,received_at',
                                (at.isoformat(), now.isoformat())).fetchall()
             if previous_days:
-                closes = [row for row in prior if row[2] == previous_days[-1].isoformat() and row[4]]
+                # Derived features stored under this receipt must not use a
+                # cohort that only became known after that receipt.
+                closes = [row for row in prior if row[2] == previous_days[-1].isoformat() and row[4]
+                          and row[1] <= received.isoformat()
+                          and json.loads(row[5]).get('measurementVersion') == EMOTION_EVIDENCE_VERSION
+                          and json.loads(row[5])['features'].get('limit_observed_count', 0) /
+                              max(1, json.loads(row[5])['features'].get('universe_count', 0)) >= self.policy['minimumCoverage']]
                 if closes:
                     old = json.loads(closes[-1][5])['rows']
-                    cohort = [code for code, row in old.items() if row['up'] is True]
+                    cohort = [code for code, row in old.items() if row['up'] is True
+                              and row.get('limit_evidence') == EMOTION_EVIDENCE_VERSION]
                     matched = [code for code in cohort if code in data and data[code]['previous_close']
                                and abs(data[code]['previous_close'] - old[code]['price']) <= .01]
                     if cohort and len(matched) / len(cohort) >= self.policy['minimumCoverage']:
                         features['previous_limit_cohort_count'] = len(cohort)
+                        features['previous_limit_matched_count'] = len(matched)
                         features['previous_limit_cohort_coverage'] = len(matched) / len(cohort)
                         features['previous_limit_premium_pct'] = mean((data[code]['price'] / old[code]['price'] - 1) * 100 for code in matched)
                         if all(data[code]['up'] is not None for code in matched):
@@ -417,7 +512,11 @@ class MarketEmotionArchive:
             history = {}
             for row in prior:
                 if row[3] == slot and row[2] < now.date().isoformat():
-                    history[row[2]] = json.loads(row[5])['features']
+                    archived = json.loads(row[5])
+                    # Old archives inferred ±10% limits. Do not silently mix
+                    # those measurements into this definition's baseline.
+                    if archived.get('measurementVersion') == EMOTION_EVIDENCE_VERSION:
+                        history[row[2]] = archived['features']
             expected = previous_days[-int(self.policy['historySessions']):]
             features['same_slot_history_sessions'] = sum(day.isoformat() in history for day in expected)
             required = ('advancing_pct', 'limit_up_pct', 'limit_down_pct')
@@ -439,6 +538,7 @@ class MarketEmotionArchive:
                            exposureMultiplier=self.policy['weakExposure'] if regime == 'weak' else self.policy['hotExposure'] if regime == 'hot' else 1.)
             else:
                 out['gaps'].append('同刻历史不足或当前快照已过期，市场状态保持未知')
+            out['emotionDiagnostics'] = _emotion_diagnostics(features, history, expected, self.policy, now, at, slot)
             # Digest uses raw features, before history-dependent derived diagnostics.
             db.execute('INSERT OR IGNORE INTO observations VALUES(?,?,?,?,?,?,?)',
                        (digest, at.isoformat(), first_received, now.date().isoformat(), slot, int(is_close),

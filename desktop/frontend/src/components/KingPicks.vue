@@ -124,6 +124,34 @@ const snapshotIsOld = computed(() => {
 const adaptivePicks = computed(() => primaryRecommendationPicks(adaptive.value, precisionProfile.value))
 const isDailyPrimary = computed(() => isDailyPrimaryRun(adaptive.value))
 const dailyAssessment = computed(() => adaptive.value.dailyAssessment || {})
+const dailyRankMeaning = computed(() => dailyAssessment.value.policyContract?.meaning
+  || adaptivePicks.value[0]?.rankMeaning || '排序口径以本轮保存的规则版本为准。')
+const dailyAttackWatchlist = computed(() => Array.isArray(adaptive.value.dailyAttackWatchlist) ? adaptive.value.dailyAttackWatchlist : [])
+const dailyAuditSummary = computed(() => {
+  const rows = Array.isArray(adaptive.value.dailyRejectionLedger) ? adaptive.value.dailyRejectionLedger : []
+  const labels = { excluded: '基础条件未通过', profile_rejected: '均衡档条件未通过', ranked_out: '均衡档合格但未入前列', qualified_below_top_n: '均衡档合格但未入前列', selected_regular: '已入选均衡档' }
+  const counts = rows.reduce((result, row) => {
+    const state = labels[row.state] ? row.state : 'unknown'
+    result[state] = (result[state] || 0) + 1
+    return result
+  }, {})
+  return Object.entries(counts).map(([key, count]) => `${labels[key] || '其他已记录状态'} ${count} 只`).join('；')
+})
+const dailyEmotionPanel = computed(() => adaptive.value.marketEmotionPanel || {})
+const dailyEmotionMetrics = computed(() => {
+  const features = dailyEmotionPanel.value.features || {}
+  return [
+    ['advancing_pct', '上涨占比', '%'], ['limit_up_pct', '涨停占比', '%'], ['limit_down_pct', '跌停占比', '%'],
+    ['broken_board_pct', '触板后未封住占比', '%'], ['previous_limit_premium_pct', '昨日涨停群体当前平均溢价', '%'],
+    ['previous_limit_promotion_pct', '昨日涨停群体晋级率', '%'], ['same_slot_history_sessions', '同刻历史', ' 个交易日'],
+  ].map(([key, label, unit]) => {
+    const diagnostic = dailyEmotionPanel.value.emotionDiagnostics?.metrics?.[key]
+    const value = diagnostic ? diagnostic.value : features[key]
+    return { key, label, value: value == null ? '未取得' : `${dailyValue(value)}${unit}`,
+      history: diagnostic ? `历史 ${diagnostic.historySampleCount ?? 0}/${diagnostic.requiredHistorySessions ?? 60} 个同刻样本` : '',
+      percentile: diagnostic ? diagnostic.empiricalPercentile == null ? '历史分位未取得' : `历史分位 ${dailyValue(diagnostic.empiricalPercentile)}%` : '' }
+  })
+})
 const dailyDisplayMessage = computed(() => precisionProfile.value === 'regular' ? dailyAssessment.value.message
   : `日线条件推荐${adaptivePicks.value.length}只（${{ conservative: '稳健', aggressive: '激进' }[precisionProfile.value] || precisionProfile.value}档）；查看本档价格与风险检查结果。`)
 const primaryContractKnown = computed(() => isDailyPrimary.value || Boolean(adaptive.value.recommendationPolicy))
@@ -214,6 +242,8 @@ function dailyReason(key) {
     daily_support_or_upside_space_unknown: '支撑或上方空间未取得', daily_ma5_extension_too_large: 'MA5乖离或ATR距离超出本档条件',
     daily_upside_reward_risk_insufficient: '压力空间与风险距离比不足', known_large_unlock: '已知较大解禁风险',
     known_nonpositive_operating_cash_flow: '经营现金流未达到本档条件',
+    current_price_not_above_previous_close: '现价未高于昨收', current_price_not_above_open: '现价未高于开盘',
+    current_price_not_above_session_vwap: '现价未高于当日成交均价', intraday_direction_inputs_unverified: '盘中方向数据未核验',
   })[key] || key
 }
 function dailyIndicators(pick) {
@@ -628,7 +658,7 @@ onDeactivated(() => {
         </details>
       </details>
       <div class="adaptive-summary saved-recommendations"><div><b>{{ isDailyPrimary ? `日线条件推荐 · ${adaptivePicks.length} 只` : primaryContractKnown ? `主推荐 · ${adaptivePicks.length} 只通过准入` : `旧版候选 · ${adaptivePicks.length} 只` }}</b><n-tag v-if="snapshotIsOld" size="small" type="warning" :bordered="false">历史结果</n-tag><small>本轮生成 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small><small v-if="adaptive.run_id || adaptive.runId">扫描编号 {{ adaptive.run_id || adaptive.runId }}</small></div><n-button v-if="result.adaptive" size="small" secondary @click="openRecommendationRecords">查看推荐与失效记录</n-button><span v-if="loading">扫描中 · 暂时保留原列表</span></div>
-      <div class="recommendation-objectives"><p>{{ primaryObjective }}</p><p>T+1持有风险单独评估：A股当日买入通常不能当日卖出，仍须承担隔夜与下一交易日退出风险。当日价格观察不等于可实现收益。</p><p v-if="isDailyPrimary">日线条件尚未经过概率校准。按成交金额及价格位置排序；卡片保留本轮日K来源、报价时间和风险条件。</p><p v-else>规则分用于排序，不是上涨概率。刷新只更新本轮证据，首次主推荐的时间和参考价以已保存记录为准。</p></div>
+      <div class="recommendation-objectives"><p>{{ primaryObjective }}</p><p>T+1持有风险单独评估：A股当日买入通常不能当日卖出，仍须承担隔夜与下一交易日退出风险。当日价格观察不等于可实现收益。</p><p v-if="isDailyPrimary">日线条件尚未经过概率校准。{{ dailyRankMeaning }}；卡片保留本轮日K来源、报价时间和风险条件。</p><p v-else>规则分用于排序，不是上涨概率。刷新只更新本轮证据，首次主推荐的时间和参考价以已保存记录为准。</p></div>
       <p v-if="!isDailyPrimary && (adaptive.morningAssessment?.meaning || adaptive.morningAssessment?.message)" class="quote-coverage">{{ adaptive.morningAssessment.meaning || adaptive.morningAssessment.message }}</p>
       <p v-if="!primaryContractKnown && result.adaptive" class="quote-coverage">旧版快照保留原版本候选；未记录统一准入，不标记为通过当前规则。</p>
       <p v-if="!isDailyPrimary && (adaptive.profilePortfolioPolicies?.[precisionProfile] || adaptive.portfolioPolicy)" class="quote-coverage">{{ portfolioSummary(adaptive.profilePortfolioPolicies?.[precisionProfile] || adaptive.portfolioPolicy) }}</p>
@@ -644,6 +674,29 @@ onDeactivated(() => {
       <details v-if="isDailyPrimary" class="sk-help-details picks-method daily-checks"><summary>日线检查结果与未入选原因</summary><p>可用已完成日K {{ dailyAssessment.dailyUsableCount ?? '未记录' }} / {{ dailyAssessment.researchedCount ?? '未记录' }} 只 · 日线与新鲜报价核验 {{ dailyAssessment.quoteUsableCount ?? '未记录' }} 只 · 财务事件覆盖通过 {{ dailyAssessment.eventCoveragePassedCount ?? '未记录' }} 只</p><p v-for="item in dailyExcluded" :key="item.key">{{ item.label }}：{{ item.count }} 只</p><p v-for="(count, key) in dailyAssessment.profileExcludedCounts?.[precisionProfile] || {}" :key="key">本档 {{ dailyReason(key) }}：{{ count }} 只</p><p>{{ dailyAssessment.meaning || '基于已完成日K、当日报价与披露风险的独立条件筛选。' }}</p><p>各原因可能重叠，不能相加为股票总数。</p></details>
       <details v-else-if="isV11" class="sk-help-details picks-method"><summary>规则与覆盖</summary><p>{{ researchCoverage.description }}</p><p>行情 {{ adaptive.dataQuality?.snapshot_count ?? '未知' }} 只；深研完成表示已逐只核验，缺失和过期证据仍单独记录，不代表全部证据齐全。</p><p>{{ adaptive.marketSummary }}</p><p>算法 {{ adaptive.scoreVersion || adaptive.recommendationLogicVersion || '以单只候选记录为准' }}。</p><p>{{ adaptive.algorithm?.missingFactorPolicy || '缺失处理以该次记录的算法版本为准。' }}</p><p>{{ adaptive.algorithm?.formula || '评分公式以该次记录为准。' }}</p><p>{{ adaptive.algorithm?.profilePolicy }}</p><p>规则参数为待验证初值。通过独立检验的模型才提供预测；数据覆盖不是胜率。研究配置执行市场与行业预算，页面不代表实际成交。</p></details>
       <details v-else class="sk-help-details picks-method"><summary>旧版历史口径</summary><p>{{ modelMix }} · {{ adaptive.modelVersion }}。旧分快照保留用于回看；下一次刷新采用当前规则与证据筛选。</p></details>
+      <details v-if="isDailyPrimary && dailyAuditSummary" class="sk-help-details picks-method"><summary>逐股审计摘要 · 均衡档</summary><p>{{ dailyAuditSummary }}</p><p>{{ dailyAssessment.auditMeaning || '仅记录实际进入深研的股票；不能据此计算全市场漏选率。' }}</p></details>
+      <details v-if="isDailyPrimary && Object.keys(dailyEmotionPanel).length" class="sk-help-details picks-method"><summary>A股市场情绪观察</summary>
+        <p>来源 {{ dailyEmotionPanel.source || '未取得' }} · 截至 {{ formatTime(dailyEmotionPanel.asOf) }}</p>
+        <p v-if="dailyEmotionPanel.decisionAssessment?.available === false">本轮决策的市场证据保持未知，以下仅保留原记录时点的观测，不视为当前有效确认。</p>
+        <p v-else-if="dailyEmotionPanel.decisionAssessment?.available === true">本轮市场广度{{ dailyEmotionPanel.decisionAssessment.passed === false ? '偏弱，触发主榜限制' : '未触发偏弱限制' }}；核验 {{ formatTime(dailyEmotionPanel.evaluatedAt) }}。</p>
+        <p v-for="metric in dailyEmotionMetrics" :key="metric.key">{{ metric.label }}：{{ metric.value }}<template v-if="metric.history"> · {{ metric.history }} · {{ metric.percentile }}</template></p>
+        <p v-if="dailyEmotionPanel.emotionDiagnostics?.meaning || dailyEmotionPanel.emotionDiagnostics?.message">{{ dailyEmotionPanel.emotionDiagnostics.meaning || dailyEmotionPanel.emotionDiagnostics.message }}</p>
+        <p v-for="gap in dailyEmotionPanel.gaps || []" :key="gap">{{ gap }}</p>
+        <p v-for="limit in dailyEmotionPanel.emotionDiagnostics?.interpretationLimits || []" :key="limit">{{ limit }}</p>
+        <p>原始情绪指标可在历史不足时保留；缺失值不视为中性。</p>
+        <p v-if="dailyEmotionPanel.emotionDiagnostics?.measurementVersion === 'explicit-limit-observations-v2'">涨跌停统计采用已核验的提供方明确限价；无可靠限价及特殊交易状态保持未知。</p>
+        <p v-else>本记录未注明限价计量口径，历史统计保留原含义。</p>
+      </details>
+      <details v-if="isDailyPrimary && dailyAttackWatchlist.length" class="sk-help-details picks-method"><summary>进攻观察 · {{ dailyAttackWatchlist.length }} 只 · 未确认</summary>
+        <p>记录尚未封板的方向性机会，供后续核验；观察身份不构成正式推荐，也不代表随后会涨停。</p>
+        <p>{{ dailyRankMeaning }}</p>
+        <div v-for="pick in dailyAttackWatchlist" :key="codeOf(pick)" class="daily-attack-row">
+          <p><b>#{{ pick.rank }} {{ nameOf(pick) }} {{ codeOf(pick) }}</b> · 观察价 ¥{{ dailyValue(pick.quote?.price) }} · {{ observationChange(pick.quote?.change_pct) }}</p>
+          <p>开盘后涨幅 / ATR {{ dailyValue(pick.dailyRankEvidence?.openReturnAtr) }} · 方向效率 {{ dailyValue(pick.dailyRankEvidence?.directionalEfficiency) }} · 20日新高 {{ pick.breakout20 === true ? '已突破' : pick.breakout20 === false ? '未突破' : '未知' }}</p>
+          <p v-if="pick.dailyPrimaryReasons?.length">均衡档未通过原因：{{ pick.dailyPrimaryReasons.map(dailyReason).join('；') }}</p>
+          <p>截至 {{ formatTime(pick.sourceTime) }} · {{ pick.meaning }}</p>
+        </div>
+      </details>
       <n-spin :show="loading && !adaptivePicks.length">
         <section v-if="isDailyPrimary && adaptivePicks.length" class="pick-grid daily-primary-grid" aria-label="日线条件推荐">
           <n-card v-for="(pick, index) in adaptivePicks" :key="codeOf(pick)" size="small" :bordered="false" class="pick-card tier-adaptive daily-primary-card">
@@ -665,6 +718,7 @@ onDeactivated(() => {
                 <p v-if="pick.marketBreadth"><span>市场环境</span>{{ pick.marketBreadth.available === true ? '本轮已记录市场广度' : '未取得有效广度，环境保持未知' }}</p>
                 <PickIndicatorEvidence :indicators="dailyIndicators(pick)" />
                 <p><span>排序依据</span>{{ pick.rankMeaning || '本轮保存的成交金额与价格位置排序' }}</p>
+                <p v-if="pick.dailyRankEvidence"><span>排序证据</span>开盘后涨幅 / ATR {{ dailyValue(pick.dailyRankEvidence.openReturnAtr) }} · 方向效率 {{ dailyValue(pick.dailyRankEvidence.directionalEfficiency) }} · 本档比较 {{ pick.dailyRankEvidence.referencePeerCount ?? '未记录' }} 只</p>
                 <p><span>行情源时间</span>{{ pick.sourceTime || pick.quote?.provider_timestamp || pick.quote?.source_time || '未记录' }}</p>
                 <p><span>条件生成</span>{{ formatTime(pick.decision_at) }}</p>
               </details>

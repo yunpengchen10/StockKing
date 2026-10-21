@@ -187,7 +187,7 @@ def _snapshot(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "support", "resistance", "atr14", "structureRewardRisk", "biasMa5Pct", "atrExtension",
         "eventAssessment", "marketBreadth", "rankMeaning", "riskProfile", "executionQuoteData",
         "trainingEligible", "minuteModelTrainingEligible", "entryEligible", "executable",
-        "trendEvidence", "intradayDirectionEvidence",
+        "trendEvidence", "intradayDirectionEvidence", "dailyRankEvidence",
     )
     return {key: candidate[key] for key in keys if key in candidate}
 
@@ -210,20 +210,22 @@ _COMPACT_KEYS = (
     "stateLabel", "strategyId", "strategyBranch", "validationStatus", "horizon", "horizonId",
     "support", "resistance", "atr14", "structureRewardRisk", "biasMa5Pct", "atrExtension",
     "eventAssessment", "marketBreadth", "rankMeaning", "riskProfile",
-    "trendEvidence", "intradayDirectionEvidence",
+    "trendEvidence", "intradayDirectionEvidence", "dailyRankEvidence",
 )
 
 
 def _json_projection(column: str, keys: Iterable[str]) -> str:
     """Project known fields inside SQLite; never transport raw minute evidence."""
-    # Older SQLite builds cap function arguments at 127. Keep each object
+    # Older SQLite builds cap function arguments at 127. Keep each JSON call
     # below that bound even as independently versioned signal fields grow.
     keys = list(keys)
-    chunks = ["json_object(" + ",".join(f"'{key}',json_extract({column},'$.{key}')"
-               for key in keys[start:start + 50]) + ")" for start in range(0, len(keys), 50)]
-    result = chunks[0] if chunks else "json_object()"
-    for chunk in chunks[1:]:
-        result = f"json_patch({result},{chunk})"
+    result = "json_object()"
+    for start in range(0, len(keys), 50):
+        fields = ",".join(f"'$.{key}',json_extract({column},'$.{key}')"
+                          for key in keys[start:start + 50])
+        # Merge Patch recursively removes null members. Set whole fields instead
+        # so explicit unknown values in frozen evidence survive compact reads.
+        result = f"json_set({result},{fields})"
     return result
 
 

@@ -172,7 +172,8 @@ def test_missing_preceding_session_requires_a_valid_provider_reference(reference
 def snapshot(at, changes=(10., 1., -1.), *, highs=True, row_times=False):
     prices = [round(10 * (1 + change / 100), 2) for change in changes]
     result = pd.DataFrame({'code': ['600001', '600002', '600003'], 'name': ['甲', '乙', '丙'],
-                           'price': prices, 'previous_close': 10., 'change_pct': changes})
+                           'price': prices, 'previous_close': 10., 'change_pct': changes,
+                           'limit_up': 11., 'limit_down': 9.})
     if highs:
         result['high'] = [max(10., price) for price in prices]
     result.attrs['snapshot_source'] = 'recorded-provider'
@@ -219,7 +220,7 @@ def test_missing_high_or_previous_close_never_invents_board_paths(tmp_path):
     assert 'broken_board_pct' not in result['features']
     assert 'previous_limit_premium_pct' not in result['features']
     frame = snapshot(NOW)
-    frame = frame.drop(columns='previous_close')
+    frame = frame.drop(columns=['previous_close', 'limit_up', 'limit_down'])
     result = store.observe(frame, NOW, received_at=NOW)
     assert 'limit_up_pct' not in result['features']
     assert 'broken_board_pct' not in result['features']
@@ -254,6 +255,7 @@ def test_yesterday_cohort_requires_actual_previous_close_archive(tmp_path):
     current = snapshot(NOW, changes=(10., 0., 0.))
     current.loc[0, 'previous_close'] = 11.
     current.loc[0, ['price', 'high']] = 12.1
+    current.loc[0, ['limit_up', 'limit_down']] = [12.1, 9.9]
     result = store.observe(current, NOW, received_at=NOW)
     assert result['features']['previous_limit_cohort_count'] == 1
     assert result['features']['previous_limit_premium_pct'] == pytest.approx(10)

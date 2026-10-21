@@ -14,11 +14,58 @@ from .premarket import _at, _daily_valid, _local, previous_session
 from .precision_policy import execution_quote_data, POLICIES
 from .research_policy import DEFAULT_PARAMETERS
 
-VERSION = 'king-daily-primary-v2'
+VERSION = 'king-daily-primary-v3'
 TASK_ID = 'daily_structure_to_next_session'
+RANK_POLICY = 'equal_percentile_open_return_atr_and_directional_efficiency_then_amount_then_code'
 INTRADAY_DIRECTION_RULE = 'price > pre_close and price > open_price and price > amount / volume'
 INTRADAY_DIRECTION_MEANING = ('同一新鲜报价的价格方向约束，只排除已知逆向走势；规则尚未验证，'
     '单次量价快照不能确认持续主力资金、资金身份或主升，也不表示上涨概率')
+
+
+def daily_policy_contract():
+    return {'version': VERSION, 'taskId': TASK_ID, 'rankingPolicy': RANK_POLICY,
+        'validationStatus': 'unvalidated_rules', 'probability': None,
+        'attackWatchlist': 'shadow_only_not_selected_not_training_eligible',
+        'directionalEfficiency': '(price-open_price)/(high-low)',
+        'openReturnAtr': '(price-open_price)/completed_daily_atr14',
+        'rankWeights': {'directionalEfficiencyPercentile': .5, 'openReturnAtrPercentile': .5},
+        'percentileDefinition': '(count_less + 0.5*count_equal)/eligible_peer_count',
+        'meaning': '方向效率与ATR标准化涨幅各占一半经验名次；等权为待验证基线，金额仅同分排序'}
+
+
+def _rank_evidence(quote, atr):
+    span = quote['high'] - quote['low']
+    return {'policy': RANK_POLICY, 'validationStatus': 'unvalidated_rules', 'probability': None,
+        'directionalEfficiency': (quote['price'] - quote['open_price']) / span if span > 0 else None,
+        'openReturnAtr': (quote['price'] - quote['open_price']) / atr if atr > 0 else None,
+        'amountTieBreakCny': quote['amount'],
+        'meaning': '单次快照方向与波动标准化排序；未证明分钟加速、持续买盘或后续收益'}
+
+
+def _rank_key(row):
+    evidence = row['dailyRankEvidence']
+    return (-evidence['relativeRankScore'], -evidence['amountTieBreakCny'], row['code'])
+
+
+def _rank_candidates(rows):
+    """Frozen cross-sectional ranks in this lane, not a probability or time series.
+
+    Two independent questions: how much progress relative to normal volatility,
+    and how directional that progress was relative to today's range. Neither a
+    one-tick move at the high nor large unsigned turnover wins on its own.
+    """
+    result = []
+    for row in rows:
+        evidence = dict(row['dailyRankEvidence'])
+        for key in ('directionalEfficiency', 'openReturnAtr'):
+            peers = [x['dailyRankEvidence'][key] for x in rows if x['dailyRankEvidence'][key] is not None]
+            value = evidence[key]
+            evidence[key + 'Percentile'] = (sum(x < value for x in peers) + .5 * sum(x == value for x in peers)) / len(peers) if peers and value is not None else None
+        evidence['referencePeerCount'] = len(rows)
+        evidence['relativeRankScore'] = sum(.5 * (evidence[key + 'Percentile'] or 0.)
+                                          for key in ('directionalEfficiency', 'openReturnAtr'))
+        result.append({**row, 'dailyRankEvidence': evidence})
+    return sorted(result, key=_rank_key)
 
 
 def _number(value):
@@ -171,13 +218,16 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
         'probability': None, 'horizon': 'next_session', 'minuteDataRequired': False,
         'morningModelRequired': False, 'minuteSectorFundRequired': False,
         'marketBreadth': market, 'dailyUsableCount': 0, 'quoteUsableCount': 0,
-        'intradayDirectionPassedCount': 0,
+        'intradayDirectionPassedCount': 0, 'policyContract': daily_policy_contract(),
         'intradayDirectionPolicy': {'version': VERSION, 'rule': INTRADAY_DIRECTION_RULE,
                                    'meaning': INTRADAY_DIRECTION_MEANING},
         'eventCoveragePassedCount': 0, 'researchedCount': 0, 'excludedCounts': {},
         'profileExcludedCounts': {}, 'profileQualifiedCounts': {}, 'count': 0,
         'meaning': '真实已完成日K、当日报价及已披露风险的独立条件筛选；不表示分钟主力确认、上午T0模型通过或上涨概率'}
     result = {'dailyCandidates': [], 'dailyProfileCandidates': {key: [] for key in POLICIES},
+              'dailyAttackWatchlist': [], 'dailyRejectionLedger': [],
+              'marketEmotionPanel': {**dict(market_evidence or {}),
+                  'evaluatedAt': now.isoformat(), 'decisionAssessment': market},
               'dailyAssessment': assessment}
     clock = now.time().replace(tzinfo=None)
     if (not is_market_open('cn', now.date()) or not
@@ -187,27 +237,34 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
     previous = previous_session(now).isoformat()
     assessment['baselineAsOf'] = previous
     excluded, profiles, profile_excluded, seen = Counter(), {key: [] for key in POLICIES}, {key: Counter() for key in POLICIES}, set()
+    attacks, ledger = [], {}
     for item in queued:
         code, name = str(item.get('code') or ''), str(item.get('name') or item.get('code') or '')
         if code in seen:
             continue
         seen.add(code)
+        record = {'code': code, 'name': name, 'decisionAt': now.isoformat(),
+                  'state': 'excluded', 'reasons': [], 'profileDecisions': {}}
+        ledger[code] = record
+        def reject(*reasons):
+            record['reasons'].extend(reasons)
+            excluded.update(reasons)
         if not re.fullmatch(r'(600|601|603|605|000|001|002|003)\d{3}', code) or re.search(r'ST|退|整理|停牌', name, re.I):
-            excluded['unsupported_or_risk_board'] += 1
+            reject('unsupported_or_risk_board')
             continue
         daily = daily_by_code.get(code) or {}
         prior = daily.get('previousSession') or {}
         if (not _daily_valid(daily, now, previous) or prior.get('priceBasis') != 'unadjusted'
                 or prior.get('asOf') != previous or prior.get('source') != daily.get('source')
                 or 'unknown' in str(daily.get('source')).lower()):
-            excluded['daily_history_source_basis_or_latest_session_unverified'] += 1
+            reject('daily_history_source_basis_or_latest_session_unverified')
             continue
         d = {key: _number(value) for key, value in daily['metrics'].items()}
         required = ('last_close', 'ma5', 'ma10', 'ma20', 'high20', 'low20', 'atr14', 'history_sessions')
         prior_close = _number(prior.get('close'))
         if (any(d.get(key) is None or d[key] <= 0 for key in required) or d['history_sessions'] < 20
                 or prior_close is None or abs(prior_close-d['last_close']) > .000001):
-            excluded['daily_history_prices_invalid'] += 1
+            reject('daily_history_prices_invalid')
             continue
         assessment['dailyUsableCount'] += 1
         quote = dict(quotes_by_code.get(code) or {})
@@ -217,40 +274,58 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
         execution = execution_quote_data({'code': code, 'quote': quote})
         if (quote_check(quote, code, now) or execution['status'] != 'complete'
                 or not _limit_evidence_current(quote, now)):
-            excluded['quote_or_provider_price_limits_unverified'] += 1
+            reject('quote_or_provider_price_limits_unverified')
             continue
         price, prev, amount, volume = (_number(quote.get(key)) for key in ('price', 'pre_close', 'amount', 'volume'))
         if abs(prev-d['last_close']) > DEFAULT_PARAMETERS['entry']['previousCloseToleranceCny']:
-            excluded['daily_quote_previous_close_mismatch'] += 1
+            reject('daily_quote_previous_close_mismatch')
             continue
         if (any(quote.get(key) is True for key in ('suspended', 'locked_limit_up', 'corporate_action', 'no_price_limit'))
                 or quote.get('quote_usable_for_current_price_check') is False
                 or amount is None or volume is None or amount <= 0 or volume <= 0
                 or not quote['low']-.01 <= amount/volume <= quote['high']+.01
                 or not quote['limit_down']+.005 < price < quote['limit_up']-.005):
-            excluded['not_tradable_or_limit_locked'] += 1
+            reject('not_tradable_or_limit_locked')
             continue
         assessment['quoteUsableCount'] += 1
+        record.update(quoteSource=quote.get('source'), quoteSourceTime=quote.get('provider_timestamp') or quote.get('source_time'),
+                      referencePrice=price)
         direction = _intraday_direction(quote)
         if direction['passed'] is not True:
-            excluded.update(direction['reasons'])
+            reject(*direction['reasons'])
             continue
         assessment['intradayDirectionPassedCount'] += 1
         events = _events((contexts or {}).get(code) or {}, now)
         if events['missingReasons'] or events['riskReasons']:
-            excluded.update(events['missingReasons'] + events['riskReasons'])
+            reject(*(events['missingReasons'] + events['riskReasons']))
             continue
         assessment['eventCoveragePassedCount'] += 1
+        rank_evidence = _rank_evidence(quote, d['atr14'])
+        # A new high has no observed overhead resistance. Preserve the opportunity
+        # for prospective research without inventing a target or bypassing entry gates.
+        attacks.append({'code': code, 'name': name, 'decision_at': now.isoformat(),
+            'version': VERSION, 'status': 'research_only', 'stateLabel': '进攻观察（未确认）',
+            'taskId': 'unsealed_intraday_attack_shadow', 'sourceTime': direction['sourceTime'],
+            'quote': quote, 'dailyRankEvidence': rank_evidence, 'intradayDirectionEvidence': direction,
+            'breakout20': price > d['high20'],
+            'breakout60': price > d['high60'] if d.get('high60') else None,
+            'marketBreadth': market, 'eventAssessment': events,
+            'entryEligible': False, 'executable': False, 'trainingEligible': False,
+            'probability': None, 'validationStatus': 'unvalidated_rules',
+            'resistance': None, 'structureRewardRisk': None,
+            'missingConfirmation': ['completed_minute_path', 'aligned_sector_resonance',
+                                    'persistent_trading_pressure', 'validated_T1_payoff'],
+            'meaning': '未封板的方向性观察，不证明随后涨停；须补齐分钟、板块、资金及T+1证据，不能当成正式推荐'})
         if market['status'] == 'weak_market_veto':
-            excluded['verified_weak_market'] += 1
+            reject('verified_weak_market')
             continue
         if not d['ma5'] > d['ma10'] > d['ma20'] or price < d['ma20']:
-            excluded['daily_uptrend_not_confirmed'] += 1
+            reject('daily_uptrend_not_confirmed')
             continue
         support = max((d[key] for key in ('ma20', 'low20') if 0 < d[key] < price), default=None)
         resistance = min((d[key] for key in ('high20', 'high60') if d.get(key) and d[key] > price), default=None)
         if support is None or resistance is None:
-            excluded['daily_support_or_upside_space_unknown'] += 1
+            reject('daily_support_or_upside_space_unknown')
             continue
         risk_distance = max(price-support, d['atr14'] * DEFAULT_PARAMETERS['entry']['volatilityRiskFloorAtr'])
         rr, bias, extension = (resistance-price)/risk_distance, (price/d['ma5']-1)*100, (price-d['ma5'])/d['atr14']
@@ -277,6 +352,7 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
             'baselineAsOf': previous, 'baselineSource': daily['source'], 'dailyEvidence': daily,
             'dailyEvidenceStatus': 'completed_daily_source_and_quote_preclose_verified',
             'intradayDirectionEvidence': direction,
+            'dailyRankEvidence': rank_evidence,
             'support': support, 'resistance': resistance, 'atr14': d['atr14'], 'structureRewardRisk': rr,
             'biasMa5Pct': bias, 'atrExtension': extension, 'riskDistance': risk_distance,
             'indicatorEvidence': indicators, 'selectionReasons': reasons, 'reasons': reasons,
@@ -285,7 +361,7 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
             'validationStatus': 'unvalidated_rules', 'probability': None, 'probabilities': {}, 'confidence': None,
             'horizon': '下一交易日（T+1）', 'horizonId': 'next_session',
             'minuteModelTrainingEligible': False, 'trainingEligible': False, 'training_eligible': False,
-            'rankMeaning': '先按当日已成交金额、再按MA5偏离和代码排序；规则排序不是上涨概率',
+            'rankMeaning': '方向效率与ATR标准化开盘后涨幅的截面名次各占一半，成交金额只作同分项；等权为待验证基线，不是上涨概率',
             'dailySignal': {'version': VERSION, 'taskId': TASK_ID, 'horizon': 'next_session',
                 'validationStatus': 'unvalidated_rules', 'probability': None, 'minuteDataRequired': False,
                 'morningModelRequired': False, 'trainingEligibleAtSignal': False},
@@ -305,15 +381,34 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
                               'state': 'avoid' if blocked else 'conditional', 'reasons': blocked}
             profile_excluded[key].update(blocked)
         candidate['dailyProfileDecision'] = decisions
+        record['profileDecisions'] = decisions
+        record['state'] = 'qualified_below_top_n' if decisions['regular']['entryEligible'] else 'profile_rejected'
+        record['reasons'] = list(decisions['regular']['reasons'])
         for key in POLICIES:
             if decisions[key]['entryEligible']:
                 profiles[key].append(candidate)
     limit = max(0, min(5, int(top_n)))
     for key, candidates in profiles.items():
-        candidates.sort(key=lambda row: (-_number(row['quote']['amount']), abs(row['biasMa5Pct']), row['code']))
+        candidates = _rank_candidates(candidates)
+        for rank, row in enumerate(candidates, 1):
+            decision = ledger[row['code']]['profileDecisions'][key]
+            decision.update(rank=rank, selected=rank <= limit,
+                            rankEvidence=dict(row['dailyRankEvidence']))
         result['dailyProfileCandidates'][key] = [{**row, 'rank': rank, 'riskProfile': key}
                                                 for rank, row in enumerate(candidates[:limit], 1)]
     result['dailyCandidates'] = result['dailyProfileCandidates']['regular']
+    for row in result['dailyCandidates']:
+        ledger[row['code']]['state'] = 'selected_regular'
+    assessment['attackObservedCount'] = len(attacks)
+    attacks = _rank_candidates([row for row in attacks if ledger[row['code']]['state'] != 'selected_regular'])
+    result['dailyAttackWatchlist'] = [{**row, 'rank': rank,
+        'dailyPrimaryState': ledger[row['code']]['state'],
+        'dailyPrimaryReasons': ledger[row['code']]['reasons']}
+        for rank, row in enumerate(attacks[:limit], 1)]
+    result['dailyRejectionLedger'] = list(ledger.values())
+    assessment['attackAlternativeCount'] = len(attacks)
+    assessment['attackWatchlistCount'] = len(result['dailyAttackWatchlist'])
+    assessment['auditMeaning'] = '只覆盖实际深研队列；每股保留首个失败阶段，非全市场漏选率'
     assessment.update(researchedCount=len(seen), excludedCounts=dict(excluded),
         profileExcludedCounts={key: dict(value) for key, value in profile_excluded.items()},
         profileQualifiedCounts={key: len(value) for key, value in profiles.items()},

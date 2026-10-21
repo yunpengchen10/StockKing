@@ -69,7 +69,7 @@ def test_same_fresh_quote_exposes_direction_math_without_inventing_fund_identity
     result = run()
     row = result['dailyCandidates'][0]
     direction = row['intradayDirectionEvidence']
-    assert row['version'] == VERSION == 'king-daily-primary-v2'
+    assert row['version'] == VERSION == 'king-daily-primary-v3'
     assert direction['status'] == 'observed' and direction['passed'] is True
     assert direction['source'] == row['quote']['source']
     assert direction['sourceTime'] == row['quote']['provider_timestamp']

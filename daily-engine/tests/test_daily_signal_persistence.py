@@ -46,6 +46,9 @@ def test_profile_only_daily_publication_roundtrips_evidence_without_minute_task(
     assert snapshot['dailyEvidence'] == original['profileCandidates']['aggressive'][0]['dailyEvidence']
     assert snapshot['selectionReasons'] == original['profileCandidates']['aggressive'][0]['selectionReasons']
     assert snapshot['dailyProfileDecision'] == original['profileCandidates']['aggressive'][0]['dailyProfileDecision']
+    assert snapshot['dailyRankEvidence'] == original['profileCandidates']['aggressive'][0]['dailyRankEvidence']
+    assert snapshot['dailyRankEvidence']['referencePeerCount'] == 1
+    assert snapshot['dailyRankEvidence']['probability'] is None
     assert snapshot['dailySignal']['selectedProfiles'] == ['aggressive']
     assert snapshot['dailySignal']['referenceVerifiedAtPublication'] is True
     assert snapshot['dailyFirstReferenceTime'] == NOW.isoformat()

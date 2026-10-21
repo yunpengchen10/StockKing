@@ -11,10 +11,14 @@ from .primary_policy import evaluate_primary_admission, policy_contract
 
 
 def algorithm_contract():
+    from .daily_primary import daily_policy_contract
+    from .research_factors import EMOTION_EVIDENCE_VERSION
     from .task_learning import task_contract, NEXT_DAY_TASK_ID
     from .morning_task import MORNING_TASK_ID, MORNING_QUEUES
     payload = {
         'schemaVersion': 4,
+        'dailyPolicy': daily_policy_contract(),
+        'marketMeasurementVersion': EMOTION_EVIDENCE_VERSION,
         'primaryTask': 'session_specific_morning_T0_plus_T1_risk',
         'learningTaskContracts': [task_contract()['taskContractId']] + [
             task_contract(NEXT_DAY_TASK_ID, queue)['taskContractId']

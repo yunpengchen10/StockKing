@@ -80,7 +80,7 @@ def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
     return {**payload, "adaptive": shown}
 
 
-def _daily_assessment_valid(run: dict[str, Any]) -> bool:
+def _daily_assessment_valid(run: dict[str, Any], *, historical: bool = False) -> bool:
     """Validate at publication; opening an old saved result never refreshes it."""
     from src.services.yao_scout.daily_primary import TASK_ID, VERSION
     from src.services.yao_scout.daily_opportunities import is_market_open
@@ -89,6 +89,9 @@ def _daily_assessment_valid(run: dict[str, Any]) -> bool:
     assessment = run.get("dailyAssessment")
     if not isinstance(assessment, dict):
         return False
+    # A frozen v2 scan retains its own evidence and version after an upgrade.
+    # Only history reads accept that known contract; new publications use VERSION.
+    versions = {VERSION, "king-daily-primary-v2"} if historical else {VERSION}
 
     def period(stamp):
         clock = stamp.time().replace(tzinfo=None)
@@ -104,7 +107,7 @@ def _daily_assessment_valid(run: dict[str, Any]) -> bool:
         daily, quotes, count = (assessment.get(key) for key in
                                 ("dailyUsableCount", "quoteUsableCount", "count"))
         return bool(run.get("primaryObjective") == TASK_ID
-            and assessment.get("version") == VERSION and assessment.get("taskId") == TASK_ID
+            and assessment.get("version") in versions and assessment.get("taskId") == TASK_ID
             and assessment.get("status") in {"completed", "no_daily_candidates"}
             and assessment.get("minuteDataRequired") is False
             and all(type(value) is int for value in (daily, quotes, count))
@@ -118,7 +121,7 @@ def _daily_assessment_valid(run: dict[str, Any]) -> bool:
         return False
 
 
-def displayable_run(run: Any) -> bool:
+def displayable_run(run: Any, *, historical: bool = False) -> bool:
     """A source outage is not an empty selection. Old snapshots do not expire here."""
     if not isinstance(run, dict) or run.get("status") not in _VALID_STATUSES:
         return False
@@ -155,7 +158,7 @@ def displayable_run(run: Any) -> bool:
     if run.get("primarySelectionMode") == "daily_conditional":
         # Minute availability cannot veto this independent daily task. The
         # branch label alone is insufficient: its own evidence must be usable.
-        return _daily_assessment_valid(run)
+        return _daily_assessment_valid(run, historical=historical)
     minutes = quality.get("minute_coverage") or {}
     if (minutes.get("requested", 0) > 0 and not minutes.get("usable", 0)
             and not run.get("nextDayWatchlist") and not run.get("nextDayContinuationWatchlist")):
@@ -182,7 +185,7 @@ class LocalPicksDisplayStore:
             value = json.loads(self.path.read_text(encoding="utf-8"))
             if (isinstance(value, dict) and value.get("displaySnapshotVersion") == 1
                     and value.get("schemaVersion") == STOCK_KING_SCHEMA_VERSION
-                    and displayable_run(value.get("adaptive"))):
+                    and displayable_run(value.get("adaptive"), historical=True)):
                 return {**value, **display_counts(value["adaptive"])}
         except (OSError, ValueError, TypeError):
             pass
@@ -198,14 +201,14 @@ class LocalPicksDisplayStore:
                 rows = self.db.list_yao_display_runs(limit=100, modes=_SCAN_MODES,
                                                     statuses=tuple(sorted(_VALID_STATUSES)))
                 valid = [row for row in rows
-                         if row.get("mode") in _SCAN_MODES and displayable_run(row.get("result"))]
+                         if row.get("mode") in _SCAN_MODES and displayable_run(row.get("result"), historical=True)]
                 newest = max(valid, key=lambda row: _generated_at(row["result"]), default=None)
                 with _display_lock:
                     saved = self._read_saved()
                 if newest and (not saved or _generated_at(newest["result"]) > _generated_at(saved["adaptive"])):
                     row = self.db.get_yao_run(newest["run_id"])
                     result = (row or {}).get("result")
-                    if displayable_run(result):
+                    if displayable_run(result, historical=True):
                         chosen = result
                     else:
                         sync_error = True
@@ -225,7 +228,7 @@ class LocalPicksDisplayStore:
             return self.save(chosen, source="history" if saved else "migration")
 
     def save(self, run: dict[str, Any], *, source: str = "manual") -> dict[str, Any]:
-        if not displayable_run(run):
+        if not displayable_run(run, historical=source in {"history", "migration"}):
             message = run.get("message") or {
                 "skipped_non_trading_day": "当前不是交易日，本轮未刷新，已保留上次结果",
             }.get(run.get("status")) or "行情或证据不可用，本轮未刷新，已保留上次结果"

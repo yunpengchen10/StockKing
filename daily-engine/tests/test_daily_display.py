@@ -90,7 +90,34 @@ def test_daily_counts_never_include_other_research_queues(tmp_path, monkeypatch)
     assert saved['nextDayCandidateCount'] == 1
 
 
-def test_sql_history_header_restores_daily_branch_without_loading_rejected_payloads(tmp_path, monkeypatch):
+def test_v2_saved_display_survives_upgrade_without_rewriting_version(tmp_path, monkeypatch):
+    monkeypatch.setenv('YAO_SCOUT_DATA_DIR', str(tmp_path))
+    store = LocalPicksDisplayStore(None)
+    saved = store.save(scan())
+    saved['adaptive']['dailyAssessment']['version'] = 'king-daily-primary-v2'
+    store.path.write_text(json.dumps(saved), encoding='utf-8')
+    before = store.path.read_bytes()
+    assert LocalPicksDisplayStore(None).read() == saved
+    assert store.path.read_bytes() == before
+    assert not displayable_run(saved['adaptive'])
+    with pytest.raises(ValueError):
+        store.save(saved['adaptive'])  # A fresh publication must use the current version.
+
+
+def test_unknown_daily_version_is_rejected_even_on_historical_reads(tmp_path, monkeypatch):
+    monkeypatch.setenv('YAO_SCOUT_DATA_DIR', str(tmp_path))
+    store = LocalPicksDisplayStore(None)
+    saved = store.save(scan())
+    saved['adaptive']['dailyAssessment']['version'] = 'king-daily-primary-future'
+    store.path.write_text(json.dumps(saved), encoding='utf-8')
+    assert store.read() == {}
+    assert not displayable_run(saved['adaptive'], historical=True)
+    with pytest.raises(ValueError):
+        store.save(saved['adaptive'], source='migration')
+
+
+@pytest.mark.parametrize('version', [VERSION, 'king-daily-primary-v2'])
+def test_sql_history_header_restores_daily_branch_without_loading_rejected_payloads(tmp_path, monkeypatch, version):
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
     from src.storage import DatabaseManager, YaoRun
@@ -101,15 +128,18 @@ def test_sql_history_header_restores_daily_branch_without_loading_rejected_paylo
     db = object.__new__(DatabaseManager)
     db._initialized, db._SessionLocal = True, sessionmaker(bind=engine)
     valid = scan()
+    valid['dailyAssessment']['version'] = version
     missing = scan(minute=31)
     missing['dailyAssessment']['dailyUsableCount'] = 0
     stale = scan(minute=32)
     stale['dailyAssessment']['baselineAsOf'] = '2026-10-14'
+    unknown = scan(minute=33)
+    unknown['dailyAssessment']['version'] = 'king-daily-primary-future'
     rows = [{'run_id': row['run_id'], 'mode': 'king_live', 'status': row['status'],
              'as_of_at': datetime.fromisoformat(row['generatedAt']).replace(tzinfo=None),
              'cutoff_at': datetime.fromisoformat(row['generatedAt']).replace(tzinfo=None),
              'model_version': 'fixture', 'result_json': json.dumps(row)}
-            for row in (valid, missing, stale)]
+            for row in (valid, missing, stale, unknown)]
     try:
         with engine.begin() as connection:
             connection.execute(YaoRun.__table__.insert(), rows)
@@ -118,7 +148,8 @@ def test_sql_history_header_restores_daily_branch_without_loading_rejected_paylo
         assert header['primarySelectionMode'] == 'daily_conditional'
         assert header['primaryObjective'] == TASK_ID
         assert header['dailyAssessment'] == valid['dailyAssessment']
-        assert displayable_run(header)
+        assert displayable_run(header, historical=True)
+        assert displayable_run(header) is (version == VERSION)
         reads, get_run = [], db.get_yao_run
         def fetch(run_id):
             reads.append(run_id)
