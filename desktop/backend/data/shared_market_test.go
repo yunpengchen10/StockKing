@@ -6,7 +6,23 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/bensema/gotdx/proto"
 )
+
+func TestMACFractionalLotsSurviveShareNormalization(t *testing.T) {
+	rows := convertMACSymbolBar([]proto.MACSymbolBar{{
+		Open: 116.05, High: 116.05, Low: 116.05, Close: 116.05,
+		Vol: 12.8, Amount: 148544,
+	}})
+	if rows[0].Volume != "12.8" {
+		t.Fatalf("fractional lots were rounded before unit conversion: %s", rows[0].Volume)
+	}
+	normalizeSharedVolume(&KLineSourceResult{Data: &rows, Source: "tdx-mac"}, "1")
+	if rows[0].Volume != "1280" || rows[0].Amount != "148544.00" {
+		t.Fatalf("odd-lot volume/amount corrupted: %+v", rows[0])
+	}
+}
 
 func TestSharedMarketNormalizesUnitsAndPreservesUnknownAmount(t *testing.T) {
 	for _, source := range []string{"tdx-mac", "eastmoney", "sina", "tencent"} {

@@ -37,6 +37,51 @@ def anchor(price=4.5):
             'open':price, 'close':price, 'high':price+.01, 'low':price-.01}
 
 
+def test_existing_archive_gets_indexed_anchor_lookup_without_rewriting_data(tmp_path):
+    archive = minute.MinuteArchive(tmp_path)
+    archive.save(CODE, bars(), NOW, verification=anchor())
+    with archive.connect() as db:
+        db.execute('DROP INDEX idx_session_evidence_code_day_kind')
+        before = db.execute('SELECT payload FROM sessions WHERE code=? AND day=?', (CODE, DAY)).fetchone()[0]
+        evidence = db.execute('SELECT evidence_id FROM session_evidence ORDER BY evidence_id').fetchall()
+    minute.MinuteArchive(tmp_path)
+    with archive.connect() as db:
+        plan = db.execute("EXPLAIN QUERY PLAN SELECT s.code,s.day,s.metadata_json FROM session_evidence s "
+            "WHERE s.kind='independent_price_anchor' AND s.code=? AND s.day IN (?)", (CODE, DAY)).fetchall()
+        assert any('SEARCH' in row[3] and 'idx_session_evidence_code_day_kind' in row[3] for row in plan)
+        assert db.execute('SELECT payload FROM sessions WHERE code=? AND day=?', (CODE, DAY)).fetchone()[0] == before
+        assert db.execute('SELECT evidence_id FROM session_evidence ORDER BY evidence_id').fetchall() == evidence
+
+
+def test_batched_validation_reuses_sessions_but_checks_each_prefix_and_revision(tmp_path, monkeypatch):
+    from src.services.yao_scout import minute_integrity as integrity
+    archive = minute.MinuteArchive(tmp_path)
+    archive.save(CODE, bars(), NOW, verification=anchor())
+    other_day = '2026-10-09'
+    other_rows = [{**row, 'end':row['end'].replace(DAY, other_day)} for row in bars()]
+    archive.save(CODE, other_rows, NOW, verification={**anchor(), 'day':other_day})
+    prefixes = [minute.read_archive_lineage(tmp_path, CODE, [DAY], cutoff=bars()[59]['end']),
+                minute.read_archive_lineage(tmp_path, CODE, [DAY]),
+                minute.read_archive_lineage(tmp_path, CODE, [other_day])]
+    lineage = {'data_quality_version':integrity.DATA_QUALITY_VERSION,
+               'sessions':[part['sessions'][0] for part in prefixes]}
+    original = integrity._read_archive_records
+    reads = []
+    def counted(*args, **kwargs):
+        reads.append((args[1], set(args[2])))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(integrity, '_read_archive_records', counted)
+    checked = integrity.validate_archive_dependencies(tmp_path, lineage)
+    assert len(reads) == 1 and reads[0] == (CODE, {DAY, other_day})
+    assert all(item['valid'] for item in checked)
+    assert [item['sessions'] for item in checked] == [part['sessions'] for part in prefixes]
+    corrupt = {**lineage, 'sessions':[dict(row) for row in lineage['sessions']]}
+    corrupt['sessions'][1]['revision'] = 'wrong_revision'
+    assert [item['valid'] for item in integrity.validate_archive_dependencies(tmp_path, corrupt)] == [True, False, True]
+    archive.quarantine(CODE, DAY, 'independent_review_conflict')
+    assert [item['valid'] for item in integrity.validate_archive_dependencies(tmp_path, lineage)] == [False, False, True]
+
+
 def test_mismatched_security_is_quarantined_and_raw_evidence_retained(tmp_path):
     archive = minute.MinuteArchive(tmp_path)
     rows = [{**row, 'identity_evidence':identity('001336')} for row in bars()]

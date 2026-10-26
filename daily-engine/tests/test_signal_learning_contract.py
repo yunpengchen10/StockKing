@@ -56,6 +56,7 @@ def artifact(version, contract=None):
             'algorithmContractId':contract or algorithm_contract()['contractId'],
             'features':['finalScore'],'medians':[50], 'netRegressor':'fixture', 'tailRegressor':'fixture',
             'eventClassifier':'fixture','calibrationCoef':1.,'calibrationIntercept':0.,'riskCoefficient':1,
+            'mainProbabilityTarget':'net_return_strictly_positive','trainingWinPrevalence':.5,
             'ridgeCoef':[.01,0], 'ridgeIntercept':0., 'trainingPrevalence':.1, 'trainingMeanReturn':0.,
             'dataLineage':{'sessions':[{'code':'000001','day':DAY.isoformat(),'revision':'fixture'}]},
             'logisticMean':[0,0], 'logisticScale':[1,1], 'logisticCoef':[1,0], 'logisticIntercept':0}
@@ -65,6 +66,8 @@ def fixture_predictions(model, rows):
     n = len(rows)
     return {'rank':np.arange(n,dtype=float)+70,'baselineRank':np.full(n,50.),
             'net':np.full(n,.07),'tail':np.full(n,-.01),'probability':np.full(n,.7),
+            'winProbability':np.full(n,.8),'targetReturnProbability':np.full(n,.7),
+            'targetReturnProbabilityAvailable':np.ones(n,dtype=bool),
             'utility':np.full(n,.06),'eligible':np.ones(n,dtype=bool)}
 
 
@@ -143,6 +146,33 @@ def test_live_ranking_and_saved_provenance_use_only_shared_eligible_rows(tmp_pat
     assert signals[0]['snapshot']['priceHistoricalCoverageDays'] == 20
     assert signals[0]['trainingEligible']
     assert not signals[1]['trainingEligible']
+
+
+@pytest.mark.parametrize('failure_code', [1, 2, 3, 4, 5])
+def test_auxiliary_prediction_failure_does_not_claim_current_availability_or_block_win_head(tmp_path, monkeypatch, failure_code):
+    service = SignalLearningService(tmp_path, clock=lambda: _clock(DAY))
+    model = {**artifact('model'), 'targetReturnProbabilityValidated': True,
+             'targetReturnModelStatus': 'out_of_time_validated'}
+    with service._connect() as db:
+        db.execute('INSERT INTO model_versions VALUES(?,?,?,?,?)',
+                   ('model', 'active', json.dumps(model), json.dumps({'passed': True}), _clock(DAY).isoformat()))
+    service._save_registry({'championVersion': 'model'}, _clock(DAY))
+    def predictions(model, rows):
+        result = fixture_predictions(model, rows)
+        result.update(targetReturnProbability=np.full(len(rows), np.nan),
+                      targetReturnProbabilityAvailable=np.zeros(len(rows), dtype=bool),
+                      targetReturnProbabilityFailureCode=np.full(len(rows), failure_code))
+        return result
+    monkeypatch.setattr(task_learning, 'lineage_valid', lambda *_: True)
+    monkeypatch.setattr(task_learning, 'predict_model', predictions)
+    ranked = service.rank_candidates([_candidate('000001', DAY)])
+    prediction = ranked[0]['prediction']
+    assert prediction['status'] == 'active' and prediction['entryEligible'] is True
+    assert prediction['winProbability'] == .8
+    assert prediction['bigMoveProbability'] is None and prediction['targetReturnProbability'] is None
+    assert prediction['targetReturnProbabilityStatus'] == 'optional_prediction_unavailable'
+    assert prediction['targetReturnProbabilityFailureCode'] == failure_code
+    assert prediction['targetReturnProbabilityFailureReason'] == task_learning.TARGET_HEAD_FAILURE_REASONS[failure_code]
 
 
 def test_account_baseline_uses_saved_selection_rank_and_model_ties_use_live_order():

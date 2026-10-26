@@ -1,4 +1,5 @@
 from copy import deepcopy
+import pytest
 
 from src.services.yao_scout.admission_diagnostics import build_admission_diagnostics
 from src.services.yao_scout.precision_policy import evaluate
@@ -67,3 +68,54 @@ def test_missing_active_classification_remains_a_data_failure():
     result = build_admission_diagnostics([row], [], {})
     assert result['status'] == 'data_incomplete'
     assert '主动资金分类未通过1/1' in result['summary']
+
+
+def test_afternoon_window_warmup_is_not_reported_as_missing_twenty_days():
+    row = ready()
+    row.update(baselineHistoryDays=0, priceHistoricalCoverageDays=0,
+        baselineEvidence={'baselineStatus':'session_warmup', 'sessionWindow':{
+            'baselineReadyAt':'2026-09-14T13:04:00+08:00',
+            'price5mReadyAt':'2026-09-14T13:06:00+08:00'}})
+    result = build_admission_diagnostics([row], [], {})
+    history = next(check for check in result['checks'] if check['key']=='history')
+    assert history['pending'] == 1 and history['blocked'] == history['passed'] == 0
+    assert result['status'] == 'session_warmup'
+    assert result['sessionWarmupCount'] == 1
+    assert '不能据此判定历史缺失' in result['summary']
+
+
+@pytest.mark.parametrize('baseline', [
+    {'baselineStatus':'current_minutes_unavailable'},
+    {'baselineStatus':'current_minutes_stale'},
+    {'baselineStatus':'current_window_unavailable'},
+    {'baselineStatus':'ready', 'sessionWindow':{'price5mWindowElapsed':False}},
+])
+def test_incomplete_current_window_is_never_reported_as_passed(baseline):
+    row = ready()
+    row['baselineEvidence'] = baseline
+    result = build_admission_diagnostics([row], [], {})
+    check = next(check for check in result['checks'] if check['key']=='current_window')
+    assert check['passed'] == 0 and check['blocked'] == 1
+
+
+def test_current_collection_timeout_does_not_claim_twenty_days_of_history_missing():
+    row = ready()
+    row.update(baselineHistoryDays=0, priceHistoricalCoverageDays=0,
+        baselineEvidence={'baselineStatus':'current_minutes_unavailable'})
+    row['primaryAdmission']['missingReasons'] = ['minute_window_missing_future_or_stale']
+    result = build_admission_diagnostics([row], [], {})
+    history = next(check for check in result['checks'] if check['key']=='history')
+    assert (history['passed'], history['blocked'], history['pending']) == (0, 0, 1)
+    assert result['currentMinuteUnavailableCount'] == 1
+    assert result['status'] == 'data_incomplete'
+    assert '当前分钟未采集齐' in result['summary']
+    assert '历史基准待核验' in history['pendingReason']
+
+
+def test_actual_historical_gap_is_still_blocked():
+    row = ready()
+    row.update(baselineHistoryDays=19, priceHistoricalCoverageDays=19,
+        baselineEvidence={'baselineStatus':'missing_history'})
+    result = build_admission_diagnostics([row], [], {})
+    history = next(check for check in result['checks'] if check['key']=='history')
+    assert (history['passed'], history['blocked'], history['pending']) == (0, 1, 0)

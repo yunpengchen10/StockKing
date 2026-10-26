@@ -167,7 +167,37 @@ def score_v11(candidate, minute, *, now=None):
     base['invalidationConditions'] = list(candidate.get('invalidations') or [])
     base['tradability'] = {'status': 'unverified', 'firstTradablePrice': None,
                             'reason': '未验证盘口排队和实际成交'}
+    quote = candidate.get('quote') or {}
+    # L is a current order-book observation, never a verified executable fill.
+    book = quote.get('order_book') or (quote.get('public_quote_metadata') or {}).get('order_book') or {}
+    asks, bids = book.get('asks') or [],book.get('bids') or []
+    tradability_score = None
+    if asks and bids and quote.get('quote_usable_for_current_price_check') is not False:
+        ask_price = _number(asks[0].get('price'))
+        bid_price = _number(bids[0].get('price'))
+        depth = sum((_number(row.get('price')) or 0)*(_number(row.get('volume_shares')) or 0)
+                    for row in asks)
+        try:
+            book_at = datetime.fromisoformat(book.get('source_time') or '')
+            book_fresh = now is None or (book_at.tzinfo is not None and
+                                         0 <= (now-book_at).total_seconds() <= DEFAULT_PARAMETERS['freshness']['quoteSeconds'])
+        except (TypeError,ValueError):
+            book_fresh = False
+        if book_fresh and ask_price and bid_price and ask_price >= bid_price > 0 and depth > 0:
+            spread_pct = (ask_price-bid_price)/((ask_price+bid_price)/2)*100
+            tradability_score = _clamp(PARAMS['bookDepthWeight']*_clamp(PARAMS['centre']+PARAMS['bookDepthLogScale']*math.log10(depth/PARAMS['bookDepthReferenceCny']))
+                                       +PARAMS['bookSpreadWeight']*_clamp(PARAMS['maximum']-PARAMS['bookSpreadScale']*spread_pct))
+            base['tradability'] = {'status':'order_book_observed',
+                'estimatedAskPrice':ask_price,'askDepthNotionalCny':round(depth,2),
+                'bidAskSpreadPct':round(spread_pct,4),'sourceTime':book.get('source_time'),
+                'firstTradablePrice':None,'executionVerified':False}
     if status == 'insufficient':
+        # Current book evidence does not depend on a historical baseline.
+        # Preserve it while leaving aggregate scores and admission unavailable.
+        base['tradabilityScore'] = tradability_score
+        base['factorScores']['L'] = tradability_score
+        if tradability_score is not None:
+            base['missingFactors'].remove('L')
         return base
     evidence = _evidence_values(candidate)
     price = _number(candidate.get('referencePrice'))
@@ -232,29 +262,6 @@ def score_v11(candidate, minute, *, now=None):
     turnover_score = (_clamp(PARAMS['centre'] + PARAMS['ratioScale']*(turnover_ratio-1)) if turnover_ratio is not None
                       and r3 is not None and r3 > 0 else
                       _clamp(PARAMS['centre'] - PARAMS['ratioScale']*(turnover_ratio-1)) if turnover_ratio is not None and r3 is not None else None)
-    # L is a current order-book observation, never a verified executable fill.
-    book = quote.get('order_book') or (quote.get('public_quote_metadata') or {}).get('order_book') or {}
-    asks, bids = book.get('asks') or [],book.get('bids') or []
-    tradability_score = None
-    if asks and bids and quote.get('quote_usable_for_current_price_check') is not False:
-        ask_price = _number(asks[0].get('price'))
-        bid_price = _number(bids[0].get('price'))
-        depth = sum((_number(row.get('price')) or 0)*(_number(row.get('volume_shares')) or 0)
-                    for row in asks)
-        try:
-            book_at = datetime.fromisoformat(book.get('source_time') or '')
-            book_fresh = now is None or (book_at.tzinfo is not None and
-                                         0 <= (now-book_at).total_seconds() <= DEFAULT_PARAMETERS['freshness']['quoteSeconds'])
-        except (TypeError,ValueError):
-            book_fresh = False
-        if book_fresh and ask_price and bid_price and ask_price >= bid_price > 0 and depth > 0:
-            spread_pct = (ask_price-bid_price)/((ask_price+bid_price)/2)*100
-            tradability_score = _clamp(PARAMS['bookDepthWeight']*_clamp(PARAMS['centre']+PARAMS['bookDepthLogScale']*math.log10(depth/PARAMS['bookDepthReferenceCny']))
-                                       +PARAMS['bookSpreadWeight']*_clamp(PARAMS['maximum']-PARAMS['bookSpreadScale']*spread_pct))
-            base['tradability'] = {'status':'order_book_observed',
-                'estimatedAskPrice':ask_price,'askDepthNotionalCny':round(depth,2),
-                'bidAskSpreadPct':round(spread_pct,4),'sourceTime':book.get('source_time'),
-                'firstTradablePrice':None,'executionVerified':False}
     factors = {'M': momentum, 'V': volume, 'T': turnover_score, 'F': funds, 'W': vwap_score,
                'S': sector, 'B': breakout, 'C': _research_score(candidate, 'C', cutoff),
                'G': _research_score(candidate, 'G', cutoff), 'L': tradability_score}

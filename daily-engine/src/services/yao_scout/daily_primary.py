@@ -1,4 +1,4 @@
-"""Completed daily-bar conditions, independent of minute models and their ledger.
+"""Daily research observations, independent of formal recommendations and models.
 
 The lane uses downloaded historical daily bars immediately. It never treats a
 daily rule as a calibrated probability, a morning T0 model, or a verified fill.
@@ -14,7 +14,7 @@ from .premarket import _at, _daily_valid, _local, previous_session
 from .precision_policy import execution_quote_data, POLICIES
 from .research_policy import DEFAULT_PARAMETERS
 
-VERSION = 'king-daily-primary-v3'
+VERSION = 'king-daily-primary-v5'
 TASK_ID = 'daily_structure_to_next_session'
 RANK_POLICY = 'equal_percentile_open_return_atr_and_directional_efficiency_then_amount_then_code'
 INTRADAY_DIRECTION_RULE = 'price > pre_close and price > open_price and price > amount / volume'
@@ -25,6 +25,11 @@ INTRADAY_DIRECTION_MEANING = ('同一新鲜报价的价格方向约束，只排�
 def daily_policy_contract():
     return {'version': VERSION, 'taskId': TASK_ID, 'rankingPolicy': RANK_POLICY,
         'validationStatus': 'unvalidated_rules', 'probability': None,
+        'observationOnly': True, 'formalRecommendationAllowed': False,
+        'publicationPolicy': 'daily_research_only_never_fills_formal_recommendation_slots',
+        'selectionMeaning': 'observationSelected marks research display only; selected is always false',
+        'evaluationPolicy': 'separate_daily_forward_observations_not_minute_model_training',
+        'weakMarketPolicy': 'retain_observations_with_risk_warning_never_grant_formal_eligibility',
         'attackWatchlist': 'shadow_only_not_selected_not_training_eligible',
         'directionalEfficiency': '(price-open_price)/(high-low)',
         'openReturnAtr': '(price-open_price)/completed_daily_atr14',
@@ -174,13 +179,15 @@ def _market(evidence, now):
                      and coverage is not None and .8 <= coverage <= 1
                      and universe is not None and universe >= 300
                      and breadth is not None and 0 <= breadth <= 100)
-    blocked = bool(available and (breadth < 50 or packet.get('regime') == 'weak'))
-    return {'status': 'weak_market_veto' if blocked else 'observed_non_weak' if available else 'unavailable',
-            'available': available, 'passed': not blocked if available else None,
+    weak = bool(available and (breadth < 50 or packet.get('regime') == 'weak'))
+    return {'status': 'observed_weak' if weak else 'observed_non_weak' if available else 'unavailable',
+            'available': available, 'passed': True if available else None,
+            'marketRiskState': 'weak' if weak else 'normal' if available else 'unknown',
+            'warnings': ['verified_weak_market_observation_risk'] if weak else [],
             'advancingPct': breadth if available else None,
             'source': packet.get('source') if available else None,
             'asOf': packet.get('asOf') if available else None,
-            'meaning': '有可靠负面广度时否决；缺失时不宣称市场环境已通过'}
+            'meaning': 'passed仅表示广度证据可核验；弱市保留日线观察并标记风险，不能授予正式资格；缺失时市场环境保持未知'}
 
 
 def _limit_evidence_current(quote, now):
@@ -203,18 +210,20 @@ def _limit_evidence_current(quote, now):
 
 def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *, top_n=5,
                            contexts=None, market_evidence=None):
-    """Return independent daily candidates/profiles plus an inspectable gate summary.
+    """Return daily observations/profiles plus an inspectable research gate summary.
 
     ``daily_by_code`` contains packets produced by ``daily_evidence`` from real
     completed, unadjusted daily history. ``contexts`` contains ``for_stock``
     disclosure packets. Minute lineage, minute factors and morning predictions
     are deliberately never read. The caller must keep this task out of the
     minute/morning training ledger and recheck quote freshness at publication.
+    Passing this research screen never grants formal recommendation eligibility.
     """
     now = _local(decision_at)
     market = _market(market_evidence, now)
-    assessment = {'version': VERSION, 'taskId': TASK_ID, 'label': '日线条件推荐',
-        'asOf': now.isoformat(), 'status': 'completed', 'validationStatus': 'unvalidated_rules',
+    assessment = {'version': VERSION, 'taskId': TASK_ID, 'label': '日线观察',
+        'asOf': now.isoformat(), 'status': 'completed_observations', 'validationStatus': 'unvalidated_rules',
+        'observationOnly': True, 'formalEligible': False, 'formalCount': 0, 'observationResearchCount': 0,
         'probability': None, 'horizon': 'next_session', 'minuteDataRequired': False,
         'morningModelRequired': False, 'minuteSectorFundRequired': False,
         'marketBreadth': market, 'dailyUsableCount': 0, 'quoteUsableCount': 0,
@@ -223,8 +232,9 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
                                    'meaning': INTRADAY_DIRECTION_MEANING},
         'eventCoveragePassedCount': 0, 'researchedCount': 0, 'excludedCounts': {},
         'profileExcludedCounts': {}, 'profileQualifiedCounts': {}, 'count': 0,
-        'meaning': '真实已完成日K、当日报价及已披露风险的独立条件筛选；不表示分钟主力确认、上午T0模型通过或上涨概率'}
+        'meaning': '真实已完成日K、当日报价及已披露风险的独立研究筛选；仅作观察，不进入正式推荐，不表示分钟主力确认、上午T0模型通过或上涨概率'}
     result = {'dailyCandidates': [], 'dailyProfileCandidates': {key: [] for key in POLICIES},
+              'dailyObservationResearch': [],
               'dailyAttackWatchlist': [], 'dailyRejectionLedger': [],
               'marketEmotionPanel': {**dict(market_evidence or {}),
                   'evaluatedAt': now.isoformat(), 'decisionAssessment': market},
@@ -244,7 +254,8 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
             continue
         seen.add(code)
         record = {'code': code, 'name': name, 'decisionAt': now.isoformat(),
-                  'state': 'excluded', 'reasons': [], 'profileDecisions': {}}
+                  'state': 'excluded', 'reasons': [], 'profileDecisions': {},
+                  'formalEligible': False, 'observationOnly': True}
         ledger[code] = record
         def reject(*reasons):
             record['reasons'].extend(reasons)
@@ -309,16 +320,15 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
             'quote': quote, 'dailyRankEvidence': rank_evidence, 'intradayDirectionEvidence': direction,
             'breakout20': price > d['high20'],
             'breakout60': price > d['high60'] if d.get('high60') else None,
-            'marketBreadth': market, 'eventAssessment': events,
-            'entryEligible': False, 'executable': False, 'trainingEligible': False,
+            'marketBreadth': market, 'marketRiskState': market['marketRiskState'],
+            'riskFlags': list(market['warnings']), 'eventAssessment': events,
+            'entryEligible': False, 'formalEligible': False, 'observationOnly': True,
+            'selected': False, 'executable': False, 'trainingEligible': False, 'training_eligible': False,
             'probability': None, 'validationStatus': 'unvalidated_rules',
             'resistance': None, 'structureRewardRisk': None,
             'missingConfirmation': ['completed_minute_path', 'aligned_sector_resonance',
                                     'persistent_trading_pressure', 'validated_T1_payoff'],
             'meaning': '未封板的方向性观察，不证明随后涨停；须补齐分钟、板块、资金及T+1证据，不能当成正式推荐'})
-        if market['status'] == 'weak_market_veto':
-            reject('verified_weak_market')
-            continue
         if not d['ma5'] > d['ma10'] > d['ma20'] or price < d['ma20']:
             reject('daily_uptrend_not_confirmed')
             continue
@@ -332,9 +342,12 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
         indicator_keys = ('last_close', 'ma5', 'ma10', 'ma20', 'high20', 'high60', 'low20', 'atr14')
         indicators = [{'key': key, 'label': key, 'value': d.get(key), 'unit': '元', 'source': daily['source'],
                        'asOf': previous, 'status': 'observed' if d.get(key) is not None else 'missing'} for key in indicator_keys]
-        gaps = ['未依赖分钟板块、分钟资金或上午T0模型；其状态不构成本分支确认']
+        missing_confirmation = ['completed_minute_path', 'aligned_sector_resonance',
+                                'persistent_trading_pressure', 'validated_T1_payoff']
+        gaps = ['未核验分钟结构、同窗板块及持续资金方向，仅供日线研究观察，不构成正式推荐']
         if not market['available']:
             gaps.append('全市场广度未取得或未满足时效覆盖要求，市场环境保持未知')
+            missing_confirmation.append('fresh_whole_market_breadth')
         reasons = [f"{int(d['history_sessions'])}个已完成日K截至{previous}，报价前收盘与日线末收盘一致",
                    '现价严格高于前收盘、当日开盘及成交额/成交量计算的当日VWAP',
                    'MA5>MA10>MA20，现价维持MA20上方',
@@ -343,7 +356,9 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
         risk_notes = ['日线条件规则尚未经过概率校准；排序不代表上涨概率',
                       INTRADAY_DIRECTION_MEANING,
                       '按A股T+1约束评估下一交易日；支撑和压力不是保证成交的止损价或收益目标']
-        candidate = {'code': code, 'name': name, 'status': 'daily_conditional', 'stateLabel': '日线条件推荐',
+        if market['marketRiskState'] == 'weak':
+            risk_notes.append('已核验全市场广度偏弱，逆市持续性风险较高；仅保留观察，未获得正式入选资格')
+        candidate = {'code': code, 'name': name, 'status': 'daily_observation', 'stateLabel': '日线观察',
             'strategyBranch': '日线趋势与T+1价格纪律', 'strategyId': TASK_ID,
             'version': VERSION, 'decision_at': now.isoformat(), 'quote': quote,
             'price': price, 'signalPrice': price, 'referencePrice': price,
@@ -357,12 +372,16 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
             'biasMa5Pct': bias, 'atrExtension': extension, 'riskDistance': risk_distance,
             'indicatorEvidence': indicators, 'selectionReasons': reasons, 'reasons': reasons,
             'risks': risk_notes, 'riskFlags': risk_notes, 'dataGaps': gaps, 'eventAssessment': events,
-            'marketBreadth': market, 'entryEligible': True, 'executable': False,
+            'marketBreadth': market, 'marketRiskState': market['marketRiskState'],
+            'entryEligible': False, 'formalEligible': False,
+            'observationOnly': True, 'dailyObservationEligible': True, 'selected': False,
+            'executable': False, 'missingConfirmation': missing_confirmation,
             'validationStatus': 'unvalidated_rules', 'probability': None, 'probabilities': {}, 'confidence': None,
             'horizon': '下一交易日（T+1）', 'horizonId': 'next_session',
             'minuteModelTrainingEligible': False, 'trainingEligible': False, 'training_eligible': False,
             'rankMeaning': '方向效率与ATR标准化开盘后涨幅的截面名次各占一半，成交金额只作同分项；等权为待验证基线，不是上涨概率',
             'dailySignal': {'version': VERSION, 'taskId': TASK_ID, 'horizon': 'next_session',
+                'selected': False, 'formalEligible': False, 'observationOnly': True,
                 'validationStatus': 'unvalidated_rules', 'probability': None, 'minuteDataRequired': False,
                 'morningModelRequired': False, 'trainingEligibleAtSignal': False},
             'executionQuoteData': execution}
@@ -377,30 +396,40 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
                 blocked.append('known_large_unlock')
             if rule.require_financial_quality and not events['positiveOperatingCashFlow']:
                 blocked.append('known_nonpositive_operating_cash_flow')
-            decisions[key] = {'label': rule.label, 'entryEligible': not blocked,
-                              'state': 'avoid' if blocked else 'conditional', 'reasons': blocked}
+            decisions[key] = {'label': rule.label, 'observationEligible': not blocked,
+                              'entryEligible': False, 'formalEligible': False, 'observationOnly': True,
+                              'selected': False, 'observationSelected': False,
+                              'state': 'avoid' if blocked else 'observation', 'reasons': blocked}
             profile_excluded[key].update(blocked)
         candidate['dailyProfileDecision'] = decisions
         record['profileDecisions'] = decisions
-        record['state'] = 'qualified_below_top_n' if decisions['regular']['entryEligible'] else 'profile_rejected'
+        record['state'] = 'observation_below_top_n' if decisions['regular']['observationEligible'] else 'profile_rejected'
         record['reasons'] = list(decisions['regular']['reasons'])
         for key in POLICIES:
-            if decisions[key]['entryEligible']:
+            if decisions[key]['observationEligible']:
                 profiles[key].append(candidate)
     limit = max(0, min(5, int(top_n)))
     for key, candidates in profiles.items():
         candidates = _rank_candidates(candidates)
         for rank, row in enumerate(candidates, 1):
             decision = ledger[row['code']]['profileDecisions'][key]
-            decision.update(rank=rank, selected=rank <= limit,
+            decision.update(rank=rank, selected=False, observationSelected=rank <= limit,
                             rankEvidence=dict(row['dailyRankEvidence']))
         result['dailyProfileCandidates'][key] = [{**row, 'rank': rank, 'riskProfile': key}
                                                 for rank, row in enumerate(candidates[:limit], 1)]
     result['dailyCandidates'] = result['dailyProfileCandidates']['regular']
+    observed_codes = {row['code'] for row in result['dailyCandidates']}
+    research = {row['code']: row for rows in profiles.values() for row in rows}
+    result['dailyObservationResearch'] = [{**row, 'observationRank': rank}
+        for rank, row in enumerate(_rank_candidates(list(research.values())), 1)]
+    for rows in [result['dailyObservationResearch'], *result['dailyProfileCandidates'].values()]:
+        for row in rows:
+            row['observationSelected'] = row['code'] in observed_codes
+            row['dailySignal'] = {**row['dailySignal'], 'observationSelected': row['observationSelected']}
     for row in result['dailyCandidates']:
-        ledger[row['code']]['state'] = 'selected_regular'
+        ledger[row['code']]['state'] = 'observed_regular'
     assessment['attackObservedCount'] = len(attacks)
-    attacks = _rank_candidates([row for row in attacks if ledger[row['code']]['state'] != 'selected_regular'])
+    attacks = _rank_candidates([row for row in attacks if ledger[row['code']]['state'] != 'observed_regular'])
     result['dailyAttackWatchlist'] = [{**row, 'rank': rank,
         'dailyPrimaryState': ledger[row['code']]['state'],
         'dailyPrimaryReasons': ledger[row['code']]['reasons']}
@@ -412,9 +441,10 @@ def build_daily_candidates(queued, daily_by_code, quotes_by_code, decision_at, *
     assessment.update(researchedCount=len(seen), excludedCounts=dict(excluded),
         profileExcludedCounts={key: dict(value) for key, value in profile_excluded.items()},
         profileQualifiedCounts={key: len(value) for key, value in profiles.items()},
+        observationResearchCount=len(result['dailyObservationResearch']),
         count=len(result['dailyCandidates']))
     if not result['dailyCandidates']:
         assessment['status'] = 'no_daily_candidates'
-    assessment['message'] = (f"日线条件推荐{assessment['count']}只；可用日K {assessment['dailyUsableCount']}/{len(seen)}只，"
+    assessment['message'] = (f"日线观察{assessment['count']}只，正式推荐0只；可用日K {assessment['dailyUsableCount']}/{len(seen)}只，"
                              f"日线与新鲜报价核验{assessment['quoteUsableCount']}只，事件风险覆盖通过{assessment['eventCoveragePassedCount']}只。")
     return result

@@ -19,6 +19,37 @@ def session(day, *, source='software', amount=1000):
             for start in starts for index in range(120)]
 
 
+@pytest.mark.parametrize('clock,warmup,history,price', [
+    ('13:01', True, 0, 0), ('13:03', True, 20, 0),
+    ('13:04', False, 20, 20), ('13:06', False, 20, 20)])
+def test_afternoon_warmup_is_not_reported_as_lost_history(clock, warmup, history, price):
+    dates = [f'2026-09-{day:02d}' for day in range(1, 21)]
+    cutoff = minute._datetime('2026-10-09T'+clock+':00+08:00')
+    rows = session('2026-10-09') + [row for day in dates for row in session(day)]
+    result = minute.compute_bar_evidence(rows, cutoff, expected_dates=dates)
+    assert result['historyDays'] == history and result['priceHistoryDays'] == price
+    assert result['baselineStatus'] == ('session_warmup' if warmup else 'ready')
+    assert result['missingHistoryDates'] == []
+    if warmup:
+        assert any('预热' in gap for gap in result['gaps'])
+        assert not any('同刻20日分钟基准未就绪' in gap for gap in result['gaps'])
+    if clock < '13:06':
+        assert result['metrics']['speed_5m_pct'] is None
+    else:
+        assert result['metrics']['speed_5m_pct'] == 0
+
+
+def test_real_missing_afternoon_history_remains_a_gap_after_warmup():
+    dates = [f'2026-09-{day:02d}' for day in range(1, 21)]
+    cutoff = minute._datetime('2026-10-09T13:06:00+08:00')
+    rows = session('2026-10-09') + [row for day in dates for row in session(day)
+        if not (day == dates[0] and row['end'][11:16] == '13:05')]
+    result = minute.compute_bar_evidence(rows, cutoff, expected_dates=dates)
+    assert result['baselineStatus'] == 'missing_history'
+    assert result['historyDays'] == 19 and result['missingHistoryDates'] == dates[:1]
+    assert not result['baselineReady']
+
+
 def test_cross_source_duplicate_enriches_only_compatible_missing_fields():
     original = {**session(DAYS[0])[0], 'amount_cny': None}
     second = {**original, 'source': 'sina', 'amount_cny': 1000}

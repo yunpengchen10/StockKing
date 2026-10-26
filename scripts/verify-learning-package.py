@@ -26,6 +26,8 @@ for suffix in (
     "next_day_watch", "recommendation_evidence", "sector_fund_evidence", "morning_task", "primary_policy",
     "precision_policy", "research_factors", "premarket", "daily_primary", "admission_diagnostics",
     "history_preparation", "history_maintenance", "v11_factors", "trend_evidence",
+    "scan_routing", "daily_observation_outcomes", "daily_observation_queue",
+    "learning_contracts", "entry_execution_policy", "factor_experiments",
 ):
     name = "src.services.yao_scout." + suffix
     frozen = pyz.extract(name)
@@ -40,12 +42,12 @@ for name in ('src.services.software_market', 'src.services.stock_king_display', 
 assert all(checks.values()), checks
 assert max(p.stat().st_mtime for p in (root / "desktop/frontend/src").rglob("*") if p.is_file()) <= desktop.stat().st_mtime
 result = {
-    "version": "2.7.0", "frozenSourceMatches": checks,
+    "version": json.loads((root / "desktop/wails.json").read_text(encoding="utf-8"))["info"]["productVersion"], "frozenSourceMatches": checks,
     "engineSha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
     "desktopSha256": hashlib.sha256(desktop.read_bytes()).hexdigest(),
     "meaning": "Package/source integrity only; not evidence of predictive performance.",
 }
-output = args.output or root / "output/validation/v270-package-integrity.json"
+output = args.output or root / "output/validation/package-integrity.json"
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 print(json.dumps(result, ensure_ascii=False))

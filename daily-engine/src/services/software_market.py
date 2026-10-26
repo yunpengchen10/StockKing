@@ -51,10 +51,23 @@ class SoftwareMarketClient:
 
     def snapshot(self):
         import pandas as pd
+        from .public_market_quotes import TZ
         result = self._request('snapshot', {})
         frame = pd.DataFrame(result.get('items', []))
+        checked = datetime.now(TZ)
+        def fresh(row):
+            try:
+                stamp = datetime.fromisoformat(str(row.get('source_time') or ''))
+                return bool(stamp.tzinfo and 0 <= (checked-stamp).total_seconds() <= 30)
+            except (ValueError, TypeError):
+                return False
+        fresh_count = sum(fresh(row) for row in result.get('items', []))
+        complete = bool(result.get('complete'))
         frame.attrs.update(source='software:go/eastmoney', fetched_at=result.get('fetched_at'),
-                           stale=not result.get('complete', False), complete=bool(result.get('complete')),
+                           stale=not complete or fresh_count != len(frame) or frame.empty,
+                           complete=complete, directory_complete=complete,
+                           selection_fresh_count=fresh_count,
+                           freshness_meaning='provider_row_clock_checked_independently_of_directory_completeness',
                            source_time_meaning=result.get('source_time_meaning'))
         frame.attrs.update({key: result.get(key) for key in ('expected_count','unique_count','received_count','pages')})
         return frame
@@ -108,7 +121,8 @@ class SoftwareMarketClient:
                 except (TypeError, ValueError):
                     continue
                 observations[code] = {key:quote.get(key) for key in (
-                    'code', 'price', 'previous_close', 'high', 'low', 'change_pct',
+                    'code', 'price', 'open', 'previous_close', 'high', 'low', 'change_pct',
+                    'amount_cny', 'volume_shares',
                     'limit_up', 'limit_down', 'source', 'source_time', 'fetched_at')}
         frame['market_quote'] = [observations.get(str(row['code']).zfill(6)) for row in records]
         frame.attrs['market_quote_source'] = 'software:go/' + '+'.join(sorted({

@@ -23,6 +23,7 @@ _VALID_STATUSES = {
     "completed_observations", "no_candidates_with_coverage_limits",
     "completed", "no_qualified_signal",
 }
+_DAILY_OBSERVATION_MODES = {"daily_observation", "mixed_intraday_and_daily_observation"}
 
 
 def _generated_at(run: dict[str, Any]) -> datetime:
@@ -42,20 +43,23 @@ def display_counts(run: dict[str, Any]) -> dict[str, Any]:
     """Count frozen selections, keeping execution and research meanings separate."""
     def codes(key):
         return {str(row.get("code")).split(".")[0].strip() for row in run.get(key) or []
-                if isinstance(row, dict) and row.get("code")}
+                if isinstance(row, dict) and row.get("code") and (key != "candidates" or not (
+                    row.get("observationOnly") is True or row.get("status") == "daily_observation"))}
     trade, watch, continuation = (codes(key) for key in
                                   ("candidates", "nextDayWatchlist", "nextDayContinuationWatchlist"))
     return {
         "displayRunId": run.get("run_id") or run.get("runId"),
         "tradeCandidateCount": len(trade),
-        "dailyCandidateCount": len(trade) if run.get("primarySelectionMode") == "daily_conditional" else 0,
+        "dailyCandidateCount": len(trade) if run.get("primarySelectionMode") == "daily_conditional"
+            else len(codes("dailyCandidates")) if run.get("primarySelectionMode") in _DAILY_OBSERVATION_MODES else 0,
+        "dailyObservationCount": len(codes("dailyCandidates")) if run.get("primarySelectionMode") in _DAILY_OBSERVATION_MODES else 0,
         "nextDayCandidateCount": len(watch),
         "continuationCandidateCount": len(continuation),
         "premarketCandidateCount": len(codes("premarketCandidates")),
         # Preserve legacy counters as recorded; under the primary-admission
         # contract, research observations never inflate recommendation counts.
         "savedRecommendationCount": len(trade) if (run.get('recommendationPolicy')
-            or run.get("primarySelectionMode") == "daily_conditional") else len(trade | watch),
+            or run.get("primarySelectionMode") in _DAILY_OBSERVATION_MODES | {"daily_conditional"}) else len(trade | watch),
     }
 
 
@@ -64,7 +68,7 @@ def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
     run = payload.get("adaptive")
     if not isinstance(run, dict):
         return payload
-    shown = {key: value for key, value in run.items() if key not in {"controls", "windvanes", "morningResearch"}}
+    shown = {key: value for key, value in run.items() if key not in {"controls", "windvanes", "morningResearch", "dailyObservationResearch"}}
     if isinstance(run.get("precisionWatchlist"), list):
         shown["precisionWatchlist"] = []
         for pick in run["precisionWatchlist"]:
@@ -89,9 +93,12 @@ def _daily_assessment_valid(run: dict[str, Any], *, historical: bool = False) ->
     assessment = run.get("dailyAssessment")
     if not isinstance(assessment, dict):
         return False
-    # A frozen v2 scan retains its own evidence and version after an upgrade.
+    # Frozen daily scans retain their own evidence and version after an upgrade.
     # Only history reads accept that known contract; new publications use VERSION.
-    versions = {VERSION, "king-daily-primary-v2"} if historical else {VERSION}
+    versions = {VERSION, "king-daily-primary-v2", "king-daily-primary-v3", "king-daily-primary-v4"} if historical else {VERSION}
+    statuses = {"completed", "no_daily_candidates"}
+    if run.get("primarySelectionMode") in _DAILY_OBSERVATION_MODES:
+        statuses.add("completed_observations")
 
     def period(stamp):
         clock = stamp.time().replace(tzinfo=None)
@@ -106,9 +113,9 @@ def _daily_assessment_valid(run: dict[str, Any], *, historical: bool = False) ->
         generated = _generated_at(run).astimezone(_SHANGHAI_TZ)
         daily, quotes, count = (assessment.get(key) for key in
                                 ("dailyUsableCount", "quoteUsableCount", "count"))
-        return bool(run.get("primaryObjective") == TASK_ID
+        return bool((run.get("primaryObjective") == TASK_ID or run.get("primarySelectionMode") in _DAILY_OBSERVATION_MODES)
             and assessment.get("version") in versions and assessment.get("taskId") == TASK_ID
-            and assessment.get("status") in {"completed", "no_daily_candidates"}
+            and assessment.get("status") in statuses
             and assessment.get("minuteDataRequired") is False
             and all(type(value) is int for value in (daily, quotes, count))
             and daily >= quotes > 0 and 0 <= count <= quotes
@@ -159,6 +166,14 @@ def displayable_run(run: Any, *, historical: bool = False) -> bool:
         # Minute availability cannot veto this independent daily task. The
         # branch label alone is insufficient: its own evidence must be usable.
         return _daily_assessment_valid(run, historical=historical)
+    if run.get("primarySelectionMode") in _DAILY_OBSERVATION_MODES:
+        # A completed daily observation is a valid new snapshot, including a
+        # deliberately empty formal list. Never retain yesterday's formal picks
+        # merely because today's minute/market/sector/fund admission failed.
+        if _daily_assessment_valid(run, historical=historical):
+            return True
+        if not run["candidates"]:
+            return False
     minutes = quality.get("minute_coverage") or {}
     if (minutes.get("requested", 0) > 0 and not minutes.get("usable", 0)
             and not run.get("nextDayWatchlist") and not run.get("nextDayContinuationWatchlist")):
@@ -238,7 +253,7 @@ class LocalPicksDisplayStore:
             minute_missing = minutes.get("requested", 0) > 0 and not minutes.get("usable", 0)
             if run.get('premarketAssessment'):
                 message = '昨夜已完成日线不足或开盘预案窗口已结束，本轮未生成有效预案；已保留上次结果'
-            elif run.get('primarySelectionMode') == 'daily_conditional':
+            elif run.get('primarySelectionMode') in _DAILY_OBSERVATION_MODES | {'daily_conditional'}:
                 message = '本轮日线、当日报价或本时段日线评估尚未核验完成；已保留上次结果'
             elif quote_missing or minute_missing:
                 message = ("本轮全部实时报价缺失或过期，无法核验推荐；已保留上次结果" if quote_missing

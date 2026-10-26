@@ -20,7 +20,7 @@ import requests
 
 from .intraday_evidence import SHANGHAI, _datetime, _prior_sessions
 from .minute_history import (FORMAL_HISTORY_DAYS, MinuteArchive, bounded_fetch_map,
-    fetch_software_bars, minute_coverage, normalize_bars, symbol, window)
+    fetch_software_bars, minute_coverage, normalize_bars, session_window_status, symbol, window)
 from .minute_integrity import inspect_session, read_archive_lineage, session_revision
 
 VERSION = 'verified-history-preparation-v1'
@@ -86,14 +86,25 @@ def _audit(archive, code, days, cutoff):
     clock = min(cutoff.timetz().replace(tzinfo=None), time(15))
     clock = clock.replace(second=0, microsecond=0)
     window_days = []
+    ready_clocks = None
     for day in verified:
         end = datetime.combine(date.fromisoformat(day), clock, SHANGHAI)
         bars = normalize_bars(raw[day], cutoff)
         price, amount = window(bars, end, 4), window(bars, end, 3)
         if price and amount and all(row['amount_cny'] is not None for row in amount):
             window_days.append(day)
+        # Keep the genuine available clocks, not just the clock of this worker.
+        # A small hole elsewhere in a session must not hide all its good windows.
+        day_clocks = set()
+        for at in bars:
+            prices, amounts = window(bars, at, 4), window(bars, at, 3)
+            if prices and amounts and all(row['amount_cny'] is not None for row in amounts):
+                day_clocks.add(at.time().isoformat())
+        ready_clocks = day_clocks if ready_clocks is None else ready_clocks & day_clocks
     return raw, states, {'code': code, 'ready': len(window_days) == FORMAL_HISTORY_DAYS,
         'fullSessionReady': len(complete) == FORMAL_HISTORY_DAYS,
+        'readyClocks': sorted(ready_clocks or []) if len(verified) == FORMAL_HISTORY_DAYS else [],
+        'verifiedDayCount': len(verified), 'sessionWindow': session_window_status(cutoff),
         'completeDays': complete, 'baselineClock': clock.isoformat(), 'windowReadyDays': window_days,
         'verifiedDays': verified, 'missingDays': [day for day in days if day not in raw],
         'incompleteDays': [day for day in days if day in raw and not _complete(raw[day], day, cutoff)],
@@ -210,6 +221,9 @@ def _prepare_code(archive, code, days, cutoff, deadline, *, max_pages, minute_fe
             if at.date().isoformat() in pending and at.date().isoformat() <= target:
                 fetched.setdefault(at.date().isoformat(), []).append(row)
         visited.add(target)
+        # A page may contain many target sessions. Re-requesting those same
+        # partial bytes via another cursor cannot make a missing bar appear.
+        visited.update(fetched)
         conflict_days = {at.date().isoformat() for at in conflicts}
         for day in sorted(fetched):
             if monotonic() >= deadline:
@@ -221,8 +235,19 @@ def _prepare_code(archive, code, days, cutoff, deadline, *, max_pages, minute_fe
                 errors.append({'day': day, 'reason': 'historical_minute_session_conflicting_or_empty'})
                 continue
             if not full:
+                normalized_times = {row['end'] for row in rows}
+                source_times = set()
+                for original in original_days.get(day, []):
+                    label = str(original.get('end', ''))
+                    try:
+                        label = _datetime(label).isoformat()
+                    except (TypeError, ValueError):
+                        pass
+                    source_times.add(label)
                 errors.append({'day': day, 'reason': 'historical_minute_session_incomplete',
-                    'actualMinutes': len(rows), 'missingMinuteTimes': coverage['missingMinuteTimes'],
+                    'actualMinutes': len(rows), 'sourceMinuteCount':len(source_times),
+                    'normalizationRejectedMinuteTimes':sorted(source_times-normalized_times),
+                    'missingMinuteTimes': coverage['missingMinuteTimes'],
                     'missingFields': coverage['missingFields'],
                     'meaning': '真实分钟保留缺口；仅完整同刻窗口可通过正式20日基准'})
             if not anchor or anchor.get('kind') != 'daily_ohlc' or anchor.get('day') != day:
@@ -254,7 +279,11 @@ def _prepare_code(archive, code, days, cutoff, deadline, *, max_pages, minute_fe
                         archive.replace_unknown_session(code, day, rows, cutoff, verification=anchor,
                                         expected_revision=session_revision(code, day, raw[day]))
                     else:
-                        raise ValueError('partial_history_cannot_replace_verified_or_tainted_session')
+                        supplemented = archive.supplement_verified_session(code, day, rows, cutoff,
+                            verification=anchor, expected_revision=session_revision(code, day, raw[day]))
+                        if supplemented.get('unchanged'):
+                            errors.append({'day':day, 'reason':supplemented['reason']})
+                            continue
                 else:
                     written = archive.save(code, rows, cutoff, verification=anchor)
                     if day in written.get('quarantinedDays', []):
@@ -306,6 +335,8 @@ def prepare_history(codes, cutoff, cache_dir, *, timeout=120, max_codes=20,
     def checkpoint(status):
         result.update(status=status, updatedAt=datetime.now(SHANGHAI).isoformat(),
             ready=sum(value.get('ready') is True for value in result['details'].values()),
+            fullSessionReady=sum(value.get('fullSessionReady') is True for value in result['details'].values()),
+            preparedWithUsableClocks=sum(bool(value.get('readyClocks')) for value in result['details'].values()),
             pending=sum(result['details'].get(code, {}).get('ready') is not True for code in codes))
         _write_status(path, result)
     if len(days) != FORMAL_HISTORY_DAYS:

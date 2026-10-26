@@ -211,10 +211,20 @@ export function isDailyPrimaryRun(run = {}) {
 export function isDailyPrimaryPick(pick = {}) {
   return pick.dailySignal?.taskId === 'daily_structure_to_next_session'
 }
+export function isDailyObservationPick(pick = {}) {
+  return pick.status === 'daily_observation' || pick.observationOnly === true || pick.dailySignal?.observationOnly === true
+}
+export function dailyObservationPicks(run = {}, profile = 'regular') {
+  const byProfile = run.dailyProfileCandidates?.[profile]
+  const candidates = Array.isArray(byProfile) ? byProfile : Array.isArray(run.dailyCandidates) ? run.dailyCandidates : []
+  return candidates.filter(pick => isDailyObservationPick(pick)
+    && !['invalidated', 'withdrawn'].includes(pick.dailyCurrentSignalState || pick.dailySignal?.currentSignalState || pick.currentSignalState))
+}
 export function primaryRecommendationPicks(run = {}, profile = 'regular') {
   const byProfile = run.profileCandidates?.[profile]
   const candidates = Array.isArray(byProfile) ? byProfile : Array.isArray(run.candidates) ? run.candidates : []
   return candidates.filter(pick => {
+    if (isDailyObservationPick(pick)) return false
     if (['invalidated', 'withdrawn', 'research'].includes(pick.currentSignalState)) return false
     if (isDailyPrimaryRun(run)) return isDailyPrimaryPick(pick)
       && !['invalidated', 'withdrawn', 'observation'].includes(pick.dailyCurrentSignalState || pick.dailySignal?.currentSignalState)
@@ -223,11 +233,13 @@ export function primaryRecommendationPicks(run = {}, profile = 'regular') {
     // Saved old records keep their original contract. Never promote a research
     // queue, or claim that a missing admission passed the new contract.
     if (!pick.primaryAdmission) return !run.recommendationPolicy
+      && !['daily_observation', 'mixed_intraday_and_daily_observation'].includes(run.primarySelectionMode)
     return pick.primaryAdmission.eligible === true
       && pick.precisionDecision?.profiles?.[profile]?.entryEligible !== false
   })
 }
 export function primaryRecommendationState(pick = {}) {
+  if (isDailyObservationPick(pick)) return '日线观察'
   const savedState = isDailyPrimaryPick(pick) ? pick.dailyCurrentSignalState || pick.dailySignal?.currentSignalState : pick.currentSignalState
   const state = { new: '首次入选', continuing: '持续跟踪', continued: '持续跟踪', invalidated: '已失效', withdrawn: '已撤销', research: '研究观察', observation: '研究观察' }[savedState]
   return state || (isDailyPrimaryPick(pick) ? '日线条件推荐'
@@ -245,11 +257,22 @@ const primaryAdmissionReasonLabels = {
   relative_volume_not_confirmed: '同刻相对成交量尚未确认',
   latest_completed_minute_failed_breakout: '最近完整分钟出现突破失败',
   whole_market_breadth_unavailable_or_stale: '全市场涨跌分布数据缺失、覆盖不足或已过期',
-  weak_market_primary_entries_paused: '市场偏弱，本轮暂停新增主推荐',
+  weak_market_primary_entries_paused: '历史规则记录：市场偏弱，当时暂停新增主推荐',
+  verified_weak_market_reduced_risk_budget: '市场偏弱；满足全部个股条件后，执行弱市减半总风险预算',
+  verified_weak_market_observation_risk: '市场偏弱；保留日线风险观察，未获得正式推荐资格',
 }
 export function primaryAdmissionReasons(reasons = []) {
   return (Array.isArray(reasons) ? reasons : [reasons]).filter(Boolean)
     .map(reason => primaryAdmissionReasonLabels[reason] || reason)
+}
+export function marketBreadthSummary(market = {}) {
+  if (market.available !== true) return '未取得有效广度，市场环境保持未知'
+  if (market.status === 'weak_market_veto') return '历史规则记录：广度偏弱，当时按旧规则否决'
+  if (market.marketRiskState === 'weak' || market.status === 'observed_weak') {
+    return '已核验市场偏弱；日线保留风险观察，正式候选通过全部个股条件后执行弱市减半总风险预算'
+  }
+  if (market.passed === false) return '历史记录显示市场广度条件未通过'
+  return '本轮市场广度已核验，未标记弱市风险'
 }
 export function firstRecommendationEvidence(pick = {}) {
   // Only persisted first-reference fields establish the anchor. Do not fall
@@ -266,6 +289,7 @@ export function signalSelectionLabel(signal = {}) {
   const candidate = signal.snapshot || signal.features?.candidate || signal.candidate || signal.features || signal
   const state = isDailyPrimaryPick(candidate) ? candidate.dailyCurrentSignalState || candidate.dailySignal?.currentSignalState : candidate.currentSignalState
   if (['invalidated', 'withdrawn'].includes(state)) return primaryRecommendationState(candidate)
+  if (isDailyObservationPick(candidate)) return '日线观察'
   return isDailySelection(signal) ? '日线条件推荐' : signal.selected === true ? '交易条件候选' : isNextDaySelection(signal)
     ? nextDay?.queue ? `${nextDayQueueLabel(nextDay)}观察` : '次日观察' : '对照'
 }

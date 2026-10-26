@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from contextlib import closing
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
@@ -52,18 +53,21 @@ def inspect_session(code, day, rows, verification=None):
     """Return reasons, independent verification and identity status, without I/O."""
     reasons = []
     ordered = sorted(rows, key=lambda row: row['end'])
+    identities = []
     for row in ordered:
         if str(row.get('end', ''))[:10] != day:
             reasons.append('session_date_mismatch')
         if row.get('data_quality_status') == 'tainted' or row.get('conflicting_observations'):
             reasons.append('conflicting_source_observations')
         identity = row.get('identity_evidence') or {}
+        matches = identity_matches(row, code)
+        identities.append(matches)
         if identity and ((identity.get('requested_code') and identity['requested_code'] != code)
                          or (identity.get('response_code') and identity['response_code'] != code)):
             reasons.append('security_identity_mismatch')
-        if identity.get('status') == 'provider_reply_checked' and not identity_matches(row, code):
+        if identity.get('status') == 'provider_reply_checked' and not matches:
             reasons.append('security_identity_contract_mismatch')
-    identity_ok = bool(ordered) and all(identity_matches(row, code) for row in ordered)
+    identity_ok = bool(ordered) and all(identities)
     # Within-session discontinuities only: an ex-right overnight gap is not a
     # same-day splice. These thresholds quarantine pending evidence, not reject
     # a legal high-volatility session under an invented exchange price limit.
@@ -106,7 +110,8 @@ def inspect_session(code, day, rows, verification=None):
                       or abs(min(row['low'] for row in covered)-lo) > tolerance)):
                     reasons.append('independent_daily_ohlc_conflict')
                 else:
-                    covered_identity = all(identity_matches(row, code) for row in covered)
+                    covered_identity = identity_ok or all(matches for row, matches in zip(ordered, identities)
+                        if scope is None or datetime.fromisoformat(row['end']) <= scope)
                     verified_through = covered[-1]['end'] if covered_identity else None
                     verified = identity_ok and len(covered) == len(ordered)
             else:
@@ -142,11 +147,11 @@ def _lineage(sessions, missing=False):
             'reasonCodes': sorted(reasons), 'sessions': sessions}
 
 
-def read_archive_lineage(directory, code=None, days=None, *, cutoff=None):
-    """Never creates/changes the archive; legacy days remain explicitly unknown."""
+def _read_archive_records(directory, code=None, days=None):
+    """Load only requested sessions and anchors in one read-only snapshot."""
     path = Path(directory) / 'minute-bars-v2.sqlite3'
     if not path.exists():
-        return _lineage([], missing=True)
+        return [], {}
     conditions, args = [], []
     if code is not None:
         conditions.append('s.code=?')
@@ -154,11 +159,12 @@ def read_archive_lineage(directory, code=None, days=None, *, cutoff=None):
     if days is not None:
         days = sorted({str(day)[:10] for day in days})
         if not days:
-            return _lineage([], missing=True)
+            return [], {}
         conditions.append('s.day IN (' + ','.join('?' for _ in days) + ')')
         args.extend(days)
     where = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
     with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+        db.execute('BEGIN')
         exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_quality'").fetchone()
         query = ('SELECT s.code,s.day,q.revision,q.status,q.reasons_json,s.payload,q.verification_json FROM sessions s '
                  'LEFT JOIN session_quality q ON q.code=s.code AND q.day=s.day' if exists else
@@ -170,45 +176,114 @@ def read_archive_lineage(directory, code=None, days=None, *, cutoff=None):
             anchor_where = " WHERE s.kind='independent_price_anchor'" + (' AND ' + ' AND '.join(conditions) if conditions else '')
             for anchor in db.execute('SELECT s.code,s.day,s.metadata_json FROM session_evidence s' + anchor_where, args):
                 anchors.setdefault((anchor[0],anchor[1]), []).append(json.loads(anchor[2]))
+    return rows, anchors
+
+
+@lru_cache(maxsize=4096)
+def _checked_lineage_session(row, anchor_json, cutoff):
+    """Memoize immutable bytes, including every quarantine/anchor input.
+
+    Callers reread the database first. A changed payload, quality row or anchor
+    therefore cannot inherit an earlier validation, even within the same scan.
+    Only the small serialized lineage result is retained, never mutable rows.
+    """
+    stored = json.loads(zlib.decompress(row[5]))
+    anchors = json.loads(anchor_json)
+    limit = datetime.fromisoformat(str(cutoff)) if cutoff is not None else None
+    prefix = [item for item in stored if limit is None or datetime.fromisoformat(item['end']) <= limit]
+    if not prefix:
+        return None
+    # Dependencies refer to exactly the price prefix known at decision time.
+    # Normal later bars may extend a session without altering old evidence.
+    through = max(item['end'] for item in prefix)
+    evidence = json.loads(row[6]) if row[6] else {}
+    scoped = inspect_session(row[0], row[1], prefix, evidence)
+    # Retain the earliest successful independently observed check for this
+    # exact repair generation and prefix. A later quote cannot rewrite when
+    # this evidence first became knowable to a historical training fold.
+    generation = prefix[0].get('integrity_revision')
+    for anchor in anchors:
+        candidate = anchor.get('verification') or {}
+        if anchor.get('integrityRevision') != generation or not candidate.get('known_at'):
+            continue
+        if scoped['status'] == 'verified' and evidence.get('known_at') and candidate['known_at'] >= evidence['known_at']:
+            continue
+        candidate_quality = inspect_session(row[0], row[1], prefix, candidate)
+        if candidate_quality['status'] == 'verified' and (scoped['status'] != 'verified'
+                or not evidence.get('known_at') or candidate['known_at'] < evidence['known_at']):
+            evidence, scoped = candidate, candidate_quality
+    status = 'tainted' if row[3] == 'tainted' else scoped['status']
+    reasons = json.loads(row[4]) if row[3] == 'tainted' else scoped['reasonCodes']
+    if any(str(item.get('end', ''))[:10] != row[1] for item in stored):
+        status = 'tainted'
+        reasons = sorted(set(reasons + ['session_date_mismatch']))
+    if row[3] is None:
+        legacy = inspect_session(row[0], row[1], stored)
+        if legacy['status'] == 'tainted':
+            status, reasons = 'tainted', legacy['reasonCodes']
+        reasons += ['session_quality_metadata_missing']
+    return json.dumps({'code': row[0], 'day': row[1], 'revision': session_revision(row[0], row[1], prefix),
+                     'archiveRevision':row[2], 'frozenThrough':through,
+                     'verifiedThrough':scoped['verifiedThrough'], 'qualityKnownAt':evidence.get('known_at'),
+                     'verificationLevel':scoped['verificationLevel'], 'status':status, 'reasonCodes':reasons})
+
+
+def _lineage_from_records(rows, anchors, *, cutoff=None):
     sessions = []
     for row in rows:
-        stored = json.loads(zlib.decompress(row[5]))
-        limit = datetime.fromisoformat(str(cutoff)) if cutoff is not None else None
-        prefix = [item for item in stored if limit is None or datetime.fromisoformat(item['end']) <= limit]
-        if not prefix:
-            continue
-        # Dependencies refer to exactly the price prefix known at decision time.
-        # Normal later bars may extend a session without altering old evidence.
-        through = max(item['end'] for item in prefix)
-        evidence = json.loads(row[6]) if row[6] else {}
-        scoped = inspect_session(row[0], row[1], prefix, evidence)
-        # Retain the earliest successful independently observed check for this
-        # exact repair generation and prefix. A later quote cannot rewrite when
-        # this evidence first became knowable to a historical training fold.
-        generation = prefix[0].get('integrity_revision')
-        for anchor in anchors.get((row[0],row[1]), []):
-            candidate = anchor.get('verification') or {}
-            if anchor.get('integrityRevision') != generation or not candidate.get('known_at'):
-                continue
-            candidate_quality = inspect_session(row[0], row[1], prefix, candidate)
-            if candidate_quality['status'] == 'verified' and (scoped['status'] != 'verified'
-                    or not evidence.get('known_at') or candidate['known_at'] < evidence['known_at']):
-                evidence, scoped = candidate, candidate_quality
-        status = 'tainted' if row[3] == 'tainted' else scoped['status']
-        reasons = json.loads(row[4]) if row[3] == 'tainted' else scoped['reasonCodes']
-        if row[3] is None:
-            legacy = inspect_session(row[0], row[1], stored)
-            if legacy['status'] == 'tainted':
-                status, reasons = 'tainted', legacy['reasonCodes']
-            reasons += ['session_quality_metadata_missing']
-        sessions.append({'code': row[0], 'day': row[1], 'revision': session_revision(row[0], row[1], prefix),
-                         'archiveRevision':row[2], 'frozenThrough':through,
-                         'verifiedThrough':scoped['verifiedThrough'], 'qualityKnownAt':evidence.get('known_at'),
-                         'verificationLevel':scoped['verificationLevel'], 'status':status, 'reasonCodes':reasons})
+        # Historical prefixes stop at their own close; today's changing clock
+        # must not evict an unchanged historical validation.
+        end = datetime.fromisoformat(row[1] + 'T15:00:00+08:00')
+        limit = min(datetime.fromisoformat(str(cutoff)), end).isoformat() if cutoff is not None else None
+        checked = _checked_lineage_session(tuple(row), json.dumps(anchors.get((row[0], row[1]), []),
+            sort_keys=True, separators=(',', ':')), limit)
+        if checked:
+            sessions.append(json.loads(checked))
     missing = not sessions or any(row[3] is None for row in rows)
-    if code is not None and days is not None and {row['day'] for row in sessions} != set(days):
-        missing = True
     return _lineage(sessions, missing)
+
+
+def read_archive_lineage(directory, code=None, days=None, *, cutoff=None):
+    """Never creates/changes the archive; legacy days remain explicitly unknown."""
+    days = sorted({str(day)[:10] for day in days}) if days is not None else None
+    rows, anchors = _read_archive_records(directory, code, days)
+    result = _lineage_from_records(rows, anchors, cutoff=cutoff)
+    sessions = result['sessions']
+    if code is not None and days is not None and {row['day'] for row in sessions} != set(days):
+        return _lineage(sessions, True)
+    return result
+
+
+def validate_archive_dependencies(directory, lineage):
+    """Validate every exact prefix, reusing a bounded stock/session snapshot.
+
+    Results follow dependency order so callers can cache each exact revision.
+    No snapshot survives this call or bypasses price/identity/hash validation.
+    """
+    if not isinstance(lineage, dict) or lineage.get('data_quality_version') != DATA_QUALITY_VERSION or not lineage.get('sessions'):
+        return []
+    groups = {}
+    for index, old in enumerate(lineage['sessions']):
+        groups.setdefault(str(old.get('code') or ''), []).append((index, old))
+    checks = [None] * len(lineage['sessions'])
+    for code, dependencies in groups.items():
+        days = {str(old['day'])[:10] for _, old in dependencies if old.get('day')}
+        rows, anchors = _read_archive_records(directory, code, days) if code and days else ([], {})
+        records = {}
+        for row in rows:
+            key = (row[0], row[1])
+            records[key] = row
+        for index, old in dependencies:
+            row = records.get((code, str(old.get('day'))[:10]))
+            state = _lineage_from_records([row] if row else [], anchors,
+                cutoff=old.get('frozenThrough'))
+            invalid = []
+            if len(state['sessions']) != 1 or state['sessions'][0]['revision'] != old.get('revision'):
+                invalid.append('referenced_data_revision_changed_or_missing')
+            if state['status'] != 'verified':
+                invalid.extend(state['reasonCodes'] or ['referenced_data_not_verified'])
+            checks[index] = {**state, 'valid': not invalid, 'validationReasons': invalid}
+    return checks
 
 
 def validate_archive_lineage(directory, lineage):
@@ -216,13 +291,9 @@ def validate_archive_lineage(directory, lineage):
     if not isinstance(lineage, dict) or lineage.get('data_quality_version') != DATA_QUALITY_VERSION or not lineage.get('sessions'):
         return {**_lineage([], True), 'valid': False}
     current, invalid = [], []
-    for old in lineage['sessions']:
-        state = read_archive_lineage(directory, old.get('code'), [old.get('day')], cutoff=old.get('frozenThrough'))
+    for state in validate_archive_dependencies(directory, lineage):
         current.extend(state['sessions'])
-        if len(state['sessions']) != 1 or state['sessions'][0]['revision'] != old.get('revision'):
-            invalid.append('referenced_data_revision_changed_or_missing')
-        if state['status'] != 'verified':
-            invalid.extend(state['reasonCodes'] or ['referenced_data_not_verified'])
+        invalid.extend(state['validationReasons'])
     result = _lineage(current, bool(invalid))
     result['valid'] = not invalid and result['status'] == 'verified'
     if invalid:

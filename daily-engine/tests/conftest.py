@@ -16,10 +16,26 @@ from warnings import warn
 import anyio.to_thread
 import fastapi.testclient
 import httpx
+import pytest
 import starlette.testclient
 from anyio._backends import _asyncio
 
 T = TypeVar("T")
+
+
+@pytest.fixture(autouse=True)
+def isolate_history_maintenance_workers(request, monkeypatch):
+    """A scan fixture must not leave a daemon using later tests' fake providers.
+
+    Maintenance tests explicitly control the worker/thread and exercise the real
+    entry point. Other tests can monkeypatch this no-op when they need to assert
+    scheduling, without ever starting unowned network work.
+    """
+    if request.path.name == 'test_history_maintenance.py':
+        return
+    from src.services.yao_scout import history_maintenance
+    monkeypatch.setattr(history_maintenance, 'start_history_preparation',
+        lambda *a, **k: {'status':'not_started', 'reason':'isolated_unit_test'})
 
 _original_call_soon_threadsafe = asyncio.BaseEventLoop.call_soon_threadsafe
 

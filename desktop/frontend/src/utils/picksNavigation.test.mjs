@@ -6,6 +6,7 @@ import * as vue from 'vue'
 import * as ledger from './pickLedger.mjs'
 import * as recordRead from './recordRead.mjs'
 import * as learningStatus from './learningStatus.mjs'
+import * as recommendationQuality from './recommendationQuality.mjs'
 
 const flush = async () => { for (let n = 0; n < 12; n++) await Promise.resolve(); await vue.nextTick() }
 
@@ -13,7 +14,7 @@ const flush = async () => { for (let n = 0; n < 12; n++) await Promise.resolve()
 function mountLedger(api, initialMode = 'records') {
   const source = readFileSync(new URL('../components/PicksLedger.vue', import.meta.url), 'utf8')
   const { descriptor } = parse(source)
-  const modules = { vue, '../../wailsjs/go/main/App': api, '../utils/pickLedger.mjs': ledger, '../utils/recordRead.mjs': recordRead, '../utils/learningStatus.mjs': learningStatus }
+  const modules = { vue, '../../wailsjs/go/main/App': api, '../utils/pickLedger.mjs': ledger, '../utils/recordRead.mjs': recordRead, '../utils/learningStatus.mjs': learningStatus, '../utils/recommendationQuality.mjs': recommendationQuality }
   const compiled = compileScript(descriptor, { id: 'ledger-persistence-test' }).content
     .replace(/^import\s+(.+?)\s+from\s+['"](.+?)['"];?$/gm, (_, bindings, path) => `const ${bindings.replace(/\bas\b/g, ':')} = modules[${JSON.stringify(path)}]`)
     .replace('export default', 'return')

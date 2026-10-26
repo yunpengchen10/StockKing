@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$InstallDir,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [switch]$Disabled
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,6 +65,9 @@ foreach ($slot in $slots) {
     $shanghaiDate = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTime]::UtcNow, 'China Standard Time').ToString('yyyy-MM-dd')
     $trigger.StartBoundary = "${shanghaiDate}T$($slot.Time):00+08:00"
     $settings = New-ScheduledTaskSettingsSet -Hidden -MultipleInstances IgnoreNew -StartWhenAvailable -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 2) -ExecutionTimeLimit (New-TimeSpan -Minutes 35)
+    # Register disabled atomically; disabling after registration leaves a
+    # StartWhenAvailable window in which a real scan can already launch.
+    if ($Disabled) { $settings.Enabled = $false }
     $userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description 'Stock King V1.1 local engine; Shanghai 09:20 watchlist, 09:40/09:55/10:30/14:55 fresh scans, 15:30 delayed reviews, Friday 15:45 gated learning. No LLM in picks.' -Force | Out-Null

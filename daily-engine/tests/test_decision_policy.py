@@ -17,6 +17,26 @@ def test_weak_market_reduces_actual_allocation_and_keeps_cash():
     assert all(r["portfolioWeight"] == .2 for r in result["candidates"])
 
 
+def test_verified_breadth_risk_cannot_be_overridden_by_an_optimistic_or_missing_emotion_score():
+    for emotion in ('normal', 'hot', 'unknown'):
+        pool = rows(emotion)
+        # One admitted weak-market observation applies the same frozen budget
+        # to the entire cohort, including controls and any reordered selection.
+        pool[-1]['primaryAdmission'] = {'marketRiskState': 'weak'}
+        annotated = annotate_portfolio(pool)
+        assert all(row['portfolioPolicy']['totalExposureCap'] == .5 for row in annotated)
+        assert all(row['portfolioPolicy']['marketRegime'] == 'weak' for row in annotated)
+        assert all(row['portfolioPolicy']['version'] == 'king-portfolio-v2' for row in annotated)
+        result = allocate_portfolio(list(reversed(annotated)))
+        assert result['policy']['plannedExposure'] == .5
+
+
+def test_precision_admission_risk_is_used_before_top_level_annotation():
+    pool = rows('normal')
+    pool[0]['precisionDecision'] = {'primaryAdmission': {'marketRiskState': 'weak'}}
+    assert allocate_portfolio(pool)['policy']['totalExposureCap'] == .5
+
+
 def test_all_controls_keep_caps_and_counterfactual_order_can_be_replayed():
     pool = annotate_portfolio(rows("normal", "同一行业"))
     assert len(pool) == 6

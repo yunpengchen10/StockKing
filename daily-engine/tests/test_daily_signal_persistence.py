@@ -14,6 +14,10 @@ from tests.test_daily_primary import NOW, CODE, run
 def daily_row(at=NOW, price=10.05):
     row = deepcopy(run()['dailyCandidates'][0])
     row.update(decision_at=at.isoformat(), signalPrice=price, referencePrice=price)
+    # These cases exercise the historical v3 publication contract. V4 is a
+    # separate observation-only contract and must never inherit selected=True.
+    row.update(observationOnly=False, formalEligible=True, version='king-daily-primary-v3')
+    row['dailySignal'].update(version='king-daily-primary-v3', selected=True)
     row['quote'].update(price=price, provider_timestamp=at.isoformat())
     return row
 

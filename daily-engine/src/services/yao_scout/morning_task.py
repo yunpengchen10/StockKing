@@ -111,6 +111,7 @@ def morning_signal_state(candidate, previous=None, *, selected=False):
 
 def freeze_morning_signal(candidate, published_at, slot, quality, *, selected, official, previous=None):
     from .task_learning import task_contract
+    from .learning_contracts import frozen_learning_fields
     signal = dict(candidate.get('morningSignal') or {})
     if not signal:
         return None  # Never synthesize a morning task for legacy records.
@@ -132,7 +133,8 @@ def freeze_morning_signal(candidate, published_at, slot, quality, *, selected, o
     state = morning_signal_state(candidate, previous, selected=selected)
     if selected and not state['isRepeatedSignal'] and published:
         state['firstReferenceTime'] = published.isoformat()
-    return {**signal, **state,
+    contracts = frozen_learning_fields(task_contract(MORNING_TASK_ID, queue)) if valid else {}
+    return {**signal, **contracts, **state,
         'publishedAt': published.isoformat() if published else None,
         'referencePrice': reference, 'referenceSourceTime': source.isoformat() if source else None,
         'referenceVerifiedAtPublication': reference_valid,
@@ -290,29 +292,40 @@ def summarize_morning_records(items):
 def morning_dataset(service, now, contract, queue):
     """Keep the entire prospective qualified cohort, including rejected controls."""
     from .local_algorithm import algorithm_contract
+    from .learning_contracts import compatibility, learning_contracts, task_data_compatible
     from .signal_learning import _feature_values
     algorithm_id = algorithm_contract()['contractId']
+    data_contract = learning_contracts(contract)['learningDataContractId']
     with service._connect() as db:
         rows = db.execute("SELECT e.signal_id,e.code,e.decision_at,e.snapshot_json,r.run_id,r.trading_day,"
-            "r.created_at,o.result_json,o.reviewed_at FROM signal_events e JOIN signal_runs r ON r.run_id=e.run_id "
+            "r.created_at,o.result_json,o.reviewed_at,COALESCE(json_extract(r.scan_json,'$.algorithmManifest'),"
+            "json_extract(r.scan_json,'$.result.algorithm')) manifest_json FROM signal_events e JOIN signal_runs r ON r.run_id=e.run_id "
             "LEFT JOIN morning_outcomes o ON o.signal_id=e.signal_id WHERE r.official=1 AND r.trading_day<=? "
-            "AND json_extract(e.snapshot_json,'$.algorithmContractId')=? "
-            "AND json_extract(e.snapshot_json,'$.morningSignal.learningTaskContractId')=? "
+            "AND (json_extract(e.snapshot_json,'$.morningSignal.learningTaskContractId')=? "
+            "OR json_extract(e.snapshot_json,'$.morningSignal.learningDataContractId')=?) "
             "AND json_extract(e.snapshot_json,'$.morningSignal.trainingEligibleAtSignal')=1 "
             "ORDER BY r.trading_day,e.decision_at,e.code",
-            (now.date().isoformat(), algorithm_id, contract['taskContractId'])).fetchall()
-        runs = db.execute("SELECT trading_day,created_at FROM signal_runs WHERE official=1 AND trading_day<=? "
-            "AND json_extract(scan_json,'$.algorithmContractId')=? "
-            "AND json_extract(scan_json,'$.morningTaskContractId')=?",
-            (now.date().isoformat(), algorithm_id, contract['taskContractId'])).fetchall()
+            (now.date().isoformat(), contract['taskContractId'], data_contract)).fetchall()
+        runs = db.execute("SELECT trading_day,created_at,json_extract(scan_json,'$.algorithmContractId') algorithm_id,"
+            "COALESCE(json_extract(scan_json,'$.algorithmManifest'),json_extract(scan_json,'$.result.algorithm')) manifest_json "
+            "FROM signal_runs WHERE official=1 AND trading_day<=? "
+            "AND (json_extract(scan_json,'$.morningTaskContractId')=? OR json_extract(scan_json,'$.morningDataContractId')=?)",
+            (now.date().isoformat(), contract['taskContractId'], data_contract)).fetchall()
     days = sorted({row['trading_day'] for row in runs if timestamp(row['created_at']) <= now
-                   and datetime.fromisoformat(row['trading_day']+'T15:01:00+08:00') <= now})
+                   and datetime.fromisoformat(row['trading_day']+'T15:01:00+08:00') <= now
+                   and compatibility({'algorithmContractId': row['algorithm_id'],
+                       'algorithmManifest': json.loads(row['manifest_json']) if row['manifest_json'] else None}, task_id=MORNING_TASK_ID)['compatible']})
     result = []
     for row in rows:
         if row['trading_day'] not in days:
             continue
         snapshot = json.loads(row['snapshot_json'])
+        audit = compatibility({**snapshot, 'algorithmManifest': json.loads(row['manifest_json']) if row['manifest_json'] else None}, task_id=MORNING_TASK_ID)
+        if not audit['compatible']:
+            continue
         signal = snapshot['morningSignal']
+        if not task_data_compatible(signal, contract):
+            continue
         outcome = json.loads(row['result_json']) if row['result_json'] else {}
         published = timestamp(signal.get('publishedAt'))
         publication_ok = bool(published and published == timestamp(row['created_at']) and published <= now
@@ -335,7 +348,8 @@ def morning_dataset(service, now, contract, queue):
             'baselineSelected': signal.get('ruleBaselineSelected') is True,
             'baselineRank': signal.get('ruleBaselineRank'), 'dataLineage': snapshot.get('dataLineage'),
             'labelDataLineage': outcome.get('dataLineage'), 'labelEndAt': outcome.get('labelEndAt'),
-            'labelKnownAt': row['reviewed_at'], 'outcome': outcome, 'complete': complete}
+            'labelKnownAt': row['reviewed_at'], 'outcome': outcome, 'complete': complete,
+            'contractCompatibility': audit}
         if complete:
             item.update(net=ret, observedMae=mae, eventLabel=int(ret > 0))
         result.append(item)

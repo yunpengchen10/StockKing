@@ -1,10 +1,16 @@
 from datetime import datetime, timedelta
 import json
+import pytest
 
 from src.services.yao_scout import sector_fund_evidence as mod
 
 
 NOW = datetime(2026, 10, 9, 10, 30, tzinfo=mod.SHANGHAI)
+
+
+@pytest.fixture(autouse=True)
+def exercise_legacy_cache_fallback(monkeypatch):
+    monkeypatch.setattr(mod, 'discover_bulk_sectors', lambda *a, **k: ({}, {}))
 
 
 def saved(tmp_path, key, value, at=NOW):

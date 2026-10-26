@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	gotdx "github.com/bensema/gotdx"
 	"github.com/bensema/gotdx/proto"
 	"github.com/bensema/gotdx/types"
 )
@@ -83,11 +82,18 @@ func Collect(page func(uint32, uint16) ([]proto.MACSymbolBar, error), count int,
 	return result, nil
 }
 
-func Fetch(client *gotdx.Client, market uint8, code string, period uint16, count int, adjust uint16, end string) ([]proto.MACSymbolBar, error) {
+// BarClient permits bounded connection pools while retaining the same provider
+// identity, cursor and completed-minute checks for every transport.
+type BarClient interface {
+	ConnectMAC() error
+	GetMACSymbolBars(uint8, string, uint16, uint16, uint32, uint16, uint16) (*proto.MACSymbolBarsReply, error)
+}
+
+func Fetch(client BarClient, market uint8, code string, period uint16, count int, adjust uint16, end string) ([]proto.MACSymbolBar, error) {
 	return FetchContext(context.Background(), client, market, code, period, count, adjust, end)
 }
 
-func FetchContext(ctx context.Context, client *gotdx.Client, market uint8, code string, period uint16, count int, adjust uint16, end string) ([]proto.MACSymbolBar, error) {
+func FetchContext(ctx context.Context, client BarClient, market uint8, code string, period uint16, count int, adjust uint16, end string) ([]proto.MACSymbolBar, error) {
 	// Freeze the cutoff before connecting or reading page 1. A partial minute
 	// from page 1 cannot become completed while subsequent pages are downloaded.
 	if period == types.KLINE_TYPE_1MIN || period == types.KLINE_TYPE_EXHQ_1MIN {

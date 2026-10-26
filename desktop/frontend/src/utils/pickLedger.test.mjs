@@ -2,8 +2,17 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { priceObservationPercent } from './pickLedger.mjs'
-import { primaryRecommendationPicks, primaryRecommendationState, firstRecommendationEvidence } from './pickLedger.mjs'
+import { primaryRecommendationPicks, primaryRecommendationState, firstRecommendationEvidence, dailyObservationPicks, primaryAdmissionReasons, marketBreadthSummary } from './pickLedger.mjs'
 import { groupSignals, ledgerPercent, ledgerPrice, ledgerSigned, reviewStatusLabel, reviewReasonLabel, visibleReviews, reviewProgress, learningEffect, reviewReturn, shanghaiDate, learningProgress, recordQuoteCode, recordQuoteCodes, signalPriceComparison, createRecordQuoteLoader, nextDaySignalOf, isNextDaySelection, signalSelectionLabel, nextDayPatternValue, savedRecommendationSummary, nextDayQueueLabel, nextDayTouchLabel } from './pickLedger.mjs'
+
+test('weak market warnings preserve risk budgets and frozen historical veto meaning', () => {
+  assert.match(primaryAdmissionReasons(['verified_weak_market_reduced_risk_budget'])[0], /全部个股条件.*减半总风险预算/)
+  assert.match(primaryAdmissionReasons(['verified_weak_market_observation_risk'])[0], /未获得正式推荐资格/)
+  assert.match(primaryAdmissionReasons(['weak_market_primary_entries_paused'])[0], /历史规则记录/)
+  assert.match(marketBreadthSummary({ available: true, status: 'observed_weak', marketRiskState: 'weak', passed: true }), /减半总风险预算/)
+  assert.match(marketBreadthSummary({ available: true, status: 'weak_market_veto', passed: false }), /当时按旧规则否决/)
+  assert.match(marketBreadthSummary({ available: false, marketRiskState: 'weak' }), /保持未知/)
+})
 
 test('saved signals group by Shanghai day, stock and version without losing distinct scans', () => {
   const first = { runId:'a', asOf:'2026-09-28T18:00:00Z', slot:'0940', modelVersion:'v1.1', official:true, signals:[{signalId:'s1',code:'600001',selected:true},{signalId:'s2',code:'600002',selected:false}] }
@@ -127,7 +136,7 @@ test('a learning-state failure cannot hide saved reviews or falsely retain an ac
     GetStockKingDelayedReviews: async () => { if (failReviews) throw new Error('复盘连接失败'); return { items: [], nextDayReview: { items: [{ signalId: 'saved', selected: true, status: 'incomplete' }, { signalId: 'control', selected: false, status: 'mature_price_pattern' }] } } },
     GetStockKingLearningState: async () => { if (failLearning) throw new Error('学习连接失败'); return { effectiveRankSource: 'champion', effectiveRankVersion: 'verified' } },
   }
-  const component = new Function('modules', compiled)({ vue, '../../wailsjs/go/main/App': api, '../utils/pickLedger.mjs': await import('./pickLedger.mjs'), '../utils/recordRead.mjs': await import('./recordRead.mjs'), '../utils/learningStatus.mjs': await import('./learningStatus.mjs') })
+  const component = new Function('modules', compiled)({ vue, '../../wailsjs/go/main/App': api, '../utils/pickLedger.mjs': await import('./pickLedger.mjs'), '../utils/recordRead.mjs': await import('./recordRead.mjs'), '../utils/learningStatus.mjs': await import('./learningStatus.mjs'), '../utils/recommendationQuality.mjs': await import('./recommendationQuality.mjs') })
   component.render = () => { instance = vue.getCurrentInstance(); return null }
   const renderer = vue.createRenderer({
     createElement: type => ({ type }), createText: text => ({ text }), createComment: text => ({ text }),
@@ -202,6 +211,22 @@ test('daily recommendations use the independent task and explicit selected-profi
   assert.equal(primaryRecommendationState(daily), '日线条件推荐')
   assert.equal(savedRecommendationSummary(run).saved, 1)
   assert.equal(daily.primaryAdmission, undefined)
+})
+
+test('daily observations cannot enter the primary list even with stale admission flags', () => {
+  const observation = Object.freeze({ code: '600001', status: 'daily_observation', observationOnly: true,
+    entryEligible: false, primaryAdmission: { eligible: true }, dailySignal: { taskId: 'daily_structure_to_next_session' } })
+  const formal = { code: '600002', primaryAdmission: { eligible: true } }
+  const run = { primarySelectionMode: 'mixed_intraday_and_daily_observation', recommendationPolicy: { version: 'v4' },
+    candidates: [formal, observation], dailyCandidates: [observation], dailyProfileCandidates: { regular: [observation], conservative: [] } }
+  assert.deepEqual(primaryRecommendationPicks(run), [formal])
+  assert.deepEqual(dailyObservationPicks(run), [observation])
+  assert.deepEqual(dailyObservationPicks(run, 'conservative'), [])
+  assert.deepEqual(primaryRecommendationPicks({ ...run, candidates: [] }), [])
+  assert.equal(savedRecommendationSummary({ ...run, candidates: [] }).saved, 0)
+  assert.equal(primaryRecommendationState(observation), '日线观察')
+  assert.equal(signalSelectionLabel({ selected: true, snapshot: observation }), '日线观察')
+  assert.deepEqual(dailyObservationPicks({ dailyCandidates: [{ code: '600003', dailySignal: observation.dailySignal }] }), [])
 })
 
 test('a daily marker cannot promote a candidate outside the independently published daily contract', () => {

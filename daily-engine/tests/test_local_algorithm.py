@@ -43,6 +43,19 @@ CONTEXT = {'financials': {'profit': 10000, 'eps': 1, 'cashPerShare': .5},
 DAILY = {'metrics': {'last_close': 9.8, 'ma5': 9.8, 'ma10': 9.7, 'ma20': 9.6, 'atr14': .4}}
 
 
+def _with_validated_entry(candidate):
+    """Only formal-gate cases get execution evidence; shared research stays raw."""
+    from src.services.yao_scout.entry_execution_policy import VERSION
+    return {**candidate, 'prediction': {'taskId': 'entry_today_exit_next_session',
+                'status': 'active', 'entryEligible': True, 'expectedNetReturn': .02,
+                'utility': .01, 'winProbability': .7, 'modelVersion': 'validated-fixture'},
+            'entryExecution': {'version': VERSION, 'priceEligible': True,
+                'minimumPrice': 9.95, 'maximumPrice': 10.05, 'invalidationPrice': 9.8,
+                'triggerAt': '2026-09-24T10:30:20+08:00',
+                'expiresAt': '2026-09-24T10:35:20+08:00', 'targetSession': '2026-09-25',
+                'state': 'ready'}}
+
+
 def test_negative_model_decisions_remain_prospective_training_controls():
     candidate = _eligible_candidate()
     candidate['precisionDecision'] = evaluate(candidate, CONTEXT, DAILY)
@@ -60,7 +73,7 @@ def test_negative_model_decisions_remain_prospective_training_controls():
     ({'factorScores': {'M': 90, 'V': 90, 'W': 90}}, False),
     ({'dataEligibility': {'status': 'observation'}}, False)])
 def test_shared_gate_matches_live_precision_decision(change, expected):
-    candidate = {**_eligible_candidate(), **change}
+    candidate = {**_with_validated_entry(_eligible_candidate()), **change}
     candidate['precisionDecision'] = evaluate(candidate, CONTEXT, DAILY)
     for profile in ('conservative', 'regular', 'aggressive'):
         assert is_entry_eligible(candidate, profile) is expected
@@ -69,7 +82,7 @@ def test_shared_gate_matches_live_precision_decision(change, expected):
 
 
 def test_old_or_incomplete_entry_decision_cannot_qualify_by_score_alone():
-    candidate = {**_eligible_candidate(), 'finalScore': 99, 'precisionDecision': {'version': V11_VERSION,
+    candidate = {**_with_validated_entry(_eligible_candidate()), 'finalScore': 99, 'precisionDecision': {'version': V11_VERSION,
                      'profiles': {'regular': {'entryEligible': True}}}}
     assert is_entry_eligible(candidate)
     old = deepcopy(candidate)
@@ -80,9 +93,16 @@ def test_old_or_incomplete_entry_decision_cannot_qualify_by_score_alone():
 
 
 def test_confidence_is_coverage_and_not_an_extra_probability_threshold():
-    candidate = {**_eligible_candidate(), 'confidence': .2, 'dataConfidence': .2}
+    candidate = {**_with_validated_entry(_eligible_candidate()), 'confidence': .2, 'dataConfidence': .2}
     candidate['precisionDecision'] = evaluate(candidate, CONTEXT, DAILY)
     assert is_entry_eligible(candidate)
+
+
+def test_shared_research_fixture_never_implies_an_active_model_or_entry_plan():
+    candidate = _eligible_candidate()
+    candidate['precisionDecision'] = evaluate(candidate, CONTEXT, DAILY)
+    assert 'prediction' not in candidate and 'entryExecution' not in candidate
+    assert is_research_eligible(candidate) and not is_entry_eligible(candidate)
 
 
 def test_task_label_change_invalidates_parent_algorithm_contract(monkeypatch):

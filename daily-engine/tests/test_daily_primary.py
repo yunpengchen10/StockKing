@@ -1,4 +1,4 @@
-"""Fresh-install daily conditions cannot inherit minute data or model gates."""
+"""Daily observations cannot acquire formal recommendation or minute-model eligibility."""
 from copy import deepcopy
 from datetime import datetime, timedelta
 
@@ -53,12 +53,15 @@ def test_real_downloaded_daily_history_works_with_no_minute_archive_or_ml_model(
                       'morningSignal': {'selectionEligible': False, 'learningStatus': 'rules_unvalidated'},
                       'v11Inputs': {'failed_breakout_risk': 100}})
     row = result['dailyCandidates'][0]
-    assert row['stateLabel'] == '日线条件推荐'
+    assert row['stateLabel'] == '日线观察' and row['status'] == 'daily_observation'
     assert row['dailySignal']['taskId'] == TASK_ID and row['horizonId'] == 'next_session'
     assert row['probability'] is None and row['probabilities'] == {}
     assert row['validationStatus'] == 'unvalidated_rules'
     assert row['minuteModelTrainingEligible'] is False and row['trainingEligible'] is False
-    assert row['entryEligible'] is True and row['executable'] is False
+    assert row['entryEligible'] is False and row['executable'] is False
+    assert row['formalEligible'] is False and row['observationOnly'] is True
+    assert row['dailyObservationEligible'] is True and row['observationSelected'] is True
+    assert row['selected'] is False and row['dailySignal']['selected'] is False
     assert 'morningSignal' not in row and 'dataLineage' not in row and 'scoreVersion' not in row
     assert result['dailyAssessment']['marketBreadth']['passed'] is None
     assert any('环境保持未知' in gap for gap in row['dataGaps'])
@@ -69,7 +72,7 @@ def test_same_fresh_quote_exposes_direction_math_without_inventing_fund_identity
     result = run()
     row = result['dailyCandidates'][0]
     direction = row['intradayDirectionEvidence']
-    assert row['version'] == VERSION == 'king-daily-primary-v3'
+    assert row['version'] == VERSION == 'king-daily-primary-v5'
     assert direction['status'] == 'observed' and direction['passed'] is True
     assert direction['source'] == row['quote']['source']
     assert direction['sourceTime'] == row['quote']['provider_timestamp']
@@ -225,16 +228,88 @@ def test_three_profiles_keep_their_own_declared_unlock_and_cashflow_limits():
     assert profiles['regular'] == [] and len(profiles['aggressive']) == 1
 
 
-def test_known_weak_market_vetoes_but_unavailable_breadth_is_explicitly_unknown():
+def test_known_weak_market_preserves_observations_with_explicit_risk_only():
     market = {'source': 'whole_market_snapshot', 'asOf': NOW.isoformat(),
-              'features': {'source_coverage': 1., 'universe_count': 3000, 'advancing_pct': 40}}
+              'features': {'source_coverage': 1., 'universe_count': 3000, 'advancing_pct': 16.72}}
     result = run(market=market)
-    assert result['dailyCandidates'] == []
-    assert result['dailyAssessment']['excludedCounts']['verified_weak_market'] == 1
+    assert len(result['dailyCandidates']) == 1
+    assert 'verified_weak_market' not in result['dailyAssessment']['excludedCounts']
+    risk = result['dailyAssessment']['marketBreadth']
+    assert risk['status'] == 'observed_weak' and risk['marketRiskState'] == 'weak'
+    assert risk['warnings'] == ['verified_weak_market_observation_risk']
+    row = result['dailyCandidates'][0]
+    assert row['marketRiskState'] == 'weak' and any('广度偏弱' in note for note in row['riskFlags'])
+    assert row['observationOnly'] and not row['selected'] and not row['formalEligible']
+    assert row['dailySignal']['version'] == 'king-daily-primary-v5'
+    assert not row['trainingEligible'] and not row['executable']
     market['features']['advancing_pct'] = 65
     result = run(market=market)
     assert len(result['dailyCandidates']) == 1
     assert result['dailyAssessment']['marketBreadth']['passed'] is True
+
+
+@pytest.mark.parametrize('market_state', ['missing', 'stale', 'uncovered', 'non_weak', 'weak'])
+def test_market_data_never_promotes_daily_observations_to_formal_recommendations(market_state):
+    market = {'source': 'whole_market_snapshot', 'asOf': NOW.isoformat(),
+              'features': {'source_coverage': 1., 'universe_count': 3000, 'advancing_pct': 65}}
+    if market_state == 'missing':
+        market = None
+    elif market_state == 'stale':
+        market['asOf'] = (NOW-timedelta(seconds=301)).isoformat()
+    elif market_state == 'uncovered':
+        market['features']['source_coverage'] = .79
+    elif market_state == 'weak':
+        market['features']['advancing_pct'] = 16.72
+    result = run(market=market)
+    assessment = result['dailyAssessment']
+    assert assessment['formalCount'] == 0 and assessment['observationOnly'] is True
+    assert assessment['policyContract']['formalRecommendationAllowed'] is False
+    assert assessment['marketBreadth']['available'] is (market_state in {'non_weak', 'weak'})
+    assert result['dailyObservationResearch']
+    rows = result['dailyObservationResearch'] + result['dailyCandidates']
+    rows += [row for members in result['dailyProfileCandidates'].values() for row in members]
+    for row in rows:
+        assert row['entryEligible'] is False and row['formalEligible'] is False
+        assert row['selected'] is False and row['dailySignal']['selected'] is False
+        assert row['trainingEligible'] is False and row['minuteModelTrainingEligible'] is False
+        assert row['status'] == 'daily_observation' and row['observationOnly'] is True
+        assert {'aligned_sector_resonance', 'persistent_trading_pressure'} <= set(row['missingConfirmation'])
+        assert ('fresh_whole_market_breadth' in row['missingConfirmation']) is (market_state not in {'non_weak', 'weak'})
+        assert all(profile['entryEligible'] is False and profile['formalEligible'] is False
+                   for profile in row['dailyProfileDecision'].values())
+
+
+def test_weak_market_keeps_profile_risk_limits_and_attack_watchlist_observation_only():
+    market = {'source': 'whole_market_snapshot', 'asOf': NOW.isoformat(),
+              'features': {'source_coverage': 1., 'universe_count': 3000, 'advancing_pct': 16.72}}
+    ctx = context()
+    ctx['unlocks'] = [known(eventDate='2026-09-20', floatRatioPct=6)]
+    result = run(market=market, ctx=ctx)
+    assert result['dailyCandidates'] == []
+    assert len(result['dailyProfileCandidates']['aggressive']) == 1
+    assert result['dailyAssessment']['profileExcludedCounts']['regular']['known_large_unlock'] == 1
+    attack = result['dailyAttackWatchlist'][0]
+    assert attack['marketRiskState'] == 'weak' and attack['riskFlags']
+    assert attack['observationOnly'] and not attack['formalEligible'] and not attack['selected']
+    assert not attack['trainingEligible'] and not attack['executable'] and attack['probability'] is None
+
+
+def test_complete_research_pool_retains_unshown_controls_and_profile_qualification():
+    codes = ['600001', '600002', '600003']
+    contexts = {code: context() for code in codes}
+    contexts['600003']['unlocks'] = [known(eventDate='2026-09-20', floatRatioPct=6)]
+    result = build_daily_candidates([{'code': code, 'name': code} for code in codes],
+        {code: daily() for code in codes}, {code: quote(code=code) for code in codes}, NOW,
+        contexts=contexts, top_n=1)
+    research = {row['code']: row for row in result['dailyObservationResearch']}
+    assert set(research) == set(codes)
+    assert result['dailyAssessment']['observationResearchCount'] == 3
+    assert len(result['dailyCandidates']) == 1 and research['600001']['observationSelected'] is True
+    assert research['600002']['observationSelected'] is False
+    assert research['600002']['dailyProfileDecision']['regular']['observationEligible'] is True
+    assert research['600003']['dailyProfileDecision']['regular']['observationEligible'] is False
+    assert research['600003']['dailyProfileDecision']['aggressive']['observationEligible'] is True
+    assert all(row['formalEligible'] is False and row['selected'] is False for row in research.values())
 
 
 def test_unknown_upside_does_not_receive_an_invented_target_or_bypass_rr():

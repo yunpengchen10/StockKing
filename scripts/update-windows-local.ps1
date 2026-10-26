@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory = $true)][string]$BuiltEngineDir,
     [Parameter(Mandatory = $true)][string]$PythonBin,
     [switch]$BackupConfig,
-    [switch]$NoLaunch
+    [switch]$NoLaunch,
+    [switch]$KeepTasksDisabled
 )
 
 # Local, reversible installer. It never deletes an installation or a database.
@@ -110,7 +111,7 @@ if ($builtExePath.Equals($installedExe, [StringComparison]::OrdinalIgnoreCase) -
 }
 $registerScript = Join-Path $PSScriptRoot 'register-stock-king-tasks.ps1'
 if (-not (Test-Path -LiteralPath $registerScript -PathType Leaf)) { throw 'The task registration script is missing.' }
-foreach ($command in @('Get-ScheduledTask','Export-ScheduledTask','Register-ScheduledTask','Disable-ScheduledTask','Stop-ScheduledTask')) {
+foreach ($command in @('Get-ScheduledTask','Export-ScheduledTask','Register-ScheduledTask','Enable-ScheduledTask','Disable-ScheduledTask','Stop-ScheduledTask')) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) { throw "Required ScheduledTasks command is unavailable: $command" }
 }
 if ([string]::IsNullOrWhiteSpace($env:APPDATA)) { throw 'APPDATA is unavailable; refusing to guess the live database directory.' }
@@ -145,7 +146,7 @@ $manifest = [ordered]@{
     previousEngineExeSha256 = (Get-FileHash -LiteralPath $installedEngineExe -Algorithm SHA256).Hash
     newExeSha256 = (Get-FileHash -LiteralPath $builtExePath -Algorithm SHA256).Hash
     newEngineExeSha256 = (Get-FileHash -LiteralPath (Join-Path $builtEnginePath 'stock_analysis.exe') -Algorithm SHA256).Hash
-    engineFiles = @(); configBackup = $null
+    engineFiles = @(); configBackup = $null; tasksKeptDisabled = [bool]$KeepTasksDisabled
 }
 function Save-Manifest {
     $manifest['updatedAtUtc'] = [DateTime]::UtcNow.ToString('o')
@@ -239,7 +240,7 @@ print(json.dumps(records, ensure_ascii=True))
     Save-Manifest
 
     $tasksTouched = $true
-    & $registerScript -InstallDir $installRoot
+    & $registerScript -InstallDir $installRoot -Disabled
     $taskChecks = @()
     foreach ($expected in $expectedTasks) {
         $task = Get-ScheduledTask -TaskName $expected.Name -ErrorAction Stop
@@ -253,8 +254,19 @@ print(json.dumps(records, ensure_ascii=True))
             throw "Scheduled task does not point to the new installation: $($expected.Name)"
         }
         $previous = @($oldTaskRecords | Where-Object { $_.name -eq $expected.Name })
-        if ($previous.Count -eq 1 -and -not $previous[0].enabled) { Disable-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath | Out-Null }
-        $taskChecks += [pscustomobject]@{ name = $expected.Name; executable = $actionExe; arguments = $action.Arguments; workingDirectory = $action.WorkingDirectory; verifiedAtUtc = [DateTime]::UtcNow.ToString('o') }
+        if ($task.Settings.Enabled) { throw "Task must remain disabled until all checks finish: $($expected.Name)" }
+        $wasEnabled = $previous.Count -eq 1 -and $previous[0].enabled
+        $taskChecks += [pscustomobject]@{ name = $expected.Name; path = $task.TaskPath; executable = $actionExe; arguments = $action.Arguments; workingDirectory = $action.WorkingDirectory; previousEnabled = [bool]$wasEnabled; enabledAfterUpdate = $false; verifiedAtUtc = [DateTime]::UtcNow.ToString('o') }
+    }
+    # Restore only previously enabled tasks, after the complete set is verified.
+    # During maintenance the caller can defer this until database work finishes.
+    if (-not $KeepTasksDisabled) {
+        foreach ($checkedTask in $taskChecks) {
+            if ($checkedTask.previousEnabled) {
+                Enable-ScheduledTask -TaskName $checkedTask.name -TaskPath $checkedTask.path | Out-Null
+                $checkedTask.enabledAfterUpdate = $true
+            }
+        }
     }
     $manifest.tasks = $taskChecks
     $manifest.phase = 'tasks_verified'
@@ -304,7 +316,17 @@ print(json.dumps(records, ensure_ascii=True))
             if ($oldEngineMoved) { Move-InstallItem $oldEngineBackup $installedEngine }
             if ($tasksTouched) {
                 foreach ($record in $oldTaskRecords) {
-                    Register-ScheduledTask -TaskName $record.name -TaskPath $record.path -Xml (Get-Content -LiteralPath $record.xmlPath -Raw) -Force | Out-Null
+                    [xml]$restoreXml = Get-Content -LiteralPath $record.xmlPath -Raw
+                    if ($KeepTasksDisabled) {
+                        $settingsNode = $restoreXml.SelectSingleNode('/*[local-name()="Task"]/*[local-name()="Settings"]')
+                        $enabledNode = $settingsNode.SelectSingleNode('*[local-name()="Enabled"]')
+                        if (-not $enabledNode) {
+                            $enabledNode = $restoreXml.CreateElement('Enabled', $settingsNode.NamespaceURI)
+                            [void]$settingsNode.AppendChild($enabledNode)
+                        }
+                        $enabledNode.InnerText = 'false'
+                    }
+                    Register-ScheduledTask -TaskName $record.name -TaskPath $record.path -Xml $restoreXml.OuterXml -Force | Out-Null
                 }
                 # Newly registered tasks have no previous XML; keep them disabled on failure.
                 foreach ($expected in $expectedTasks) {

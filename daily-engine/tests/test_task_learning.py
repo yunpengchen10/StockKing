@@ -55,6 +55,8 @@ def test_real_heads_fit_calibrate_and_roundtrip_with_missing_indicators():
 def test_task_targets_are_not_interchangeable_or_fake_t_plus_2():
     row = {'net':.06,'eventLabel':0}
     assert learning.class_target(row,learning.ENTRY_TASK_ID) == 1
+    assert learning.class_target({'net': .001},learning.ENTRY_TASK_ID) == 1
+    assert learning.class_target({'net': 0.0},learning.ENTRY_TASK_ID) == 0
     assert learning.class_target(row,learning.NEXT_DAY_TASK_ID) == 0
     first = learning.task_contract(learning.NEXT_DAY_TASK_ID,'first_board')
     continuation = learning.task_contract(learning.NEXT_DAY_TASK_ID,'continuation')
@@ -63,6 +65,94 @@ def test_task_targets_are_not_interchangeable_or_fake_t_plus_2():
     assert first['returnMeaning'] == 'price_observation_not_trading_return'
     with pytest.raises(ValueError,match='T_plus_2'):
         learning.task_contract(learning.DEFERRED_ENTRY_TASK_ID)
+
+
+def test_win_model_can_fit_without_fabricating_a_rare_target_probability():
+    rows = synthetic()
+    for row in rows:
+        row['net'] /= 5  # Both win classes exist, but no outcome reaches +5%.
+    model = learning.fit_model(rows[:720], rows[840:1080], learning.ENTRY_TASK_ID)
+    prediction = learning.predict_model(model, rows[1080:])
+    assert model['mainProbabilityTarget'] == 'net_return_strictly_positive'
+    assert model['targetReturnModelStatus'] == 'two_classes_required_in_train_and_calibration'
+    assert (prediction['winProbability'] > .5).any()
+    assert not prediction['targetReturnProbabilityAvailable'].any()
+    assert np.isnan(prediction['targetReturnProbability']).all()
+    assert np.allclose(prediction['probability'], prediction['winProbability'])
+    metrics = learning.diagnostics(rows[1080:], prediction, model)
+    assert metrics['winBrierSkill'] > 0
+    assert metrics['targetReturnBrierSkill'] is None
+
+
+@pytest.fixture(scope='module')
+def fitted_entry_heads():
+    rows = synthetic()
+    model = learning.fit_model(rows[:720], rows[840:1080], learning.ENTRY_TASK_ID)
+    assert model.get('targetClassifier')
+    return model, rows[1080:]
+
+
+@pytest.mark.parametrize('damage,expected_code', [
+    ('missing_calibrator', 2), ('corrupt_model', 3), ('nan_prediction', 4),
+    ('infinite_prediction', 4), ('out_of_range_prediction', 4), ('wrong_shape', 4),
+    ('nan_calibrator', 5), ('invalid_prevalence', 5),
+])
+def test_optional_target_failure_preserves_required_win_predictions(fitted_entry_heads, monkeypatch, damage, expected_code):
+    import lightgbm
+    from types import SimpleNamespace
+    source, rows = fitted_entry_heads
+    expected = learning.predict_model(source, rows)
+    model = deepcopy(source)
+    if damage == 'missing_calibrator':
+        model.pop('targetCalibrationCoef')
+    elif damage == 'corrupt_model':
+        model['targetClassifier'] = 'invalid-lightgbm-model'
+    elif damage == 'nan_calibrator':
+        model['targetCalibrationCoef'] = float('nan')
+    elif damage == 'invalid_prevalence':
+        model['trainingTargetPrevalence'] = 1.2
+    else:
+        real_booster = lightgbm.Booster
+        values = {'nan_prediction': float('nan'), 'infinite_prediction': float('inf'),
+                  'out_of_range_prediction': 1.2, 'wrong_shape': .5}
+        def booster(*args, **kwargs):
+            if kwargs.get('model_str') == model['targetClassifier']:
+                shape = (len(rows), 1) if damage == 'wrong_shape' else len(rows)
+                return SimpleNamespace(predict=lambda *_args, **_kwargs: np.full(shape, values[damage]))
+            return real_booster(*args, **kwargs)
+        monkeypatch.setattr(lightgbm, 'Booster', booster)
+    actual = learning.predict_model(model, rows)
+    for key in ('net', 'tail', 'utility', 'probability', 'winProbability', 'rank', 'eligible'):
+        np.testing.assert_array_equal(actual[key], expected[key])
+    assert not actual['targetReturnProbabilityAvailable'].any()
+    assert np.isnan(actual['targetReturnProbability']).all()
+    assert np.isnan(actual['trainingTargetPrevalence']).all()
+    assert (actual['targetReturnProbabilityFailureCode'] == expected_code).all()
+    assert learning.TARGET_HEAD_FAILURE_REASONS[expected_code]
+
+
+@pytest.mark.parametrize('damage', ['missing_calibrator', 'corrupt_model', 'nan_prediction', 'infinite_prediction', 'infinite_calibrator'])
+def test_required_win_head_still_fails_closed(fitted_entry_heads, monkeypatch, damage):
+    import lightgbm
+    from types import SimpleNamespace
+    source, rows = fitted_entry_heads
+    model = deepcopy(source)
+    if damage == 'missing_calibrator':
+        model.pop('calibrationCoef')
+    elif damage == 'corrupt_model':
+        model['eventClassifier'] = 'invalid-lightgbm-model'
+    elif damage == 'infinite_calibrator':
+        model['calibrationCoef'] = float('inf')
+    else:
+        real_booster = lightgbm.Booster
+        def booster(*args, **kwargs):
+            if kwargs.get('model_str') == model['eventClassifier']:
+                value = float('nan') if damage == 'nan_prediction' else float('inf')
+                return SimpleNamespace(predict=lambda *_args, **_kwargs: np.full(len(rows), value))
+            return real_booster(*args, **kwargs)
+        monkeypatch.setattr(lightgbm, 'Booster', booster)
+    with pytest.raises((ValueError, KeyError, lightgbm.basic.LightGBMError)):
+        learning.predict_model(model, rows)
 
 
 def test_partition_purges_actual_exit_label_and_quality_knowledge_times():
@@ -91,9 +181,10 @@ def test_day_and_stock_day_weighting_does_not_treat_rescans_as_independent():
 
 def test_fold_metrics_use_each_fold_baseline_not_last_fold_prevalence():
     rows = [{'day':'a','code':'1','features':{},'net':0}, {'day':'b','code':'1','features':{},'net':.1}]
-    model = {**learning.task_contract(),'trainingPrevalence':.9,'trainingMeanReturn':.9}
+    model = {**learning.task_contract(),'trainingPrevalence':.9,'trainingWinPrevalence':.9,'trainingMeanReturn':.9}
     prediction = {'probability':np.array([.1,.9]),'net':np.array([.01,.09]),'tail':np.array([-.01,.05]),
         'eligible':np.array([False,True]), 'trainingPrevalence':np.array([.1,.9]),
+        'winProbability':np.array([.1,.9]), 'trainingWinPrevalence':np.array([.1,.9]),
         'trainingMeanReturn':np.array([0,.1])}
     result = learning.diagnostics(rows,prediction,model)
     assert result['baselineBrier'] == pytest.approx(.01)
@@ -283,18 +374,19 @@ def test_fixed_calendar_cohort_does_not_select_surviving_returns(tmp_path,monkey
 
 def test_prefix_validation_cache_scoped_to_one_operation(tmp_path,monkeypatch):
     from src.services.yao_scout import minute_history as minute
+    from src.services.yao_scout import minute_integrity as integrity
     from tests.test_minute_integrity import CODE, DAY as archive_day, NOW, bars, anchor
     import time
     archive = minute.MinuteArchive(tmp_path/'minute_history')
     archive.save(CODE,bars(),NOW,verification=anchor())
     lineage = minute.read_archive_lineage(tmp_path/'minute_history',CODE,[archive_day])
     assert lineage['status'] == 'verified'
-    original = minute.validate_archive_lineage
+    original = integrity.validate_archive_dependencies
     calls = []
     def counted(*args,**kwargs):
         calls.append(True)
         return original(*args,**kwargs)
-    monkeypatch.setattr(minute,'validate_archive_lineage',counted)
+    monkeypatch.setattr(integrity,'validate_archive_dependencies',counted)
     service = SignalLearningService(tmp_path)
     @learning.scoped_lineage_validation
     def operation(owner):
@@ -317,6 +409,24 @@ def test_review_archive_reader_honors_quarantine(tmp_path):
     assert service._archive_bars(CODE,NOW)
     archive.save(CODE,bars(price=7.),NOW)  # same-minute contradiction preserves old canonical bytes
     assert service._archive_bars(CODE,NOW) == []
+
+
+def test_batched_cache_does_not_poison_other_prefix_or_survive_quarantine(tmp_path):
+    from src.services.yao_scout import minute_history as minute
+    from tests.test_minute_integrity import CODE, DAY as archive_day, NOW, bars, anchor
+    archive = minute.MinuteArchive(tmp_path/'minute_history')
+    archive.save(CODE, bars(), NOW, verification=anchor())
+    short = minute.read_archive_lineage(tmp_path/'minute_history', CODE, [archive_day], cutoff=bars()[59]['end'])
+    full = minute.read_archive_lineage(tmp_path/'minute_history', CODE, [archive_day])
+    mixed = {**full, 'sessions':short['sessions'] + [{**full['sessions'][0], 'revision':'invalid'}]}
+    service = SignalLearningService(tmp_path)
+    @learning.scoped_lineage_validation
+    def operation(owner):
+        return [learning.lineage_known_at(owner, item) for item in (mixed, short, full)]
+    first = operation(service)
+    assert first[0] is None and first[1] and first[2]
+    archive.quarantine(CODE, archive_day, 'independent_review_conflict')
+    assert operation(service) == [None, None, None]
 
 
 def test_missing_entry_volume_is_unknown_not_cash_zero(tmp_path,monkeypatch):

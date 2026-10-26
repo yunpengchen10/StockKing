@@ -64,9 +64,29 @@ def test_final_minute_precedes_sector_and_funds_with_one_cutoff(monkeypatch, tmp
         return {'asOf':cutoff, 'metrics':{'main_net_flow_3m':-100}}
     service.minute_fetcher, service.sector_fetcher, service.fund_fetcher = minutes, sectors, funds
     result = service.run('live')
-    assert events == [('minute',NOW),('sector',NOW),('fund',(NOW-timedelta(minutes=1)).isoformat())]
+    assert events[0] == ('minute',NOW)
+    assert set(events[1:]) == {('sector',NOW),('fund',(NOW-timedelta(minutes=1)).isoformat())}
     assert result['dataQuality']['independent_evidence']['sector_source_available'] == 1
     assert result['dataQuality']['independent_evidence']['fund_3m_available'] == 1
+    assert result['dataQuality']['factorCutoffAt'] == NOW.isoformat()
+
+
+def test_slow_sector_does_not_delay_independent_same_window_fund_collection(monkeypatch, tmp_path):
+    from threading import Event
+    service, _, _, _ = make_service(monkeypatch, NOW, tmp_path)
+    fund_started = Event()
+    observed = []
+    original_sector, original_fund = service.sector_fetcher, service.fund_fetcher
+    def sectors(*args, **kwargs):
+        observed.append(fund_started.wait(timeout=1))
+        return original_sector(*args, **kwargs)
+    def funds(*args, **kwargs):
+        fund_started.set()
+        return original_fund(*args, **kwargs)
+    service.sector_fetcher, service.fund_fetcher = sectors, funds
+    result = service.run('live')
+    assert observed == [True]
+    assert result['dataQuality']['parallelEvidenceCollection']['enabled'] is True
     assert result['dataQuality']['factorCutoffAt'] == NOW.isoformat()
 
 
@@ -230,11 +250,12 @@ def test_model_data_rejected_stays_out_of_every_precision_profile(monkeypatch, t
 
 def test_weekly_task_check_times_remain_readable_after_service_restart(monkeypatch, tmp_path):
     from src.services.yao_scout.signal_learning import SignalLearningService
+    from src.services.yao_scout.morning_task import MORNING_QUEUES
     service, _, _, saved = make_service(monkeypatch,NOW,tmp_path)
     result = service._persist_run({'scanSlot':'weekly','status':'audit_only'})
-    assert len(result['localTraining']['taskStates']) == 3
+    assert len(result['localTraining']['taskStates']) == 3 + len(MORNING_QUEUES)
     state = SignalLearningService(tmp_path).learning_state(NOW)
-    assert len(state['taskStates']) == 3
+    assert len(state['taskStates']) == 3 + len(MORNING_QUEUES)
     assert all(row['lastLearningCheckAt'] == NOW.isoformat() for row in state['taskStates'])
     assert all(row['lastFitCompletedAt'] is None for row in state['taskStates'])
     assert saved[-1]['localTraining']['taskStates'] == result['localTraining']['taskStates']

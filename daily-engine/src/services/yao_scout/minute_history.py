@@ -260,6 +260,54 @@ def _checked_session_rows(code, day, payload, verification_json, cutoff_key, qua
             scoped['status'], revision)
 
 
+@lru_cache(maxsize=4096)
+def _checked_feature_window(code, day, payload, verification_json, end_clock, quality_version):
+    """Keep only the formula's 31 bars after checking the whole stored session.
+
+    A large scan must not cache thousands of complete decoded days. Payload and
+    anchor bytes are part of this bounded immutable cache; quarantine is read
+    from SQLite on every call, before consulting it.
+    """
+    stored = json.loads(zlib.decompress(payload))
+    evidence = json.loads(verification_json) if verification_json else None
+    quality = inspect_session(code, day, stored, evidence)
+    if quality['status'] == 'tainted':
+        return b'[]'
+    end = _datetime(day + 'T' + end_clock)
+    start = end-timedelta(minutes=30)
+    if quality['status'] == 'verified':
+        # Identity and independent price bounds have covered the entire day.
+        # Only these 31 bars supply amount/volume/price formula inputs; their
+        # duplicate and economic-unit checks are unchanged. Normalizing the
+        # other 209 bars cannot affect these windows or their lineage hashes.
+        inputs = [row for row in stored if start <= _datetime(row['end']) <= end]
+        cleaned = normalize_bars(inputs, end)
+    else:
+        # Legacy/unverified data retains the full normalization and subsequent
+        # discontinuity check; removing an invalid row may expose a conflict.
+        cleaned = normalize_bars(stored, _datetime(day + 'T15:00:00+08:00'))
+        if inspect_session(code, day, list(cleaned.values()), evidence)['status'] == 'tainted':
+            return b'[]'
+    return json.dumps([row for at, row in cleaned.items() if start <= at <= end],
+        ensure_ascii=False, separators=(',', ':')).encode()
+
+
+def _read_feature_windows(directory, code, days, end):
+    from .minute_integrity import _read_archive_records
+    records, _ = _read_archive_records(directory, code, days)
+    rows = []
+    clock = _datetime(end).isoformat()[11:]
+    for record in records:
+        if record[3] == 'tainted':
+            continue
+        try:
+            rows.extend(json.loads(_checked_feature_window(code, record[1], record[5], record[6],
+                clock, DATA_QUALITY_VERSION)))
+        except (KeyError, TypeError, ValueError, zlib.error):
+            continue
+    return rows
+
+
 def read_archive_rows(directory, code, cutoff, *, lookback_days=None, required_days=None):
     """Read features/label bars without schema writes or bypassing quarantine."""
     path = Path(directory) / 'minute-bars-v2.sqlite3'
@@ -326,6 +374,7 @@ class MinuteArchive:
             db.execute('CREATE TABLE IF NOT EXISTS attempt_times(code TEXT, day TEXT, source TEXT, attempted_at REAL, PRIMARY KEY(code,day,source))')
             db.execute('CREATE TABLE IF NOT EXISTS session_quality(code TEXT,day TEXT,revision TEXT,status TEXT,reasons_json TEXT,updated_at TEXT,verification_json TEXT,PRIMARY KEY(code,day))')
             db.execute('CREATE TABLE IF NOT EXISTS session_evidence(evidence_id TEXT PRIMARY KEY,code TEXT,day TEXT,created_at TEXT,kind TEXT,payload BLOB,metadata_json TEXT)')
+            db.execute('CREATE INDEX IF NOT EXISTS idx_session_evidence_code_day_kind ON session_evidence(code,day,kind)')
             db.execute('CREATE TABLE IF NOT EXISTS minute_quality_events(event_id INTEGER PRIMARY KEY AUTOINCREMENT,code TEXT,day TEXT,revision TEXT,event TEXT,created_at TEXT,details_json TEXT)')
 
     def connect(self):
@@ -566,6 +615,65 @@ class MinuteArchive:
         return {'code':code, 'day':day, 'revision':revision, 'previousRevision':expected_revision,
                 'status':'verified', 'actualMinutes':len(normalized), 'fullSessionRebuild':False}
 
+    def supplement_verified_session(self, code, day, rows, cutoff, *, verification, expected_revision):
+        """Add compatible actual minutes to a verified partial session with CAS.
+
+        An incomplete response must never replace a better archive. Both the
+        fresh subset and the combined session need independent daily price and
+        provider identity checks. Any overlapping economic disagreement rejects
+        the whole supplement; quarantined sessions still require a full rebuild.
+        """
+        verification = {key:value for key,value in verification.items() if key != 'known_at'}
+        original, conflicts = list(rows), set()
+        normalized = list(normalize_bars(original, cutoff, conflicts=conflicts).values())
+        if not normalized or conflicts or any(row['end'][:10] != day for row in normalized):
+            raise ValueError('supplement requires nonconflicting actual session rows')
+        if verification.get('kind') != 'daily_ohlc' or verification.get('day') != day:
+            raise ValueError('supplement requires independent historical daily prices')
+        if inspect_session(code, day, normalized, verification)['status'] != 'verified':
+            raise ValueError('supplement requires verified identity and independent prices')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            old = db.execute('SELECT s.payload,q.status,q.verification_json FROM sessions s '
+                'LEFT JOIN session_quality q ON q.code=s.code AND q.day=s.day '
+                'WHERE s.code=? AND s.day=?', (code, day)).fetchone()
+            if not old:
+                raise ValueError('supplement target missing')
+            old_rows = json.loads(zlib.decompress(old[0]))
+            if session_revision(code, day, old_rows) != expected_revision:
+                raise ValueError('supplement target revision changed')
+            previous = inspect_session(code, day, old_rows, json.loads(old[2]) if old[2] else None)
+            if old[1] == 'tainted' or previous['status'] == 'tainted':
+                raise ValueError('quarantined session requires full verified rebuild')
+            if old[1] != 'verified' or previous['status'] != 'verified':
+                raise ValueError('supplement target must already be verified')
+            coverage = minute_coverage(old_rows, cutoff, [day])
+            complete = (coverage['expectedMinutes'] == 240 and coverage['pricePathComplete']
+                        and not any(coverage['missingFields'].values()))
+            result = {'code':code, 'day':day, 'revision':expected_revision,
+                'previousRevision':expected_revision, 'status':'verified', 'actualMinutes':len(old_rows),
+                'addedMinutes':0, 'enrichedMinutes':0, 'fullSessionRebuild':False}
+            if complete:
+                return {**result, 'unchanged':True, 'reason':'complete_session_preserved'}
+            audit = {}
+            merged = supplement_bars(old_rows, normalized, cutoff, diagnostics=audit)
+            if audit['conflictingOverlapMinutes']:
+                raise ValueError('supplement economic overlap conflicts with verified history')
+            if not audit['addedMinutes'] and not audit['enrichedMinutes']:
+                return {**result, 'unchanged':True, 'reason':'no_new_verified_minutes'}
+            quality = inspect_session(code, day, merged, verification)
+            if quality['status'] != 'verified':
+                raise ValueError('combined supplement requires independent verification')
+            generation = canonical_hash([expected_revision, datetime.now(SHANGHAI).isoformat(), verification])
+            merged = [{**row, 'integrity_revision':generation} for row in merged]
+            self._evidence(db, code, day, old_rows, 'before_verified_supplement')
+            self._evidence(db, code, day, original, 'verified_supplement', verification)
+            db.execute('UPDATE sessions SET payload=? WHERE code=? AND day=?',
+                (zlib.compress(json.dumps(merged,separators=(',',':')).encode()), code, day))
+            revision = self._quality(db, code, day, merged, quality, verification, 'verified_supplement')
+        return {**result, 'revision':revision, 'actualMinutes':len(merged),
+                'addedMinutes':audit['addedMinutes'], 'enrichedMinutes':audit['enrichedMinutes'], 'unchanged':False}
+
     def attempted(self, code, day, source):
         with self.connect() as db:
             return db.execute('SELECT status FROM attempts WHERE code=? AND day=? AND source=?', (code,day,source)).fetchone()
@@ -699,6 +807,28 @@ def window(rows, end, size):
     return [rows[at] for at in stamps]
 
 
+def session_window_status(end):
+    """Explain scheduled warm-up without treating the lunch break as lost data.
+
+    Bar labels are end times: the first afternoon price is 13:01, so a
+    three-minute return needs 13:01--13:04 and a five-minute return needs
+    13:01--13:06. No price or amount is carried across a session boundary.
+    """
+    end = _datetime(end).replace(second=0, microsecond=0)
+    session = bar_session(end)
+    if session is None:
+        return {'status': 'outside_trading_session', 'session': None,
+                'asOf': end.isoformat(), 'firstBarAt': None,
+                'baselineReadyAt': None, 'price5mReadyAt': None}
+    first = end.replace(hour=9 if session == 'am' else 13, minute=31 if session == 'am' else 1)
+    baseline_at, five_at = first + timedelta(minutes=3), first + timedelta(minutes=5)
+    return {'status': 'session_warmup' if end < five_at else 'window_elapsed',
+            'session': session, 'asOf': end.isoformat(), 'firstBarAt': first.isoformat(),
+            'baselineReadyAt': baseline_at.isoformat(), 'price5mReadyAt': five_at.isoformat(),
+            'baselineWindowElapsed': end >= baseline_at,
+            'price5mWindowElapsed': end >= five_at}
+
+
 def _window_features(rows, end):
     """Completed, contiguous, same-session windows only; returns in percentage points."""
     result = {}
@@ -741,6 +871,7 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
               'gaps':[], 'historyDays':0, 'priceHistoryDays':0, 'featureHistoryDays':{},
               'dependencyDays':[cutoff.date().isoformat()],
               'baselineReady':False, 'baselineDates':[], 'missingHistoryDates':[],
+              'baselineStatus':'current_minutes_unavailable', 'sessionWindow':None,
               'sourceTimePrecision':'bar_end', 'metricDefinitions':METRIC_DEFINITIONS.copy(),
               'v11Inputs':{}, 'v11Coverage':{'status':'insufficient','days':0,'requiredDays':FORMAL_HISTORY_DAYS}}
     result['metricDefinitions'].update(amount_3m='截至该分钟结束时间的连续3根1分钟K线成交额之和（元）',
@@ -753,8 +884,9 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
     end = max(current)
     result.update(asOf=end.isoformat(), source=current[end]['source'], currentPrice=current[end]['close'],
                   sourceFetchedAt=current[end].get('fetched_at'),
-                  sourceAgeSeconds=(cutoff-end).total_seconds())
+                  sourceAgeSeconds=(cutoff-end).total_seconds(), sessionWindow=session_window_status(end))
     if (cutoff-end).total_seconds() >= MINUTE_MAX_AGE:
+        result['baselineStatus'] = 'current_minutes_stale'
         gaps.append('分钟行情已陈旧，未用于入选')
         return result
     for n in (1,3,5):
@@ -762,7 +894,10 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
         if part:
             metrics[f'speed_{n}m_pct'] = (part[-1]['close']/part[0]['close']-1)*100
         else:
-            gaps.append(f'缺连续{n}分钟价格窗口')
+            first = _datetime(result['sessionWindow']['firstBarAt'])
+            ready_at = first + timedelta(minutes=n)
+            gaps.append(f'本交易段预热：{n}分钟价格窗口最早{ready_at:%H:%M}形成'
+                        if end < ready_at else f'缺连续{n}分钟价格窗口')
     prior = window(current,end-timedelta(minutes=1),5)
     if prior:
         metrics.update(local_high_5m=max(r['high'] for r in prior),local_low_5m=min(r['low'] for r in prior))
@@ -799,7 +934,7 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
             if part and all(r['amount_cny'] is not None for r in part):
                 samples.append(sample['amount_3m'])
                 result['baselineDates'].append(day.isoformat())
-            else:
+            elif result['sessionWindow']['baselineWindowElapsed']:
                 result['missingHistoryDates'].append(day.isoformat())
     result['historyDays'] = len(samples)
     result['priceHistoryDays'] = len(feature_history['r3_pct'])
@@ -808,6 +943,8 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
     result['v11Coverage'] = {'status':coverage, 'days':len(samples),
                              'priceDays':result['priceHistoryDays'],
                              'factorDays':result['featureHistoryDays'],'requiredDays':FORMAL_HISTORY_DAYS}
+    if not result['sessionWindow']['baselineWindowElapsed']:
+        result['v11Coverage']['status'] = 'session_warmup'
     v11 = {'history_days':len(samples),'price_history_days':result['priceHistoryDays'], **current_features}
     if end in vwap_series:
         previous_at = end-timedelta(minutes=1)
@@ -858,8 +995,18 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
     if len(samples) == FORMAL_HISTORY_DAYS and median(samples) > 0 and metrics['amount_3m'] is not None:
         metrics['relative_amount_3m_20d'] = metrics['amount_3m']/median(samples)
         result['baselineReady'] = True
-    else:
+    if not result['sessionWindow']['baselineWindowElapsed']:
+        result['baselineStatus'] = 'session_warmup'
+        gaps.append('本交易段同刻量价窗口尚在预热，最早'
+                    + _datetime(result['sessionWindow']['baselineReadyAt']).strftime('%H:%M')
+                    + '形成；这不代表20日历史丢失')
+    elif len(samples) != FORMAL_HISTORY_DAYS or result['priceHistoryDays'] != FORMAL_HISTORY_DAYS:
+        result['baselineStatus'] = 'missing_history'
         gaps.append(f'同刻20日分钟基准未就绪（{len(samples)}/20）；不以少量样本或全天量比替代')
+    elif not result['baselineReady'] or metrics['speed_3m_pct'] is None:
+        result['baselineStatus'] = 'current_window_unavailable'
+    else:
+        result['baselineStatus'] = 'ready'
     result['basis'] = '1分钟K线结束时间；3分钟额为连续3根成交额之和；历史基准严格使用此前20个交易日'
     return result
 
@@ -882,23 +1029,14 @@ def read_bar_evidence(code, cutoff, cache_dir, *, required_days=None):
     cutoff = _datetime(cutoff)
     started = monotonic()
     rows = read_archive_rows(cache_dir, code, cutoff, lookback_days=0)
-    result = compute_bar_evidence(rows, cutoff, expected_dates=[])
-    if result.get('asOf') and result.get('sourceAgeSeconds', MINUTE_MAX_AGE) < MINUTE_MAX_AGE:
+    current_end = max((_datetime(row['end']) for row in rows), default=None)
+    dates, feature_rows = [], []
+    if current_end is not None and (cutoff-current_end).total_seconds() < MINUTE_MAX_AGE:
         dates = sorted({str(day)[:10] for day in _prior_sessions(cutoff.date())
                         if str(day)[:10] < cutoff.date().isoformat()})[-FORMAL_HISTORY_DAYS:]
         if len(dates) == FORMAL_HISTORY_DAYS:
-            historical = read_archive_rows(cache_dir, code, cutoff, required_days=dates)
-            # The longest historical feature is a 30-minute return (31 prices).
-            # The complete session was already inspected, including conflicts
-            # outside this window; trim only the redundant feature input.
-            end = _datetime(result['asOf'])
-            feature_rows = []
-            for row in historical:
-                at = _datetime(row['end'])
-                same_clock = end.replace(year=at.year, month=at.month, day=at.day)
-                if same_clock-timedelta(minutes=30) <= at <= same_clock:
-                    feature_rows.append(row)
-            result = compute_bar_evidence(feature_rows + rows, cutoff, expected_dates=dates)
+            feature_rows = _read_feature_windows(cache_dir, code, dates, current_end)
+    result = compute_bar_evidence(feature_rows + rows, cutoff, expected_dates=dates)
     dependency_days = required_days or result['dependencyDays']
     result.update(code=code, archivePath=str(Path(cache_dir) / 'minute-bars-v2.sqlite3'),
                   dataLineage=read_archive_lineage(cache_dir, code, dependency_days, cutoff=cutoff))
@@ -925,7 +1063,8 @@ def _fetch_scan_bar_evidence(code, cutoff, cache_dir, *, getter=None, required_d
             if client.available and remaining(1) > 0:
                 try:
                     bars = fetch_software_bars(code, count=240, client=client)
-                    normalized = normalize_bars(bars, cutoff)
+                    normalized = {at:row for at,row in normalize_bars(bars, cutoff).items()
+                                  if at.date() == cutoff.date()}
                     if not normalized:
                         raise ValueError('no usable software minute bars')
                     archive.save(code, list(normalized.values()), cutoff)
@@ -936,9 +1075,11 @@ def _fetch_scan_bar_evidence(code, cutoff, cache_dir, *, getter=None, required_d
             supplemental['attempted'] = True
             try:
                 bars = fetch_sina_bars(code, getter=getter, count=240, timeout=max(.1, remaining(5)))
-                if not normalize_bars(bars, cutoff):
+                current = [row for at,row in normalize_bars(bars, cutoff).items()
+                           if at.date() == cutoff.date()]
+                if not current:
                     raise ValueError('Sina returned no usable complete minutes')
-                supplemental.update(archive.save(code, bars, cutoff), status='fetched')
+                supplemental.update(archive.save(code, current, cutoff), status='fetched')
             except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
                 errors.append('Sina分钟更新失败：'+type(exc).__name__)
                 supplemental.update(status='failed', error=type(exc).__name__)

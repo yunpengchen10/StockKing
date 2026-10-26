@@ -6,6 +6,7 @@ import * as vue from 'vue'
 import * as refresh from './picksRefresh.mjs'
 import * as recordRead from './recordRead.mjs'
 import * as learningStatus from './learningStatus.mjs'
+import * as recommendationQuality from './recommendationQuality.mjs'
 import * as pickExplain from './pickExplain.mjs'
 import * as pickLedger from './pickLedger.mjs'
 import * as premarket from './premarket.mjs'
@@ -22,6 +23,16 @@ const snapshot = (generatedAt, source = 'scheduled') => ({
 })
 const oldSnapshot = () => snapshot('2026-07-13T10:30:00+08:00', 'manual')
 const latestSnapshot = () => snapshot('2026-10-13T10:30:00+08:00')
+const researchSnapshot = (generatedAt, { latent = [], continuation = [], source = 'scheduled' } = {}) => ({
+  ...snapshot(generatedAt, source),
+  adaptive: { ...snapshot(generatedAt, source).adaptive,
+    recommendationPolicy: { version: 'primary-admission-v1' },
+    nextDayWatchlist: latent, nextDayContinuationWatchlist: continuation,
+  },
+})
+const zhengyuObservation = () => ({ code: '603089', name: '正裕工业', referencePrice: 15,
+  nextDaySignal: { queue: 'continuation', score: 90, signalSession: '2026-10-23', targetSession: '2026-10-26',
+    reasons: ['已触板延续线索'], gaps: ['仅在展开详情后显示的待确认条件'] } })
 
 // Exercise the real setup, template, and KeepAlive lifecycle without a browser
 // or Wails. Every timer, including those used by the imported utilities, is
@@ -59,6 +70,7 @@ function mountPicks(api = {}, cached = null, now = null) {
     './PickIndicatorEvidence.vue': child,
     './PicksLedger.vue': child,
     '../utils/learningStatus.mjs': learningStatus,
+    '../utils/recommendationQuality.mjs': recommendationQuality,
     '../utils/pickExplain.mjs': pickExplain,
     '../utils/pickLedger.mjs': pickLedger,
     '../utils/premarket.mjs': premarket,
@@ -112,11 +124,20 @@ function mountPicks(api = {}, cached = null, now = null) {
   for (const name of new Set([...descriptor.template.content.matchAll(/<(n-[\w-]+)/g)].map(match => match[1]))) app.component(name, name === 'n-spin' ? spin : name === 'n-card' ? card : name === 'n-tab-pane' ? tabPane : passthrough)
   app.mount(root)
   const textOf = element => element.type === 'comment' || element.style.display === 'none' ? '' : `${element.text}${element.children.map(textOf).join('')}`
+  // Unlike textContent, a closed native <details> exposes only its first
+  // <summary>. Use this for assertions about what users see without clicking.
+  const visibleTextOf = element => {
+    if (element.type === 'comment' || element.style.display === 'none') return ''
+    const children = element.type === 'details' && !element.props.open && element.props.open !== ''
+      ? [element.children.find(child => child.type === 'summary')].filter(Boolean) : element.children
+    return `${element.text}${children.map(visibleTextOf).join('')}`
+  }
   return {
     active, timers, storage,
     state: () => instance.setupState,
     setNow(value) { now = value },
     text: () => textOf(root),
+    visibleText: () => visibleTextOf(root),
     async runTimer(delay) {
       const timer = [...timers].find(([, item]) => item.delay === delay)
       assert.ok(timer, `expected a ${delay} ms timer`)
@@ -331,6 +352,95 @@ test('background saved-result polling picks up a newer scheduled recommendation'
   } finally { mounted.dispose() }
 })
 
+test('background polling makes both saved research queues visible without expanding details or launching a scan', async () => {
+  let saved = researchSnapshot('2026-10-23T09:40:00+08:00'), reads = 0, scans = 0
+  const mounted = mountPicks({
+    GetDisplayedKingPicks: async () => { reads++; return saved },
+    StartKingPicksRefresh: async () => { scans++; throw new Error('unexpected scan') },
+  }, null, Date.parse('2026-10-23T09:56:00+08:00'))
+  try {
+    await flush()
+    assert.doesNotMatch(mounted.visibleText(), /正裕工业|潜伏观察样本/)
+    saved = researchSnapshot('2026-10-23T09:55:00+08:00', {
+      latent: [{ code: '600001', name: '潜伏观察样本', nextDaySignal: { queue: 'first_board', score: 85 } }],
+      continuation: [zhengyuObservation()],
+    })
+    await mounted.runTimer(30000)
+    assert.equal(reads, 2)
+    assert.equal(scans, 0)
+    assert.match(mounted.visibleText(), /正裕工业603089/)
+    assert.match(mounted.visibleText(), /潜伏观察样本600001/)
+    assert.match(mounted.visibleText(), /研究观察 · 不计入主推荐（潜伏 1 只 \/ 延续 1 只）/)
+    assert.match(mounted.visibleText(), /主推荐 0 只/)
+    assert.equal(mounted.state().adaptivePicks.length, 0)
+    assert.equal(mounted.state().savedRecommendations.saved, 0)
+    assert.match(mounted.text(), /仅在展开详情后显示的待确认条件/)
+    assert.doesNotMatch(mounted.visibleText(), /仅在展开详情后显示的待确认条件/, 'visibility checks must ignore collapsed evidence')
+    assert.equal(refresh.readDisplayedPicks(mounted.storage).adaptive.nextDayContinuationWatchlist[0].code, '603089')
+  } finally { mounted.dispose() }
+})
+
+test('a completed manual refresh replaces the displayed background research lists and persists the replacement', async () => {
+  const scheduled = researchSnapshot('2026-10-23T09:55:00+08:00', {
+    latent: [{ code: '600001', name: '旧潜伏观察', nextDaySignal: { queue: 'first_board', score: 85 } }],
+    continuation: [zhengyuObservation()],
+  })
+  const manual = researchSnapshot('2026-10-23T10:00:00+08:00', { source: 'manual',
+    continuation: [{ code: '600002', name: '手动延续观察', nextDaySignal: { queue: 'continuation', score: 88 } }],
+  })
+  const scan = deferred()
+  let scans = 0
+  const mounted = mountPicks({
+    GetDisplayedKingPicks: async () => scheduled,
+    StartKingPicksRefresh: () => { scans++; return scan.promise },
+  }, null, Date.parse('2026-10-23T10:00:00+08:00'))
+  try {
+    await flush()
+    assert.match(mounted.visibleText(), /正裕工业/)
+    const refreshPromise = mounted.state().refresh(); await flush()
+    assert.equal(scans, 1)
+    assert.match(mounted.visibleText(), /正裕工业/, 'keep the saved list until the replacement completes')
+    scan.resolve({ task_id: 'manual-research', status: 'completed', result: manual })
+    await refreshPromise; await flush()
+    assert.match(mounted.visibleText(), /手动延续观察600002/)
+    assert.doesNotMatch(mounted.visibleText(), /正裕工业|旧潜伏观察/)
+    assert.equal(mounted.state().nextDayWatchlist.length, 0)
+    assert.deepEqual(mounted.state().nextDayContinuationWatchlist.map(pick => pick.code), ['600002'])
+    assert.equal(mounted.state().adaptivePicks.length, 0)
+    const cached = refresh.readDisplayedPicks(mounted.storage)
+    assert.equal(cached.displaySource, 'manual')
+    assert.deepEqual(cached.adaptive.nextDayWatchlist, [])
+    assert.deepEqual(cached.adaptive.nextDayContinuationWatchlist.map(pick => pick.code), ['600002'])
+  } finally { scan.resolve(null); mounted.dispose() }
+})
+
+test('a late background read cannot restore research observations removed by a manual refresh with the same timestamp', async () => {
+  const generatedAt = '2026-10-23T10:00:00+08:00'
+  const delayedRead = deferred()
+  const scheduled = researchSnapshot('2026-10-23T09:55:00+08:00', { continuation: [zhengyuObservation()] })
+  const manual = researchSnapshot(generatedAt, { source: 'manual' })
+  let reads = 0
+  const mounted = mountPicks({
+    GetDisplayedKingPicks: () => ++reads === 1 ? Promise.resolve(scheduled) : delayedRead.promise,
+    StartKingPicksRefresh: async () => ({ task_id: 'manual-empty-research', status: 'completed', result: manual }),
+  }, null, Date.parse(generatedAt))
+  try {
+    await flush()
+    assert.match(mounted.visibleText(), /正裕工业/)
+    await mounted.runTimer(30000)
+    assert.equal(reads, 2)
+    await mounted.state().refresh(); await flush()
+    assert.doesNotMatch(mounted.visibleText(), /正裕工业/)
+    delayedRead.resolve(researchSnapshot(generatedAt, { continuation: [zhengyuObservation()] })); await flush()
+    assert.doesNotMatch(mounted.visibleText(), /正裕工业/)
+    assert.match(mounted.visibleText(), /研究观察 0 只（潜伏 0 \/ 延续 0）/)
+    assert.equal(mounted.state().nextDayContinuationWatchlist.length, 0)
+    assert.equal(mounted.state().result.displaySource, 'manual')
+    assert.deepEqual(refresh.readDisplayedPicks(mounted.storage).adaptive.nextDayContinuationWatchlist, [])
+    assert.equal(mounted.state().restoreError, '')
+  } finally { delayedRead.resolve(null); mounted.dispose() }
+})
+
 test('a saved-result read started before a successful manual scan cannot overwrite that scan', async () => {
   const delayedRead = deferred(), manual = snapshot(latestSnapshot().generatedAt, 'manual')
   manual.adaptive.scanId = 'fresh-manual'
@@ -465,5 +575,111 @@ test('an empty daily result explains daily gates instead of substituting the min
     assert.match(mounted.text(), /报价或涨跌停价未核验：4 只/)
     assert.ok(!mounted.text().includes('全部分钟缺证据'))
     assert.ok(!mounted.text().includes('最终主推荐 0 只'))
+  } finally { mounted.dispose() }
+})
+
+for (const formalCount of [0, 1]) test(`new daily observations stay separate with ${formalCount} formal picks`, async () => {
+  const saved = snapshot('2026-10-22T10:41:49+08:00')
+  const observation = { code: '600001', name: '独立日线观察样本', status: 'daily_observation', observationOnly: true,
+    entryEligible: false, referencePrice: 12.2, decision_at: saved.generatedAt, dailySignal: { taskId: 'daily_structure_to_next_session', observationOnly: true },
+    dailyProfileDecision: { regular: { entryEligible: false, label: '均衡' } },
+    dataGaps: ['市场广度缺失', '板块资金尚未确认'], indicatorEvidence: [] }
+  const formal = { code: '600002', name: '正式分钟样本', primaryAdmission: { eligible: true }, referencePrice: 15 }
+  Object.assign(saved.adaptive, { primarySelectionMode: formalCount ? 'mixed_intraday_and_daily_observation' : 'daily_observation',
+    recommendationPolicy: { version: 'v4' }, primaryObjective: 'morning_signal_to_same_session_close',
+    candidates: formalCount ? [formal] : [], profileCandidates: { regular: formalCount ? [formal] : [], conservative: [] },
+    dailyCandidates: [observation], dailyProfileCandidates: { regular: [observation], conservative: [] },
+    dailyAssessment: { message: '日线观察1只，正式准入仍待核验' },
+    dailyRejectionLedger: [{ code: '600003', state: 'observation_below_top_n' }],
+    admissionDiagnostics: { summary: formalCount ? '正式主榜已独立核验' : '市场与分钟证据不齐，本轮空榜', checks: [], selected: formalCount },
+    marketEmotionPanel: { source: 'fixture', decisionAssessment: { available: false }, gaps: ['全市场数据未齐'] } })
+  const before = JSON.stringify(saved)
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    assert.equal(mounted.state().isDailyPrimary, false)
+    assert.equal(mounted.state().adaptivePicks.length, formalCount)
+    assert.equal(mounted.state().dailyPicks.length, 1)
+    assert.match(mounted.text(), new RegExp(`主推荐 · ${formalCount} 只通过准入`))
+    assert.match(mounted.text(), /日线观察 · 1 只 · 不计入主推荐/)
+    assert.match(mounted.text(), /独立日线观察样本/)
+    assert.match(mounted.text(), /本轮日线观察 2026\/10\/22 10:41:49/)
+    assert.match(mounted.text(), /本轮参考价 ¥12.20/)
+    assert.ok(!mounted.text().includes('首次日线观察'))
+    assert.match(mounted.text(), /均衡档观察合格但未入前列 1 只/)
+    assert.match(mounted.text(), /市场广度缺失；板块资金尚未确认/)
+    assert.match(mounted.text(), /全市场数据未齐/)
+    assert.ok(!mounted.text().includes('日线条件推荐'))
+    if (!formalCount) assert.match(mounted.text(), /市场与分钟证据不齐，本轮空榜/)
+    mounted.state().precisionProfile = 'conservative'; await flush()
+    assert.equal(mounted.state().adaptivePicks.length, 0)
+    assert.equal(mounted.state().dailyPicks.length, 0)
+    assert.equal(JSON.stringify(saved), before)
+  } finally { mounted.dispose() }
+})
+
+test('pending history diagnostics explain session warmup without calling it missing history', async () => {
+  const saved = snapshot('2026-10-22T13:01:40+08:00')
+  Object.assign(saved.adaptive, { recommendationPolicy: { version: 'primary-evidence-20261015-v2' },
+    admissionDiagnostics: { version: 'primary-diagnostics-v2', status: 'session_warmup',
+      checks: [{ key: 'history', label: '20日同刻量价基准', passed: 0, blocked: 0, pending: 6, total: 6,
+        action: '后台补齐缺失交易日并核验历史分钟数据' }],
+      evidenceAndRiskPassed: 0, modelAdmissionPassed: 0, selected: 0,
+      summary: '6只正在等待开盘后的完整分钟窗口，不能据此判定历史缺失。' } })
+  const before = JSON.stringify(saved)
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    assert.match(mounted.text(), /0 \/ 6 只通过/)
+    assert.match(mounted.text(), /6 只待核验：等待当前完整分钟窗口形成，不计为历史缺失/)
+    assert.ok(!mounted.text().includes('后台补齐缺失交易日并核验历史分钟数据'))
+    assert.equal(mounted.state().adaptivePicks.length, 0)
+    assert.equal(JSON.stringify(saved), before)
+  } finally { mounted.dispose() }
+})
+
+test('verified weak breadth displays reduced budget warnings while observations stay outside the main list', async () => {
+  const saved = snapshot('2026-10-22T13:01:40+08:00')
+  const breadth = { available: true, passed: true, status: 'observed_weak', marketRiskState: 'weak', advancingPct: 16.72 }
+  const observation = { code: '600001', name: '弱市日线观察', status: 'daily_observation', observationOnly: true,
+    version: 'king-daily-primary-v5', entryEligible: false, formalEligible: false, selected: false,
+    dailySignal: { taskId: 'daily_structure_to_next_session', observationOnly: true, selected: false },
+    referencePrice: 12.2, marketBreadth: breadth, indicatorEvidence: [] }
+  const formal = { code: '600002', name: '满足个股条件的样本', primaryAdmission: { eligible: true,
+    marketRiskState: 'weak', warnings: ['verified_weak_market_reduced_risk_budget'] }, referencePrice: 15, plannedWeight: .2 }
+  Object.assign(saved.adaptive, { primarySelectionMode: 'mixed_intraday_and_daily_observation',
+    recommendationPolicy: { version: 'primary-evidence-20261015-v2' }, candidates: [formal],
+    profileCandidates: { regular: [formal] }, dailyCandidates: [observation], dailyProfileCandidates: { regular: [observation] },
+    dailyAssessment: { version: 'king-daily-primary-v5', count: 1, marketBreadth: breadth },
+    portfolioPolicy: { totalExposureCap: .5, plannedExposure: .2, cashWeight: .8 },
+    marketEmotionPanel: { source: 'fixture', asOf: saved.generatedAt, evaluatedAt: saved.generatedAt,
+      decisionAssessment: breadth, features: { advancing_pct: 16.72 } } })
+  const before = JSON.stringify(saved)
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    assert.equal(mounted.state().adaptivePicks.length, 1)
+    assert.equal(mounted.state().dailyPicks.length, 1)
+    assert.match(mounted.text(), /已核验市场偏弱/)
+    assert.match(mounted.text(), /执行弱市减半总风险预算/)
+    assert.match(mounted.text(), /日线观察 · 1 只 · 不计入主推荐/)
+    assert.ok(!mounted.text().includes('触发主榜限制'))
+    assert.ok(!mounted.text().includes('暂停新增主推荐'))
+    assert.equal(JSON.stringify(saved), before)
+  } finally { mounted.dispose() }
+})
+
+test('new daily observation cards do not borrow historical first references when this round is missing', async () => {
+  const saved = snapshot('2026-10-22T10:41:49+08:00')
+  const observation = { code: '600001', name: '缺本轮参考', status: 'daily_observation', observationOnly: true,
+    dailySignal: { taskId: 'daily_structure_to_next_session', firstReferenceTime: '2026-10-21T09:40:00+08:00', firstReferencePrice: 99 } }
+  Object.assign(saved.adaptive, { primarySelectionMode: 'daily_observation', candidates: [], dailyCandidates: [observation] })
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    assert.match(mounted.text(), /本轮日线观察 未记录/)
+    assert.match(mounted.text(), /本轮参考价未记录/)
+    assert.ok(!mounted.text().includes('首次日线观察'))
+    assert.ok(!mounted.text().includes('¥99.00'))
   } finally { mounted.dispose() }
 })

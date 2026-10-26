@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from src.services.stock_king_display import LocalPicksDisplayStore, displayable_run
+from src.services.stock_king_display import LocalPicksDisplayStore, displayable_run, display_counts
 from src.services.yao_scout.daily_primary import TASK_ID, VERSION
 
 
@@ -90,11 +90,12 @@ def test_daily_counts_never_include_other_research_queues(tmp_path, monkeypatch)
     assert saved['nextDayCandidateCount'] == 1
 
 
-def test_v2_saved_display_survives_upgrade_without_rewriting_version(tmp_path, monkeypatch):
+@pytest.mark.parametrize('version', ['king-daily-primary-v2', 'king-daily-primary-v3', 'king-daily-primary-v4'])
+def test_saved_display_survives_upgrade_without_rewriting_version(tmp_path, monkeypatch, version):
     monkeypatch.setenv('YAO_SCOUT_DATA_DIR', str(tmp_path))
     store = LocalPicksDisplayStore(None)
     saved = store.save(scan())
-    saved['adaptive']['dailyAssessment']['version'] = 'king-daily-primary-v2'
+    saved['adaptive']['dailyAssessment']['version'] = version
     store.path.write_text(json.dumps(saved), encoding='utf-8')
     before = store.path.read_bytes()
     assert LocalPicksDisplayStore(None).read() == saved
@@ -116,7 +117,7 @@ def test_unknown_daily_version_is_rejected_even_on_historical_reads(tmp_path, mo
         store.save(saved['adaptive'], source='migration')
 
 
-@pytest.mark.parametrize('version', [VERSION, 'king-daily-primary-v2'])
+@pytest.mark.parametrize('version', [VERSION, 'king-daily-primary-v2', 'king-daily-primary-v3', 'king-daily-primary-v4'])
 def test_sql_history_header_restores_daily_branch_without_loading_rejected_payloads(tmp_path, monkeypatch, version):
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
@@ -163,3 +164,40 @@ def test_sql_history_header_restores_daily_branch_without_loading_rejected_paylo
         assert LocalPicksDisplayStore(None).read() == saved
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize('formal_count', [0, 1])
+@pytest.mark.parametrize('observation_count', [0, 1])
+@pytest.mark.parametrize('mode', ['daily_observation', 'mixed_intraday_and_daily_observation'])
+def test_new_observation_snapshot_replaces_old_formal_list_without_promoting_research(
+        tmp_path, monkeypatch, formal_count, observation_count, mode):
+    monkeypatch.setenv('YAO_SCOUT_DATA_DIR', str(tmp_path))
+    store = LocalPicksDisplayStore(None)
+    store.save(scan(minute=20))
+    run = scan(count=observation_count)
+    run['primarySelectionMode'] = mode
+    run['dailyAssessment']['status'] = 'completed_observations' if observation_count else 'no_daily_candidates'
+    run['primaryObjective'] = 'morning_signal_to_same_session_close'
+    run['candidates'] = [{'code': '600003', 'primaryAdmission': {'eligible': True}}] if formal_count else []
+    run['profileCandidates'] = {'regular': deepcopy(run['candidates'])}
+    for pick in run['dailyCandidates']:
+        pick.update(status='daily_observation', observationOnly=True, entryEligible=False, stateLabel='日线观察')
+    run['dailyProfileCandidates'] = {'regular': deepcopy(run['dailyCandidates'])}
+    run['dailyObservationResearch'] = {'candidates': deepcopy(run['dailyCandidates'])}
+    assert displayable_run(run)
+    saved = store.save(run)
+    assert saved['tradeCandidateCount'] == saved['savedRecommendationCount'] == formal_count
+    assert saved['dailyObservationCount'] == saved['dailyCandidateCount'] == observation_count
+    assert saved['adaptive']['candidates'] == run['candidates']
+    assert saved['adaptive']['dailyCandidates'] == run['dailyCandidates']
+    assert 'dailyObservationResearch' not in saved['adaptive']
+    assert LocalPicksDisplayStore(None).read() == saved
+    assert json.loads(store.path.read_text(encoding='utf-8'))['adaptive']['dailyObservationResearch'] == run['dailyObservationResearch']
+
+
+def test_observation_flag_cannot_inflate_formal_count_even_if_candidate_list_is_malformed():
+    row = {'code': '600001', 'status': 'daily_observation', 'observationOnly': True}
+    counts = display_counts({'primarySelectionMode': 'daily_observation', 'candidates': [row],
+                             'dailyCandidates': [row], 'nextDayWatchlist': [{'code': '600002'}]})
+    assert counts['tradeCandidateCount'] == counts['savedRecommendationCount'] == 0
+    assert counts['dailyObservationCount'] == 1

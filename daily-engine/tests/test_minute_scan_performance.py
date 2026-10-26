@@ -152,3 +152,117 @@ def test_expired_scan_reads_cache_without_constructing_writable_archive(monkeypa
                                        software_count=240, deadline=minute.monotonic()-1)
     assert result['asOf'] == cutoff.isoformat()
     assert result['softwareMarketUsed'] is False
+
+
+def test_feature_window_cache_is_immutable_and_rechecks_whole_day_bytes(monkeypatch, tmp_path):
+    archive = minute.MinuteArchive(tmp_path)
+    archive.save(CODE, bars(), NOW, verification=anchor())
+    minute._checked_feature_window.cache_clear()
+    calls, original = [], minute.inspect_session
+    def inspect(*args):
+        calls.append(True)
+        return original(*args)
+    monkeypatch.setattr(minute, 'inspect_session', inspect)
+    end = minute._datetime(bars()[59]['end'])
+    first = minute._read_feature_windows(tmp_path, CODE, [DAY], end)
+    assert len(first) == 31
+    count = len(calls)
+    first[0]['identity_evidence']['response_code'] = '001336'
+    second = minute._read_feature_windows(tmp_path, CODE, [DAY], end)
+    assert len(calls) == count and second[0]['identity_evidence']['response_code'] == CODE
+    # A conflict after the retained window must invalidate the cached window.
+    with archive.connect() as db:
+        payload = db.execute('SELECT payload FROM sessions WHERE code=? AND day=?', (CODE, DAY)).fetchone()[0]
+        changed = json.loads(zlib.decompress(payload))
+        changed[-1]['conflicting_observations'] = [{'source':'independent_disagreement'}]
+        db.execute('UPDATE sessions SET payload=? WHERE code=? AND day=?',
+            (zlib.compress(json.dumps(changed).encode()), CODE, DAY))
+    assert minute._read_feature_windows(tmp_path, CODE, [DAY], end) == []
+    assert len(calls) > count
+
+
+def test_feature_window_cache_observes_quarantine_without_payload_change(tmp_path):
+    archive = minute.MinuteArchive(tmp_path)
+    archive.save(CODE, bars(), NOW, verification=anchor())
+    end = minute._datetime(bars()[59]['end'])
+    assert minute._read_feature_windows(tmp_path, CODE, [DAY], end)
+    archive.quarantine(CODE, DAY, 'independent_review_conflict')
+    assert minute._read_feature_windows(tmp_path, CODE, [DAY], end) == []
+
+
+def test_lineage_cache_uses_raw_bytes_not_only_declared_revision(tmp_path):
+    from src.services.yao_scout import minute_integrity as integrity
+    archive = minute.MinuteArchive(tmp_path)
+    archive.save(CODE, bars(), NOW, verification=anchor())
+    integrity._checked_lineage_session.cache_clear()
+    frozen = minute.read_archive_lineage(tmp_path, CODE, [DAY], cutoff=NOW)
+    returned = minute.read_archive_lineage(tmp_path, CODE, [DAY], cutoff=NOW)
+    returned['sessions'][0]['revision'] = 'caller_mutation'
+    assert minute.validate_archive_lineage(tmp_path, frozen)['valid']
+    with archive.connect() as db:
+        payload = db.execute('SELECT payload FROM sessions WHERE code=? AND day=?', (CODE, DAY)).fetchone()[0]
+        changed = json.loads(zlib.decompress(payload))
+        changed[0]['close'] += .001
+        db.execute('UPDATE sessions SET payload=? WHERE code=? AND day=?',
+            (zlib.compress(json.dumps(changed).encode()), CODE, DAY))
+    assert not minute.validate_archive_lineage(tmp_path, frozen)['valid']
+
+
+def test_current_scan_does_not_rewrite_historical_tail_returned_in_current_page(monkeypatch, tmp_path):
+    cutoff = minute._datetime(bars()[59]['end'])
+    previous_day = (cutoff.date()-timedelta(days=1)).isoformat()
+    archive = minute.MinuteArchive(tmp_path)
+    prior = [{**row, 'end':row['end'].replace(DAY, previous_day)} for row in bars()]
+    archive.save(CODE, prior, cutoff, verification={**anchor(), 'day':previous_day})
+    with archive.connect() as db:
+        before = db.execute('SELECT * FROM session_quality WHERE code=? AND day=?', (CODE, previous_day)).fetchone()
+    class Client:
+        available = True
+        def bars(self, code, **kwargs):
+            return {'bars':prior[-180:] + bars()[:60], 'time_semantics':'bar_end'}
+    monkeypatch.setattr(SoftwareMarketClient, 'from_environment', lambda:Client())
+    monkeypatch.setattr(minute, '_prior_sessions', lambda *_: [])
+    monkeypatch.setattr(minute, 'fetch_sina_bars', lambda *a, **k:pytest.fail('unexpected fallback'))
+    result = minute.fetch_bar_evidence(CODE, cutoff, tmp_path, backfill=False, software_count=240)
+    assert result['asOf'] == cutoff.isoformat()
+    with archive.connect() as db:
+        assert db.execute('SELECT * FROM session_quality WHERE code=? AND day=?', (CODE, previous_day)).fetchone() == before
+        assert db.execute('SELECT COUNT(*) FROM sessions WHERE code=?', (CODE,)).fetchone()[0] == 2
+
+
+def test_lineage_prefix_cache_cannot_hide_a_foreign_session_row(tmp_path):
+    archive = minute.MinuteArchive(tmp_path)
+    archive.save(CODE, bars(), NOW, verification=anchor())
+    frozen = minute.read_archive_lineage(tmp_path, CODE, [DAY], cutoff=NOW)
+    assert frozen['status'] == 'verified'
+    with archive.connect() as db:
+        payload = db.execute('SELECT payload FROM sessions WHERE code=? AND day=?', (CODE, DAY)).fetchone()[0]
+        changed = json.loads(zlib.decompress(payload))
+        changed[-1]['end'] = changed[-1]['end'].replace(DAY, '2026-10-09')
+        db.execute('UPDATE sessions SET payload=? WHERE code=? AND day=?',
+            (zlib.compress(json.dumps(changed).encode()), CODE, DAY))
+    result = minute.read_archive_lineage(tmp_path, CODE, [DAY], cutoff=NOW)
+    assert result['status'] == 'tainted' and 'session_date_mismatch' in result['reasonCodes']
+
+
+def test_verified_history_window_matches_full_normalization_and_rejects_external_price_conflict(tmp_path):
+    archive = minute.MinuteArchive(tmp_path)
+    original = bars()
+    original[45]['amount_cny'] = None
+    archive.save(CODE, original, NOW, verification=anchor())
+    end = minute._datetime(bars()[59]['end'])
+    rows = minute._read_feature_windows(tmp_path, CODE, [DAY], end)
+    expected = [row for at, row in minute.normalize_bars(original, NOW).items()
+                if end-timedelta(minutes=30) <= at <= end]
+    for key in ('end', 'open', 'high', 'low', 'close', 'amount_cny', 'volume_shares'):
+        assert [row[key] for row in rows] == [row[key] for row in expected]
+    assert len(rows) == 31
+    # A provider-price disagreement after the formula window still fails the
+    # full-session independent check, even if the quality row was unchanged.
+    with archive.connect() as db:
+        payload = db.execute('SELECT payload FROM sessions WHERE code=? AND day=?', (CODE, DAY)).fetchone()[0]
+        changed = json.loads(zlib.decompress(payload))
+        changed[-1].update(open=7., high=7.01, low=6.99, close=7.)
+        db.execute('UPDATE sessions SET payload=? WHERE code=? AND day=?',
+            (zlib.compress(json.dumps(changed).encode()), CODE, DAY))
+    assert minute._read_feature_windows(tmp_path, CODE, [DAY], end) == []

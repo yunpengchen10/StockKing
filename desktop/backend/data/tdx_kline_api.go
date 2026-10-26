@@ -6,6 +6,7 @@ import (
 	"go-stock/backend/logger"
 	"go-stock/backend/marketminute"
 	"go-stock/backend/models"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,12 +17,14 @@ import (
 )
 
 type TdxKLineApi struct {
-	client      *gotdx.Client
-	macClient   *gotdx.Client
-	macExClient *gotdx.Client
-	mu          sync.Mutex // 保护 client
-	macMu       sync.Mutex // 保护 macClient
-	macExMu     sync.Mutex // 保护 macExClient
+	client         *gotdx.Client
+	macClient      *gotdx.Client
+	macExClient    *gotdx.Client
+	mu             sync.Mutex // 保护 client
+	macMu          sync.Mutex // 保护 macClient
+	macExMu        sync.Mutex // 保护 macExClient
+	minutePoolOnce sync.Once
+	minutePool     *macMinutePool
 }
 
 var (
@@ -552,6 +555,16 @@ func (t *TdxKLineApi) GetMACMinuteKLineBefore(stockCode string, limit int, end s
 
 func (t *TdxKLineApi) getMACMainKLineDataBefore(stockCode string, klt string, limit int, adjust uint16, end string) *[]KLineData {
 	result := &[]KLineData{}
+	if useCurrentMinutePool(stockCode, klt, limit, adjust, end) {
+		market, code := tdxMarketFromStockCode(stockCode)
+		bars, err := t.currentMinuteBars(market, code, limit)
+		if err != nil {
+			logger.SugaredLogger.Warnf("MAC current-minute pool unavailable: %v", err)
+			return result
+		}
+		converted := convertMACSymbolBar(bars)
+		return &converted
+	}
 	if err := t.ensureMACClient(); err != nil {
 		logger.SugaredLogger.Errorf("TdxKLine ensureMACClient error: %v", err)
 		return result
@@ -676,12 +689,14 @@ func convertMACSymbolBar(list []proto.MACSymbolBar) []KLineData {
 	for i, bar := range list {
 		day := formatMACDateTime(bar.DateTime.Format("2006-01-02 15:04:05"))
 		kd := KLineData{
-			Day:    day,
-			Open:   fmt.Sprintf("%.2f", bar.Open),
-			Close:  fmt.Sprintf("%.2f", bar.Close),
-			High:   fmt.Sprintf("%.2f", bar.High),
-			Low:    fmt.Sprintf("%.2f", bar.Low),
-			Volume: fmt.Sprintf("%.0f", bar.Vol),
+			Day:   day,
+			Open:  fmt.Sprintf("%.2f", bar.Open),
+			Close: fmt.Sprintf("%.2f", bar.Close),
+			High:  fmt.Sprintf("%.2f", bar.High),
+			Low:   fmt.Sprintf("%.2f", bar.Low),
+			// MAC may report fractional lots. Preserve odd-lot shares before
+			// the shared gateway normalizes units; rounding corrupts VWAP.
+			Volume: strconv.FormatFloat(float64(bar.Vol), 'f', -1, 64),
 			Amount: fmt.Sprintf("%.2f", bar.Amount),
 		}
 		if i > 0 {

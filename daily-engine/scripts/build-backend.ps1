@@ -100,6 +100,12 @@ $hiddenImports = @(
   'src.services.yao_scout.morning_task',
   'src.services.yao_scout.premarket',
   'src.services.yao_scout.daily_primary',
+  'src.services.yao_scout.scan_routing',
+  'src.services.yao_scout.daily_observation_outcomes',
+  'src.services.yao_scout.daily_observation_queue',
+  'src.services.yao_scout.learning_contracts',
+  'src.services.yao_scout.entry_execution_policy',
+  'src.services.yao_scout.factor_experiments',
   'src.services.yao_scout.admission_diagnostics',
   'src.services.yao_scout.history_preparation',
   'src.services.yao_scout.history_maintenance',
@@ -219,7 +225,7 @@ if (-not (Test-Path $packagedEntry)) {
 }
 $previousProbe = $env:DSA_PACKAGED_IMPORT_PROBE
 try {
-  foreach ($module in @('src.services.stock_king_display', 'src.services.economy_review', 'src.services.yao_scout.local_opportunities', 'src.services.yao_scout.signal_learning', 'src.services.yao_scout.v11_factors', 'src.services.yao_scout.research_policy', 'src.services.yao_scout.research_factors', 'src.services.yao_scout.theme_evidence', 'src.services.yao_scout.local_algorithm', 'src.services.software_market', 'src.services.screening.pipeline', 'src.quant.service', 'src.quant.executable_backtest', 'api.v1.endpoints.stock_king', 'api.v1.endpoints.quant', 'api.v1.endpoints.portfolio', 'src.services.yao_scout.adaptive', 'lightgbm', 'torch', 'futu', 'orjson')) {
+  foreach ($module in @('src.services.stock_king_display', 'src.services.economy_review', 'src.services.yao_scout.local_opportunities', 'src.services.yao_scout.scan_routing', 'src.services.yao_scout.daily_observation_outcomes', 'src.services.yao_scout.signal_learning', 'src.services.yao_scout.v11_factors', 'src.services.yao_scout.research_policy', 'src.services.yao_scout.research_factors', 'src.services.yao_scout.theme_evidence', 'src.services.yao_scout.local_algorithm', 'src.services.software_market', 'src.services.screening.pipeline', 'src.quant.service', 'src.quant.executable_backtest', 'api.v1.endpoints.stock_king', 'api.v1.endpoints.quant', 'api.v1.endpoints.portfolio', 'src.services.yao_scout.adaptive', 'lightgbm', 'torch', 'futu', 'orjson')) {
     $env:DSA_PACKAGED_IMPORT_PROBE = $module
     $probeProcess = Start-Process -FilePath $packagedEntry -WindowStyle Hidden -Wait -PassThru
     if ($probeProcess.ExitCode -ne 0) {

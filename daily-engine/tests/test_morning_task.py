@@ -218,7 +218,8 @@ def test_real_morning_heads_fit_return_up_event_and_adverse_excursion_independen
     low_probability = learning.predict_model({**artifact, 'calibrationCoef': 0., 'calibrationIntercept': -2.}, rows[1080:])
     assert (low_probability['utility'] > 0).any() and not low_probability['eligible'].any()
     assert learning.class_target({'net': .001}, morning.MORNING_TASK_ID) == 1
-    assert learning.class_target({'net': .001}, learning.ENTRY_TASK_ID) == 0
+    assert learning.class_target({'net': .001}, learning.ENTRY_TASK_ID) == 1
+    assert learning.task_contract()['classMeaning'] == 'net_return_strictly_positive'
     metric = learning.diagnostics(rows[1080:], prediction, artifact)
     assert metric['maePredictionAbsoluteError'] >= 0 and metric['brierSkill'] > 0
 

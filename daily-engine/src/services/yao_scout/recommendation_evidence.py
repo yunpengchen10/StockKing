@@ -23,7 +23,57 @@ def research_queue_limit(universe_size: int) -> int:
     return min(universe_size, max(300, (universe_size + 9) // 10))
 
 
-def research_queue(frame, limit=None):
+def research_selection_row(row, now, *, source=None, source_time=None):
+    """Freeze rank inputs with their own clocks; never redate snapshot ratios.
+
+    Unusable rows remain directory-only controls. They can consume spare
+    research capacity, but stale/missing activity never wins a ranking axis.
+    """
+    def fresh(stamp):
+        try:
+            parsed = datetime.fromisoformat(str(stamp or ''))
+            return bool(parsed.tzinfo and now.tzinfo and 0 <= (now-parsed).total_seconds() <= 30)
+        except (TypeError, ValueError):
+            return False
+    values, evidence = {}, {}
+    original_time = row.get('source_time') or source_time
+    original_source = row.get('source') or source
+    if original_source and fresh(original_time):
+        for key in ('amount', 'volume_ratio', 'turnover_rate', 'price', 'open'):
+            value = finite(row.get(key))
+            if value is not None and value > 0:
+                values[key] = value
+                evidence[key] = {'value': value, 'source': original_source, 'sourceTime': original_time}
+    quote = row.get('market_quote')
+    if (isinstance(quote, dict) and str(quote.get('code')) == str(row.get('code'))
+            and quote.get('source') and fresh(quote.get('source_time'))):
+        # These fields are one observation. Missing quote fields cannot borrow
+        # an older snapshot's matching name or its unrelated update clock.
+        for key, quoted in (('amount', 'amount_cny'), ('price', 'price'), ('open', 'open')):
+            values.pop(key, None)
+            evidence.pop(key, None)
+            value = finite(quote.get(quoted))
+            if value is not None and value > 0:
+                values[key] = value
+                evidence[key] = {'value': value, 'source': quote['source'], 'sourceTime': quote['source_time']}
+    # Opening recovery is a ratio of prices from the SAME provider observation.
+    recovery_valid = bool(evidence.get('price') and evidence.get('open')
+        and (evidence['price']['source'], evidence['price']['sourceTime'])
+        == (evidence['open']['source'], evidence['open']['sourceTime']))
+    if not recovery_valid:
+        values.pop('open', None)
+        evidence.pop('open', None)
+    ranked = any(key in values for key in ('amount', 'volume_ratio', 'turnover_rate')) or recovery_valid
+    return {**row, **{key: values.get(key) for key in ('amount', 'volume_ratio', 'turnover_rate', 'price', 'open')},
+        'selectionEvidence': {'version': 'fresh-selection-inputs-v1',
+            'status': 'observed' if ranked else 'directory_only', 'evaluatedAt': now.isoformat(),
+            'fields': evidence, 'missingFields': [key for key in ('amount', 'volume_ratio', 'turnover_rate', 'price', 'open')
+                                               if key not in evidence],
+            'originalSnapshotSourceTime': original_time,
+            'meaning': '每个初筛字段使用自身供应商源时；缺失指标不参与名次，未借新报价给旧快照续期'}}
+
+
+def research_queue(frame, limit=None, *, now=None):
     """Prioritize activity/recovery leaders within a universe-sized research budget."""
     if limit is not None and limit < 0:
         raise ValueError('research limit must not be negative')
@@ -31,6 +81,10 @@ def research_queue(frame, limit=None):
         return []
     # Repeated provider rows must not crowd out another stock or inflate the budget.
     data = frame.drop_duplicates('code').copy()
+    if now is not None:
+        data = pd.DataFrame([research_selection_row(row, now,
+            source=frame.attrs.get('source') or frame.attrs.get('snapshot_source'),
+            source_time=frame.attrs.get('source_time')) for row in data.to_dict('records')])
     if limit is None:
         limit = research_queue_limit(len(data))
     if limit == 0:
@@ -372,7 +426,7 @@ def explain_candidate(item, quote, daily, intraday, now, slot, snapshot_meta=Non
                 'history_5d':history_days >= 5,'history_20d':baseline_ok,
                 'relative_volume':volume_confirmed,'fund_direction':funds_ok},
             'sectorEvidence':sector,'fundEvidence':funds,
-            'baselineEvidence':{key:(intraday or {}).get(key) for key in ('historyDays','baselineReady','baselineMedianAmount','baselineDates','missingHistoryDates','baselineSource','historyAccess')},
+            'baselineEvidence':{key:(intraday or {}).get(key) for key in ('historyDays','priceHistoryDays','baselineReady','baselineStatus','sessionWindow','baselineMedianAmount','baselineDates','missingHistoryDates','baselineSource','historyAccess')},
             'evidencePriority': 'minute_price_and_turnover' if immediate and (finite(m.get('amount_3m')) or 0)>0 else 'minute_price' if immediate else 'premarket_structure',
             'rankMeaning': '按即时价量证据完整性安排观察，其次参考累计成交额；不是预期收益或胜率排名',
             'entryPlan': {'trigger': triggers[0], 'invalidations': invalidations, 'noChase': no_chase,

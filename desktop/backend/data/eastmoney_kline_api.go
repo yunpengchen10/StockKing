@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/duke-git/lancet/v2/convertor"
-	"github.com/duke-git/lancet/v2/validator"
 	"github.com/go-resty/resty/v2"
 	uaFake "github.com/lib4u/fake-useragent"
 )
@@ -442,7 +441,7 @@ func (receiver *EastMoneyKLineApi) convertStockCode(stockCode string) string {
 	}
 
 	// 纯数字代码，根据代码规则判断市场
-	if len(stockCode) >= 1 && validator.IsNumber(stockCode) {
+	if len(stockCode) == 6 && strings.IndexFunc(stockCode, func(r rune) bool { return r < '0' || r > '9' }) == -1 {
 		firstChar := stockCode[0:1]
 		switch firstChar {
 		case "6": // 沪市主板

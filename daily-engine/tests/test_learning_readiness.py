@@ -91,14 +91,18 @@ def test_ready_validation_failure_and_shadow_are_distinct_without_relaxing_gates
     now = _clock(DAY, 15, 30)
     service = SignalLearningService(tmp_path)
     learner = learning.TaskLearner(service, morning.MORNING_TASK_ID, '1030')
-    days = [(DAY - timedelta(days=day)).isoformat() for day in range(120)]
-    samples = [{'day': day, 'code': str(code)} for day in days for code in range(10)]
+    days = sorted((DAY - timedelta(days=day)).isoformat() for day in range(190))
+    samples = [{'day': day, 'code': str(code), 'net': .01 if code % 2 else -.01,
+                'labelEndAt': day+'T15:01:00+08:00', 'labelKnownAt': day+'T15:30:00+08:00',
+                'dataQualityKnownAt': day+'T15:30:00+08:00'} for day in days for code in range(10)]
     registry = registry_for(learner, now, (samples, days, True))
     learner.save_registry(registry, now)
     state = learner.readiness(now)
     assert state['status'] == 'ready_for_training'
     assert state['progress']['minimumHoldoutDays'] == 60
     assert state['progress']['shadowRequiredDays'] == 20
+    assert state['progress']['trainingSplits']['ready'] is True
+    assert state['progress']['trainingSplits']['minimumSignalDaysForAnyTraining'] == 156
     assert 'validated_model_missing' in state['blockerCodes']
     registry.update(reason='challenger_holdout_gate_failed', gates={'holdout': {'passed': False}})
     learner.save_registry(registry, now)

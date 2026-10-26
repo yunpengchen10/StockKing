@@ -10,7 +10,7 @@ import math
 from collections.abc import Mapping
 from .research_policy import _freeze, _plain
 
-PORTFOLIO_POLICY_VERSION = "king-portfolio-v1"
+PORTFOLIO_POLICY_VERSION = "king-portfolio-v2"
 POLICY_PARAMETERS = _freeze({
     "exposureByRegime": {"normal": 1.0, "weak": .5, "hot": .75, "unknown": .5},
     "maxPositionWeight": .2,
@@ -68,9 +68,18 @@ def _industry(candidate):
 def annotate_portfolio(candidates):
     """Freeze the same market budget and per-name caps for selected and controls."""
     rows = list(candidates)
-    regimes = [(row.get("marketRegime") or {}).get("state", "unknown") for row in rows]
+    regimes = []
+    for row in rows:
+        regimes.append((row.get("marketRegime") or {}).get("state", "unknown"))
+        # Current verified breadth has its own risk state even when the separate
+        # 60-session emotion factor cannot be scored. Never let that omission,
+        # or a more optimistic emotion regime, erase the weak-market budget.
+        admission = row.get("primaryAdmission") or (row.get("precisionDecision") or {}).get("primaryAdmission") or {}
+        if "marketRiskState" in admission:
+            regimes.append(admission["marketRiskState"])
     regimes = [value if value in POLICY_PARAMETERS["exposureByRegime"] else "unknown" for value in regimes]
-    regime = min(regimes or ["unknown"], key=lambda key: POLICY_PARAMETERS["exposureByRegime"][key])
+    regime = min(regimes or ["unknown"], key=lambda key: (
+        POLICY_PARAMETERS["exposureByRegime"][key], key != "weak"))
     total = POLICY_PARAMETERS["exposureByRegime"][regime]
     annotated = []
     for row in rows:

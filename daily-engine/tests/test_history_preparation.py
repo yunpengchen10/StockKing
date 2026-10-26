@@ -169,6 +169,9 @@ def test_rejected_provider_row_is_retained_but_never_used_as_a_minute(tmp_path):
                 for row in historical(code, **kwargs)]
     result = run(tmp_path, minute_fetcher=malformed, max_pages_per_code=1)
     assert result['ready'] == 1 and not result['details'][CODE]['fullSessionReady']
+    rejected = next(e for e in result['details'][CODE]['errors'] if e.get('day') == DAYS[0])
+    assert rejected['sourceMinuteCount'] == 240
+    assert rejected['normalizationRejectedMinuteTimes'] == [DAYS[0]+'T11:06:00+08:00']
     archive = minute.MinuteArchive(tmp_path)
     assert len(archive.read(CODE, NOW)) == 20 * 239
     with archive.connect() as db:
@@ -270,3 +273,114 @@ def test_daily_adapter_preserves_historical_dates_and_rejects_duplicate_conflict
                 {'day': '2026-10-16', 'open': 10, 'high': 10.01, 'low': 9.99, 'close': 10}]}}
     packet = prep.fetch_daily_anchors(CODE, DAYS, NOW, getter=lambda *a, **k: Response())
     assert set(packet) == {DAYS[1]} and packet[DAYS[1]]['kind'] == 'daily_ohlc'
+
+
+def test_ready_clocks_follow_real_windows_instead_of_worker_clock(tmp_path):
+    def partial(code, **kwargs):
+        return [row for row in historical(code, **kwargs) if row['end'][11:16] != '13:07']
+    result = run(tmp_path, minute_fetcher=partial, max_pages_per_code=1)
+    detail = result['details'][CODE]
+    assert not detail['ready'] and not detail['fullSessionReady']
+    assert detail['verifiedDayCount'] == 20
+    assert '10:30:00' in detail['readyClocks']
+    assert '13:01:00' not in detail['readyClocks']
+    assert '13:04:00' in detail['readyClocks']
+    assert all(f'13:{minute:02d}:00' not in detail['readyClocks'] for minute in range(7, 11))
+    assert '13:11:00' in detail['readyClocks']
+    assert result['preparedWithUsableClocks'] == 1
+
+
+def test_preparation_warmup_does_not_erase_complete_historical_sessions(tmp_path):
+    cutoff = NOW.replace(hour=13, minute=1)
+    result = prep.prepare_history([CODE], cutoff, tmp_path,
+        minute_fetcher=historical, daily_fetcher=daily)
+    detail = result['details'][CODE]
+    assert detail['fullSessionReady'] and not detail['ready']
+    assert detail['sessionWindow']['status'] == 'session_warmup'
+    assert detail['sessionWindow']['baselineReadyAt'].endswith('13:04:00+08:00')
+    assert detail['readyClocks'][0] == '09:34:00'
+    assert '13:04:00' in detail['readyClocks']
+    assert result['fullSessionReady'] == 1
+
+
+def test_verified_partial_sessions_can_gain_compatible_real_minutes_with_cas(tmp_path):
+    archive = minute.MinuteArchive(tmp_path)
+    day = DAYS[0]
+    previous = [row for row in session(day) if row['end'][11:16] != '13:07']
+    fresh = [row for row in session(day) if row['end'][11:16] != '13:08']
+    archive.save(CODE, previous, NOW, verification=anchor(day))
+    lineage = archive.quality(CODE, NOW, [day])
+    revision = lineage['sessions'][0]['revision']
+    result = archive.supplement_verified_session(CODE, day, fresh, NOW,
+        verification=anchor(day), expected_revision=revision)
+    assert result['addedMinutes'] == 1 and result['actualMinutes'] == 240
+    assert result['revision'] != revision and not result['fullSessionRebuild']
+    assert len(archive.read(CODE, NOW)) == 240
+    assert not minute.validate_archive_lineage(tmp_path, lineage)['valid']
+    with archive.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM session_evidence WHERE kind='before_verified_supplement'").fetchone()[0] == 1
+    with pytest.raises(ValueError, match='revision changed'):
+        archive.supplement_verified_session(CODE, day, fresh, NOW,
+            verification=anchor(day), expected_revision=revision)
+
+
+@pytest.mark.parametrize('failure', ['overlap', 'identity', 'anchor', 'quarantine'])
+def test_partial_supplement_rejects_conflict_unverified_or_quarantined_bytes(tmp_path, failure):
+    archive = minute.MinuteArchive(tmp_path)
+    day = DAYS[0]
+    archive.save(CODE, session(day)[:-1], NOW, verification=anchor(day))
+    if failure == 'quarantine':
+        archive.quarantine(CODE, day, 'test_conflict')
+    with archive.connect() as db:
+        original = db.execute('SELECT payload FROM sessions WHERE code=? AND day=?', (CODE, day)).fetchone()[0]
+    old = json.loads(zlib.decompress(original))
+    revision = session_revision(CODE, day, old)
+    fresh = session(day)[1:]
+    if failure == 'overlap':
+        fresh[0] = {**fresh[0], 'close':10.005}
+    if failure == 'identity':
+        fresh[0] = {**fresh[0], 'identity_evidence':{}}
+    verification = anchor(day)
+    if failure == 'anchor':
+        verification = {**verification, 'source':'tdx-mac'}
+    with pytest.raises(ValueError):
+        archive.supplement_verified_session(CODE, day, fresh, NOW,
+            verification=verification, expected_revision=revision)
+    with archive.connect() as db:
+        assert db.execute('SELECT payload FROM sessions WHERE code=? AND day=?', (CODE, day)).fetchone()[0] == original
+
+
+def test_partial_supplement_preserves_complete_history_and_unchanged_partial_revision(tmp_path):
+    archive = minute.MinuteArchive(tmp_path)
+    day = DAYS[0]
+    for rows, expected in [(session(day)[:-1], 'no_new_verified_minutes'),
+                           (session(day), 'complete_session_preserved')]:
+        archive.save(CODE, rows, NOW, verification=anchor(day))
+        lineage = archive.quality(CODE, NOW, [day])
+        revision = lineage['sessions'][0]['revision']
+        result = archive.supplement_verified_session(CODE, day, rows[1:], NOW,
+            verification=anchor(day), expected_revision=revision)
+        assert result['unchanged'] and result['reason'] == expected
+        assert result['revision'] == revision
+        assert minute.validate_archive_lineage(tmp_path, lineage)['valid']
+
+
+def test_preparation_merges_complementary_partial_pages_without_repeating_same_page(tmp_path):
+    archive = minute.MinuteArchive(tmp_path)
+    for day in DAYS:
+        rows = session(day)
+        archive.save(CODE, rows[:-1] if day == DAYS[0] else rows, NOW, verification=anchor(day))
+    result = run(tmp_path, minute_fetcher=lambda *a, **kw: session(DAYS[0])[1:])
+    assert result['details'][CODE]['fullSessionReady']
+    assert result['details'][CODE]['pages'] == 1
+    assert result['details'][CODE]['repairedDays'] == DAYS[:1]
+
+
+def test_preparation_same_partial_page_is_no_progress_instead_of_write_failure(tmp_path):
+    archive = minute.MinuteArchive(tmp_path)
+    for day in DAYS:
+        archive.save(CODE, session(day)[:-1], NOW, verification=anchor(day))
+    result = run(tmp_path, minute_fetcher=lambda *a, **kw: [row for day in DAYS for row in session(day)[:-1]])
+    detail = result['details'][CODE]
+    assert detail['pages'] == 1 and not detail['fullSessionReady']
+    assert {e['reason'] for e in detail['errors']} == {'historical_minute_session_incomplete', 'no_new_verified_minutes'}

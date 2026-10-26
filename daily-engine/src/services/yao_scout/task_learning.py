@@ -30,6 +30,11 @@ WALK_FORWARD_DAYS = 20
 WALK_FORWARD_FOLDS = 3
 COHORT_WINDOW_DAYS = 240
 _LINEAGE_CACHE = ContextVar('stock_king_lineage_validation_cache', default=None)
+TARGET_HEAD_FAILURE_REASONS = {
+    0: None, 1: 'auxiliary_head_not_fitted', 2: 'auxiliary_calibration_fields_missing',
+    3: 'auxiliary_model_unreadable', 4: 'auxiliary_prediction_nonfinite_or_out_of_range',
+    5: 'auxiliary_calibration_nonfinite_or_invalid',
+}
 
 
 def task_contract(task_id=ENTRY_TASK_ID, queue=None):
@@ -41,21 +46,29 @@ def task_contract(task_id=ENTRY_TASK_ID, queue=None):
     if task_id == MORNING_TASK_ID and queue not in MORNING_QUEUES:
         raise ValueError('morning_time_stratum_required')
     payload = {'taskId': task_id, 'queue': queue, 'targetHorizon': 1,
-        'version': TASK_MODEL_VERSION, 'dataQualityVersion': DATA_QUALITY_VERSION,
+        'version': 'king-entry-dual-probability-v2' if task_id == ENTRY_TASK_ID else TASK_MODEL_VERSION,
+        'dataQualityVersion': DATA_QUALITY_VERSION,
         'featureSchemaVersion': 'frozen-numeric-with-missing-indicators-v1',
-        'labelVersion': 'executable-T1-net-frozen-cap-v1' if task_id == ENTRY_TASK_ID else 'T1-close-price-pattern-v1',
+        'labelVersion': 'executable-T1-net-frozen-cap-entry-band-v2' if task_id == ENTRY_TASK_ID else 'T1-close-price-pattern-v1',
         'labelSizing': 'frozen_single_name_cap_fee_inclusive_nominal_account' if task_id == ENTRY_TASK_ID else 'none_price_observation',
         'bigReturnThreshold': BIG_RETURN_THRESHOLD, 'tailAlpha': TAIL_ALPHA,
         'riskCoefficient': RISK_COEFFICIENT, 'parameterStatus': 'declared_unvalidated_research_defaults',
         'calibration': 'disjoint_chronological_sigmoid',
         'returnMeaning': 'after_cost_execution_proxy' if task_id == ENTRY_TASK_ID else 'price_observation_not_trading_return',
-        'classMeaning': 'net_return_at_least_5pct' if task_id == ENTRY_TASK_ID else 'next_session_close_10pct_price_pattern',
+        'classMeaning': 'net_return_strictly_positive' if task_id == ENTRY_TASK_ID else 'next_session_close_10pct_price_pattern',
         'costPolicy': 'already_in_net_label_do_not_subtract_again',
         'unknownFillPolicy': 'unknown_not_cash_zero',
         'folds': WALK_FORWARD_FOLDS, 'foldDays': WALK_FORWARD_DAYS,
         'cohortWindowSignalDays': COHORT_WINDOW_DAYS,
         'signalQualityEligibility': 'verified_and_known_no_later_than_publication_immutable',
         'minimumShadowCompletedObservations': 50}
+    if task_id == ENTRY_TASK_ID:
+        payload.update(winProbabilityMeaning='T_plus_1_simulated_after_cost_net_return_strictly_positive',
+            targetReturnProbabilityMeaning='T_plus_1_simulated_after_cost_net_return_at_least_5pct',
+            probabilityScope='prospectively_eligible_signals_including_verified_no_fill_zero_payoff',
+            observedDirectionMeaning='separate_same_session_price_observation_not_executable_profit',
+            probabilityHeads='required_win_optional_independently_calibrated_target_return',
+            minimumWinProbability=.5, rankObjective='after_cost_positive_net_return_probability_with_positive_utility')
     if task_id == MORNING_TASK_ID:
         payload.update(targetHorizon=0, labelVersion=MORNING_VERSION,
             classMeaning='same_session_close_above_frozen_published_signal_reference_price',
@@ -101,18 +114,25 @@ def scoped_lineage_validation(method):
 def _validated_lineage(service, lineage):
     if not isinstance(lineage, dict) or not lineage.get('sessions'):
         return {'valid':False,'sessions':[]}
-    from .minute_history import validate_archive_lineage
+    from .minute_integrity import validate_archive_dependencies
     cache = _LINEAGE_CACHE.get()
-    sessions, valid = [], True
+    cache = cache if cache is not None else {}
+    keys, pending = [], {}
     for session in lineage['sessions']:
         prefix = {name:session.get(name) for name in ('code','day','frozenThrough','revision')}
         dependency = {'data_quality_version':lineage.get('data_quality_version'),'sessions':[prefix]}
         key = (str(service.data_dir),json.dumps(dependency,sort_keys=True,separators=(',',':')))
-        result = cache.get(key) if cache is not None else None
-        if result is None:
-            result = validate_archive_lineage(service.data_dir / 'minute_history',dependency)
-            if cache is not None:
-                cache[key] = result
+        keys.append(key)
+        if key not in cache:
+            pending[key] = prefix
+    if pending:
+        checked = validate_archive_dependencies(service.data_dir / 'minute_history', {
+            'data_quality_version':lineage.get('data_quality_version'), 'sessions':list(pending.values())})
+        for index, key in enumerate(pending):
+            cache[key] = checked[index] if index < len(checked) else {'valid':False, 'sessions':[]}
+    sessions, valid = [], True
+    for key in keys:
+        result = cache[key]
         sessions.extend(result.get('sessions') or [])
         valid = valid and result.get('valid') is True
     return {'valid':valid,'sessions':sessions}
@@ -165,7 +185,7 @@ def feature_matrix(samples, features, medians):
 
 def class_target(row, task_id):
     if task_id == ENTRY_TASK_ID:
-        return int(row['net'] >= BIG_RETURN_THRESHOLD)
+        return int(row['net'] > 0)
     if task_id == MORNING_TASK_ID:
         return int(row['net'] > 0)
     return int(row['eventLabel'])
@@ -216,6 +236,26 @@ def fit_model(train, calibration, task_id, queue=None):
         'rankMeaning': 'calibrated_event_probability_with_positive_return_utility_gate',
         'trainedThrough': max(row['day'] for row in train),
         'calibrationThrough': max(row['day'] for row in calibration), 'modelParameters': args}
+    if task_id == ENTRY_TASK_ID:
+        # The main head now answers net profitability. A rare +5% target must
+        # not prevent a well-supported win model from reaching validation.
+        artifact.update(mainProbabilityTarget='net_return_strictly_positive',
+            trainingWinPrevalence=artifact['trainingPrevalence'],
+            targetReturnModelStatus='two_classes_required_in_train_and_calibration',
+            targetReturnProbabilityValidated=False,
+            rankMeaning='calibrated_T1_positive_net_return_probability_with_positive_return_utility_gate')
+        target_y = np.asarray([int(row['net'] >= BIG_RETURN_THRESHOLD) for row in train])
+        target_yc = np.asarray([int(row['net'] >= BIG_RETURN_THRESHOLD) for row in calibration])
+        if len(np.unique(target_y)) == 2 and len(np.unique(target_yc)) == 2:
+            target_classifier = LGBMClassifier(**args).fit(x, target_y, sample_weight=w)
+            target_raw = np.clip(target_classifier.predict_proba(xc)[:, 1], 1e-6, 1-1e-6)
+            target_calibrator = LogisticRegression(C=1., max_iter=500, random_state=23).fit(
+                np.log(target_raw/(1-target_raw)).reshape(-1, 1), target_yc, sample_weight=wc)
+            artifact.update(targetClassifier=target_classifier.booster_.model_to_string(),
+                targetCalibrationCoef=float(target_calibrator.coef_[0, 0]),
+                targetCalibrationIntercept=float(target_calibrator.intercept_[0]),
+                trainingTargetPrevalence=float(np.average(target_y, weights=w)),
+                targetReturnModelStatus='fitted_calibrated_pending_out_of_time_validation')
     if task_id == MORNING_TASK_ID:
         adverse = np.asarray([finite(row.get('observedMae')) for row in train], dtype=float)
         if not np.all(np.isfinite(adverse)) or np.any(adverse < 0):
@@ -230,8 +270,13 @@ def predict_model(artifact, samples):
     x = feature_matrix(samples, artifact['features'], artifact['medians'])
     net = np.asarray(Booster(model_str=artifact['netRegressor']).predict(x, num_threads=1), dtype=float)
     tail = np.asarray(Booster(model_str=artifact['tailRegressor']).predict(x, num_threads=1), dtype=float)
-    raw = np.clip(Booster(model_str=artifact['eventClassifier']).predict(x, num_threads=1), 1e-6, 1-1e-6)
+    raw = np.asarray(Booster(model_str=artifact['eventClassifier']).predict(x, num_threads=1), dtype=float)
+    if raw.shape != (len(samples),) or not np.all(np.isfinite(raw)) or np.any((raw < 0) | (raw > 1)):
+        raise ValueError('invalid_required_probability_prediction')
+    raw = np.clip(raw, 1e-6, 1-1e-6)
     logit = np.log(raw/(1-raw)) * artifact['calibrationCoef'] + artifact['calibrationIntercept']
+    if not np.all(np.isfinite(logit)):
+        raise ValueError('invalid_required_probability_calibration')
     probability = 1 / (1 + np.exp(-np.clip(logit, -30, 30)))
     standardized = (x - artifact['logisticMean']) / artifact['logisticScale']
     logistic = 1 / (1 + np.exp(-np.clip(standardized @ artifact['logisticCoef'] + artifact['logisticIntercept'], -30, 30)))
@@ -253,7 +298,52 @@ def predict_model(artifact, samples):
               'trainingMeanReturn': np.full(len(samples), artifact['trainingMeanReturn'])}
     if adverse is not None:
         result['expectedMae'] = adverse
-    if any(not np.all(np.isfinite(value)) for value in result.values()):
+    if artifact['taskId'] == ENTRY_TASK_ID:
+        if artifact.get('mainProbabilityTarget') != 'net_return_strictly_positive':
+            raise ValueError('entry_win_probability_head_contract_missing')
+        result['winProbability'] = probability
+        result['trainingWinPrevalence'] = np.full(len(samples), artifact['trainingWinPrevalence'])
+        result['targetReturnProbability'] = np.full(len(samples), np.nan)
+        result['trainingTargetPrevalence'] = np.full(len(samples), np.nan)
+        result['targetReturnProbabilityAvailable'] = np.full(len(samples), False)
+        result['targetReturnProbabilityFailureCode'] = np.full(len(samples), 1, dtype=int)
+        if artifact.get('targetClassifier'):
+            # An optional target head has no authority over the required win
+            # head. Corruption or incomplete calibration leaves only it unknown.
+            failure = 2
+            try:
+                required = ('targetCalibrationCoef', 'targetCalibrationIntercept', 'trainingTargetPrevalence')
+                if not all(key in artifact for key in required):
+                    raise ValueError('optional_calibration_fields_missing')
+                failure = 5
+                coef, intercept, prevalence = [finite(artifact[key]) for key in required]
+                if any(value is None for value in (coef, intercept, prevalence)) or not 0 <= prevalence <= 1:
+                    raise ValueError('optional_calibration_invalid')
+                failure = 3
+                target_raw = np.asarray(Booster(model_str=artifact['targetClassifier']).predict(x, num_threads=1), dtype=float)
+                failure = 4
+                if (target_raw.shape != (len(samples),) or not np.all(np.isfinite(target_raw))
+                        or np.any((target_raw < 0) | (target_raw > 1))):
+                    raise ValueError('optional_predictions_invalid')
+                target_raw = np.clip(target_raw, 1e-6, 1-1e-6)
+                with np.errstate(over='ignore', invalid='ignore'):
+                    target_logit = np.log(target_raw/(1-target_raw))*coef + intercept
+                if not np.all(np.isfinite(target_logit)):
+                    raise ValueError('optional_calibrated_logit_nonfinite')
+                target_probability = 1/(1+np.exp(-np.clip(target_logit, -30, 30)))
+                if not np.all(np.isfinite(target_probability)) or np.any((target_probability < 0) | (target_probability > 1)):
+                    raise ValueError('optional_calibrated_probability_invalid')
+                result['targetReturnProbability'] = target_probability
+                result['trainingTargetPrevalence'] = np.full(len(samples), prevalence)
+                result['targetReturnProbabilityAvailable'][:] = True
+                result['targetReturnProbabilityFailureCode'][:] = 0
+            except Exception:
+                result['targetReturnProbabilityFailureCode'][:] = failure
+        result['eligible'] = eligible & (result['winProbability'] > artifact['minimumWinProbability'])
+        result['rank'] = np.where(result['eligible'], result['winProbability']*100, 0.)
+    optional = {'targetReturnProbability', 'trainingTargetPrevalence'}
+    if any(not np.all(np.isfinite(value[result['targetReturnProbabilityAvailable']]) if key in optional
+                       else np.isfinite(value)) for key, value in result.items()):
         raise ValueError('nonfinite_model_prediction')
     return result
 
@@ -287,6 +377,33 @@ def diagnostics(samples, prediction, artifact):
         'independentTradingDays': len({row['day'] for row in samples}),
         'recommendationCoverage': float(np.average(prediction['eligible'], weights=weights)),
         'returnMeaning': artifact['returnMeaning']}
+    if artifact['taskId'] == ENTRY_TASK_ID:
+        wins = np.asarray([int(row['net'] > 0) for row in samples])
+        win_p = np.clip(prediction['winProbability'], 1e-6, 1-1e-6)
+        win_base_p = prediction.get('trainingWinPrevalence', artifact['trainingWinPrevalence'])
+        win_brier = float(np.average((win_p-wins)**2, weights=weights))
+        win_base = float(np.average((win_base_p-wins)**2, weights=weights))
+        result.update(winBrier=win_brier, winBaselineBrier=win_base,
+            winBrierSkill=1-win_brier/win_base if win_base > 0 else None,
+            winningSignals=int(wins.sum()),
+            probabilityMeaning=artifact['winProbabilityMeaning'],
+            targetReturnProbabilityMeaning=artifact['targetReturnProbabilityMeaning'])
+        available = prediction.get('targetReturnProbabilityAvailable', np.zeros(len(samples), dtype=bool))
+        if np.all(available) and len(samples):
+            target_y = np.asarray([int(row['net'] >= BIG_RETURN_THRESHOLD) for row in samples])
+            target_p = prediction['targetReturnProbability']
+            target_base = prediction['trainingTargetPrevalence']
+            target_brier = float(np.average((target_p-target_y)**2, weights=weights))
+            target_baseline = float(np.average((target_base-target_y)**2, weights=weights))
+            result.update(targetReturnBrier=target_brier,
+                targetReturnBrierSkill=1-target_brier/target_baseline if target_baseline > 0 else None,
+                targetReturnPositiveEvents=int(target_y.sum()))
+        else:
+            result.update(targetReturnBrier=None, targetReturnBrierSkill=None, targetReturnPositiveEvents=None)
+        result['targetReturnProbabilityCoverage'] = float(np.average(available, weights=weights))
+    result['tailCalibrationDiagnostic'] = {'targetViolationRate': TAIL_ALPHA,
+        'observedViolationRate': result['q10Coverage'], 'independentTradingDays': result['independentTradingDays'],
+        'releaseAuthority': False, 'meaning': '尾部覆盖诊断；不得仅凭全局Brier声称尾部已校准'}
     if artifact['taskId'] == MORNING_TASK_ID:
         adverse = np.asarray([row['observedMae'] for row in samples], dtype=float)
         result.update(meanObservedMae=float(np.average(adverse, weights=weights)),
@@ -300,7 +417,7 @@ def partition(samples, days, boundary, calibration_days=20, purge_days=5):
     """All label intervals must finish before the next chronological block."""
     calibration_start = boundary-calibration_days-purge_days
     train_end = calibration_start-purge_days
-    if train_end <= 0:
+    if train_end <= 0 or boundary >= len(days):
         return [], []
     train_dates = set(days[:train_end])
     calibration_dates = set(days[calibration_start:boundary-purge_days])
@@ -315,6 +432,80 @@ def partition(samples, days, boundary, calibration_days=20, purge_days=5):
     return train, calibration
 
 
+def training_split_readiness(samples, days, task_id):
+    """Use the same chronological boundaries and known-at purge as fitting.
+
+    The 120-day collection floor is not a promise that the three development
+    folds can fit. Report actual counts without running a model or peeking at
+    returns to choose dates. Class availability is a feasibility check only.
+    """
+    from .research_policy import DEFAULT_PARAMETERS
+    validation = DEFAULT_PARAMETERS['validation']
+    days = sorted(set(days))
+    purge = validation['purgeDays']
+    calibration_days = max(20, validation['minimumCalibrationDays'])
+    holdout_size = max(validation['minimumHoldoutDays'], math.ceil(len(days)*validation['holdoutFraction']))
+    boundary = len(days)-holdout_size
+    development_end = boundary-purge
+    structural_minimum = validation['minimumMatureDays']
+    while structural_minimum - max(validation['minimumHoldoutDays'], math.ceil(
+            structural_minimum*validation['holdoutFraction'])) - purge - WALK_FORWARD_DAYS*WALK_FORWARD_FOLDS - calibration_days - 2*purge < 1:
+        structural_minimum += 1
+    blocks = []
+    for fold in range(WALK_FORWARD_FOLDS):
+        end = development_end-(WALK_FORWARD_FOLDS-1-fold)*WALK_FORWARD_DAYS
+        blocks.append((f'development_{fold+1}', end-WALK_FORWARD_DAYS, end))
+    blocks.append(('holdout', boundary, len(days)))
+    audits, reasons = [], []
+    for name, start, end in blocks:
+        train, calibration = partition(samples, days, start,
+            calibration_days=calibration_days, purge_days=purge) if start > 0 else ([], [])
+        dates = days[max(0, start):max(0, end)] if end > 0 else []
+        test = [row for row in samples if row['day'] in set(dates)]
+        train_days, calibration_dates = sorted({row['day'] for row in train}), sorted({row['day'] for row in calibration})
+        issues = []
+        if start <= 0 or start-calibration_days-2*purge <= 0:
+            issues.append('rolling_development_history_insufficient')
+        if len(train) < validation['minimumTrainSamples']:
+            issues.append('rolling_train_samples_too_small')
+        if len(calibration_dates) < validation['minimumCalibrationDays']:
+            issues.append('rolling_calibration_days_too_small')
+        if not test:
+            issues.append('validation_samples_missing')
+        label_classes = {}
+        for kind, rows in (('train', train), ('calibration', calibration)):
+            try:
+                classes = sorted({class_target(row, task_id) for row in rows})
+                win_classes = sorted({int(row['net'] > 0) for row in rows}) if task_id == ENTRY_TASK_ID else None
+            except (KeyError, TypeError, ValueError):
+                classes, win_classes = [], []
+            label_classes[kind] = {'targetClasses': classes, 'winClasses': win_classes}
+            if len(classes) != 2 or (task_id == ENTRY_TASK_ID and len(win_classes) != 2):
+                issues.append(kind+'_two_classes_required')
+        if name != 'holdout' and boundary >= 0 and boundary < len(days) and any(
+                row.get(key, '9999') >= days[boundary]
+                for row in test for key in ('labelEndAt', 'labelKnownAt', 'dataQualityKnownAt')):
+            issues.append('rolling_test_labels_incomplete')
+        audit = {'name': name, 'trainDays': len(train_days), 'trainSamples': len(train),
+            'trainSamplesMissing': max(0, validation['minimumTrainSamples']-len(train)),
+            'calibrationDays': len(calibration_dates), 'calibrationSamples': len(calibration),
+            'calibrationDaysMissing': max(0, validation['minimumCalibrationDays']-len(calibration_dates)),
+            'evaluationDays': len(dates), 'evaluationSamples': len(test),
+            'trainThrough': train_days[-1] if train_days else None,
+            'calibrationThrough': calibration_dates[-1] if calibration_dates else None,
+            'evaluationFrom': dates[0] if dates else None, 'evaluationThrough': dates[-1] if dates else None,
+            'classAvailability': label_classes, 'ready': not issues, 'blockerCodes': list(dict.fromkeys(issues))}
+        audits.append(audit)
+        reasons.extend(issues)
+    return {'version': 'chronological-split-readiness-v1', 'ready': not reasons,
+        'minimumSignalDaysForAnyTraining': structural_minimum,
+        'additionalSignalDaysForAnyTraining': max(0, structural_minimum-len(days)),
+        'minimumTrainSamplesPerFold': validation['minimumTrainSamples'],
+        'calibrationWindowDays': calibration_days, 'purgeDays': purge,
+        'holdoutDays': holdout_size, 'folds': audits, 'blockerCodes': list(dict.fromkeys(reasons)),
+        'meaning': '结构下限仍需每折实际样本及两类标签；未预测日历到达日期，不代表已通过收益验证'}
+
+
 def load_artifact(service, version, active_only=False):
     if not version:
         return None
@@ -324,12 +515,12 @@ def load_artifact(service, version, active_only=False):
         return None
     try:
         artifact, gates = json.loads(row[0]), json.loads(row[2])
-        from .local_algorithm import algorithm_contract
+        from .learning_contracts import compatibility, learning_contracts
         contract = task_contract(artifact.get('taskId'), artifact.get('queue'))
         if (row[1] not in ({'active'} if active_only else {'active', 'shadow'})
                 or gates.get('passed') is not True or artifact.get('version') != version
                 or artifact.get('taskContractId') != contract['taskContractId']
-                or artifact.get('algorithmContractId') != algorithm_contract()['contractId']
+                or not compatibility(artifact)['compatible']
                 or not lineage_valid(service, artifact.get('dataLineage'))
                 or not all(key in artifact for key in ('netRegressor', 'tailRegressor', 'eventClassifier',
                     'calibrationCoef', 'calibrationIntercept', 'ridgeCoef', 'features', 'medians',
@@ -337,7 +528,14 @@ def load_artifact(service, version, active_only=False):
             return None
         if artifact.get('taskId') == MORNING_TASK_ID and 'maeRegressor' not in artifact:
             return None
-        # A release row is not usable unless all serialized heads actually load.
+        if artifact.get('taskId') == ENTRY_TASK_ID and (artifact.get('mainProbabilityTarget') != 'net_return_strictly_positive'
+                or 'trainingWinPrevalence' not in artifact):
+            return None
+        expected = learning_contracts(contract)
+        if any(artifact.get(key) is not None and artifact[key] != expected[key] for key in (
+                'dataContractId', 'featureContractId', 'labelContractId', 'learningDataContractId', 'modelContractId')):
+            return None
+        # A release row is not usable unless every required head actually loads.
         # Cache the probe by exact artifact content; lineage is still checked on
         # every load so a subsequently quarantined dependency invalidates it.
         digest = sha256(row[0].encode()).hexdigest()
@@ -377,13 +575,16 @@ class TaskLearner:
     def _readiness_snapshot(self, now, data):
         """Summarize an already checked cohort; never run a second ledger scan."""
         from .local_algorithm import algorithm_contract
+        from .learning_contracts import learning_contracts
         samples, days, complete = data
         return {'version': 'task-readiness-v1', 'checkedAt': now.isoformat(),
             'taskContractId': self.contract['taskContractId'],
             'algorithmContractId': algorithm_contract()['contractId'],
             'matureDays': len(days), 'validSampleDays': len({row['day'] for row in samples}),
             'validSamples': len({(row['day'], row['code']) for row in samples}),
-            'rawSampleCount': len(samples), 'completeQueue': bool(complete)}
+            'rawSampleCount': len(samples), 'completeQueue': bool(complete),
+            'trainingSplits': training_split_readiness(samples, days, self.task_id),
+            **learning_contracts(self.contract)}
 
     def refresh_readiness(self, now):
         """Explicit background/close-time cohort audit. Does not fit or promote a model.
@@ -412,20 +613,28 @@ class TaskLearner:
     def _readiness_report(self, now, registry, *, snapshot=None, current_candidates=None,
                           current_data_eligibility=None, verified_active=None):
         from .local_algorithm import algorithm_contract
+        from .learning_contracts import compatibility
         from .signal_learning import MIN_MATURE_DAYS, MIN_VALID_SAMPLES, MIN_HOLDOUT_DAYS, MIN_HOLDOUT_TRADES, SHADOW_DAYS
         algorithm_id = algorithm_contract()['contractId']
         audit = snapshot if snapshot is not None else registry.get('readinessSnapshot') or {}
         contract_matches = (audit.get('version') == 'task-readiness-v1'
                     and audit.get('taskContractId') == self.contract['taskContractId']
-                    and audit.get('algorithmContractId') == algorithm_id)
+                    and compatibility(audit, task_id=self.task_id)['compatible'])
         future_audit = bool(audit.get('checkedAt') and audit['checkedAt'] > now.isoformat())
         matching = bool(contract_matches and audit.get('checkedAt') and not future_audit)
         checked = audit.get('checkedAt') if matching else None
         fresh = bool(checked and checked[:10] == now.date().isoformat() and checked <= now.isoformat())
         counts = {key: audit.get(key) if matching else None for key in
                   ('matureDays', 'validSampleDays', 'validSamples', 'rawSampleCount', 'completeQueue')}
+        split = audit.get('trainingSplits') if matching else None
+        if split:
+            holdout = next((fold for fold in split.get('folds', []) if fold.get('name') == 'holdout'), {})
+            if holdout.get('evaluationFrom') and any(holdout['evaluationFrom'] <= day <= holdout['evaluationThrough']
+                    for day in registry.get('consumedHoldoutDays') or []):
+                split = {**split, 'ready': False, 'blockerCodes': list(dict.fromkeys([
+                    *split.get('blockerCodes', []), 'sealed_holdout_already_observed_wait_for_new_holdout']))}
         registry_matches = (registry.get('taskContractId') == self.contract['taskContractId']
-                            and registry.get('algorithmContractId') == algorithm_id)
+                            and compatibility(registry, task_id=self.task_id)['compatible'])
         reason = registry.get('reason') if registry_matches else None
         champion = registry.get('championVersion') if registry_matches else None
         shadow = registry.get('shadowVersion') if registry_matches else None
@@ -478,9 +687,15 @@ class TaskLearner:
             if counts['validSamples'] == 0:
                 status, action = 'no_eligible_samples', '先检查发布时的数据、方向与风控资格；事后补数据不能改写原信号的训练资格。'
             elif counts['matureDays'] >= MIN_MATURE_DAYS and counts['validSamples'] >= MIN_VALID_SAMPLES:
-                status = 'ready_for_training' if counts['completeQueue'] else 'cohort_incomplete'
-                action = ('后台执行学习检查；训练切分、留出验证和前瞻影子验证仍须分别通过。'
-                          if counts['completeQueue'] else '补齐已冻结合格队列的标签与数据血缘，再重新核验。')
+                status = ('cohort_incomplete' if not counts['completeQueue'] else
+                          'ready_for_training' if split and split.get('ready') is True else 'split_not_ready')
+                action = ('后台执行学习检查；留出验证和前瞻影子验证仍须分别通过。' if status == 'ready_for_training'
+                          else '补齐已冻结合格队列的标签与数据血缘，再重新核验。' if status == 'cohort_incomplete'
+                          else '按每折训练、校准、评估的日期和样本缺口继续积累；采集总数达标不代表切分可训练。')
+                if status == 'split_not_ready':
+                    blockers.extend((split or {}).get('blockerCodes') or ['training_split_audit_missing'])
+            if split:
+                message += f" 当前滚动切分结构至少需 {split['minimumSignalDaysForAnyTraining']} 个日期，仍需逐折满足样本和标签条件。"
             if not fresh:
                 message += ' 以上为上次核验结果，当前进度待刷新。'
         if reason and any(part in reason for part in ('failed', 'unavailable', 'invalid', 'too_small', 'history_insufficient')):
@@ -505,7 +720,8 @@ class TaskLearner:
             action = '先查看本轮数据、方向和风控的实际阻断原因；补齐缺失证据，等待未满足的市场条件，重复扫描不会绕过这些条件。'
         progress = {**counts, 'minimumMatureDays': MIN_MATURE_DAYS, 'minimumValidSamples': MIN_VALID_SAMPLES,
                     'minimumHoldoutDays': MIN_HOLDOUT_DAYS, 'minimumHoldoutObservations': MIN_HOLDOUT_TRADES,
-                    'shadowDays': registry.get('shadowDays', 0) if shadow else 0, 'shadowRequiredDays': SHADOW_DAYS}
+                    'shadowDays': registry.get('shadowDays', 0) if shadow else 0, 'shadowRequiredDays': SHADOW_DAYS,
+                    'trainingSplits': split}
         return {'version': 'task-readiness-v1', 'taskId': self.task_id, 'queue': self.queue,
             'taskContractId': self.contract['taskContractId'], 'algorithmContractId': algorithm_id,
             'status': status, 'message': message, 'action': action, 'blockerCodes': list(dict.fromkeys(blockers)),
@@ -515,32 +731,36 @@ class TaskLearner:
             'lastFitCompletedAt': registry.get('lastFitCompletedAt'),
             'lastValidationAt': registry.get('lastValidationAt'),
             'configuredChampionVersion': champion, 'shadowVersion': shadow,
+            'contractCompatibility': compatibility(audit, task_id=self.task_id) if matching else None,
             'validationGates': {key: {'passed': value.get('passed'), 'reason': value.get('reason')}
                 for key, value in gates.items() if isinstance(value, dict)},
             'diagnosticOnly': True, 'selectionAuthority': False}
 
     def _next_events(self, now):
         from .signal_learning import ENTRY_SLOTS, _at, _feature_values
-        from .local_algorithm import algorithm_contract
+        from .learning_contracts import compatibility, learning_contracts, task_data_compatible
+        data_contract = learning_contracts(self.contract)['learningDataContractId']
         with self.service._connect() as db:
             exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='next_day_outcomes'").fetchone()
             outcome = 'o.result_json,o.reviewed_at' if exists else 'NULL result_json,NULL reviewed_at'
             rows = db.execute('SELECT e.signal_id,e.code,e.decision_at,e.snapshot_json,r.run_id,r.trading_day,r.slot,'
-                'r.created_at,' + outcome + ' FROM signal_events e JOIN signal_runs r ON r.run_id=e.run_id '
+                "r.created_at,COALESCE(json_extract(r.scan_json,'$.algorithmManifest'),"
+                "json_extract(r.scan_json,'$.result.algorithm')) manifest_json," + outcome + ' FROM signal_events e JOIN signal_runs r ON r.run_id=e.run_id '
                 + ('LEFT JOIN next_day_outcomes o ON o.signal_id=e.signal_id ' if exists else '')
                 + "WHERE r.official=1 AND r.trading_day<=? AND json_extract(e.snapshot_json,'$.nextDaySignal.queue')=? "
-                  "AND json_extract(e.snapshot_json,'$.algorithmContractId')=? "
-                  "AND json_extract(e.snapshot_json,'$.nextDaySignal.learningTaskContractId')=? "
+                  "AND (json_extract(e.snapshot_json,'$.nextDaySignal.learningTaskContractId')=? "
+                  "OR json_extract(e.snapshot_json,'$.nextDaySignal.learningDataContractId')=?) "
                   "AND json_extract(e.snapshot_json,'$.nextDaySignal.trainingEligibleAtSignal')=1 "
                   'ORDER BY r.trading_day,e.code,e.decision_at',
-                  (now.date().isoformat(), self.queue,algorithm_contract()['contractId'],self.contract['taskContractId'])).fetchall()
+                  (now.date().isoformat(), self.queue,self.contract['taskContractId'],data_contract)).fetchall()
         result = []
         for row in rows:
             snapshot = json.loads(row['snapshot_json'])
             signal = snapshot.get('nextDaySignal') or {}
+            audit = compatibility({**snapshot, 'algorithmManifest': json.loads(row['manifest_json']) if row['manifest_json'] else None}, task_id=self.task_id)
             if (row['slot'] not in ENTRY_SLOTS or _at(row['created_at']) > now
-                    or snapshot.get('algorithmContractId') != algorithm_contract()['contractId']
-                    or signal.get('learningTaskContractId') != self.contract['taskContractId']
+                    or not audit['compatible']
+                    or not task_data_compatible(signal, self.contract)
                     or signal.get('trainingEligibleAtSignal') is not True):
                 continue
             outcome = json.loads(row['result_json']) if row['result_json'] else {}
@@ -560,7 +780,8 @@ class TaskLearner:
                 'features': features, 'selected': signal.get('selected') is True, 'selectionRank': signal.get('rank'),
                 'dataLineage': snapshot.get('dataLineage'), 'labelDataLineage': outcome.get('dataLineage'),
                 'targetSession': target, 'labelEndAt': outcome.get('labelEndAt'),
-                'labelKnownAt': row['reviewed_at'], 'outcome': outcome, 'complete': False}
+                'labelKnownAt': row['reviewed_at'], 'outcome': outcome, 'complete': False,
+                'contractCompatibility': audit}
             ret = finite(outcome.get('observedReturnFromSignalPct'))
             if (outcome.get('status') == 'mature_price_pattern' and ret is not None
                     and outcome.get('targetSession') == target and outcome.get('version') == signal.get('version')
@@ -613,15 +834,17 @@ class TaskLearner:
     def state(self, now, data=None):
         from .signal_learning import MIN_MATURE_DAYS, MIN_VALID_SAMPLES, MIN_HOLDOUT_DAYS, MIN_HOLDOUT_TRADES, SHADOW_DAYS
         from .local_algorithm import algorithm_contract
+        from .learning_contracts import compatibility, learning_contracts
         samples, days, complete = data or self.data(now)
         registry = self.registry()
         active, shadow = self.artifact(registry), self.artifact(registry, active=False)
-        same = registry.get('taskContractId') == self.contract['taskContractId'] and registry.get('algorithmContractId') == algorithm_contract()['contractId']
+        same = registry.get('taskContractId') == self.contract['taskContractId'] and compatibility(registry, task_id=self.task_id)['compatible']
         reason = registry.get('reason') if same else 'task_contract_has_no_current_validation'
         stock_days = len({(r['day'], r['code']) for r in samples})
         if len(days) < MIN_MATURE_DAYS or stock_days < MIN_VALID_SAMPLES:
             reason = f'待积累独立成熟交易日/有效股票日：{len(days)}/{MIN_MATURE_DAYS} 天，{stock_days}/{MIN_VALID_SAMPLES} 条'
-        return {**self.contract, 'algorithm': algorithm_contract(),
+        return {**self.contract, **learning_contracts(self.contract), 'algorithm': algorithm_contract(),
+            'contractCompatibility': compatibility(registry, task_id=self.task_id),
             'stage': 'active' if active else 'shadow' if shadow else 'rules_cold_start',
             'championVersion': active['version'] if active else None, 'shadowVersion': shadow['version'] if shadow else None,
             'configuredChampionVersion': registry.get('championVersion'),
@@ -744,20 +967,32 @@ class TaskLearner:
         result['probabilityCalibrated'] = bool(metric['brierSkill'] is not None and metric['brierSkill'] > 0
                                              and metric['positiveEvents'] > 0)
         result['passed'] = bool(result.get('passed') and result['probabilityCalibrated'])
+        if self.task_id == ENTRY_TASK_ID:
+            result['winProbabilityCalibrated'] = bool(metric.get('winBrierSkill') is not None
+                and metric['winBrierSkill'] > 0 and metric.get('winningSignals', 0) > 0)
+            result['passed'] = bool(result['passed'] and result['winProbabilityCalibrated'])
+            result['targetReturnProbabilityCalibrated'] = bool(metric.get('targetReturnBrierSkill') is not None
+                and metric['targetReturnBrierSkill'] > 0 and (metric.get('targetReturnPositiveEvents') or 0) > 0)
         return result
 
     def train(self, now):
         from .signal_learning import MIN_MATURE_DAYS, MIN_VALID_SAMPLES, MIN_HOLDOUT_DAYS, SHADOW_DAYS, PURGE_DAYS, _VALIDATION, _json
         from .local_algorithm import algorithm_contract
+        from .learning_contracts import compatibility, learning_contracts
         samples, days, complete = data = self.data(now)
         registry = self.registry()
         algorithm_id = algorithm_contract()['contractId']
+        migration = compatibility(registry, task_id=self.task_id)
         if (registry.get('taskContractId') != self.contract['taskContractId']
-                or registry.get('algorithmContractId') != algorithm_id):
+                or not migration['compatible']):
             registry['priorValidation'] = {key: registry.get(key) for key in
                 ('algorithmContractId', 'taskContractId', 'gates', 'lastFitCompletedAt', 'lastTrainingAt')}
             registry.update(taskContractId=self.contract['taskContractId'], algorithmContractId=algorithm_id,
                             gates={}, shadowDays=0)
+        if migration['compatible'] and registry.get('algorithmContractId') != algorithm_id:
+            registry.setdefault('compatibilityAudit', []).append({**migration, 'checkedAt': now.isoformat(),
+                'action': 'compatible_registry_reference_updated_original_signals_unchanged'})
+        registry.update(algorithmContractId=algorithm_id, **learning_contracts(self.contract))
         registry['lastLearningCheckAt'] = now.isoformat()
         registry['cohortAudit'] = {'frozenSignalDays': days, 'completeQueue': complete,
             'completedSignalCount': len(samples), 'knownThrough': now.isoformat(),
@@ -815,6 +1050,16 @@ class TaskLearner:
                 return finish('forward_prediction_or_validation_failed')
             registry['lastValidationAt'] = now.isoformat()
             registry.setdefault('gates', {})['liveRolling' if key == 'championVersion' else 'shadow'] = gates
+            if self.task_id == ENTRY_TASK_ID and gates.get('completedTrades', 0) >= _VALIDATION['minimumHoldoutTrades']:
+                # Auxiliary probability may lose validation independently; this
+                # does not pretend the required win head failed or succeeded.
+                target_passed = bool(artifact.get('targetReturnHistoricalValidated')
+                    and gates.get('targetReturnProbabilityCalibrated'))
+                artifact.update(targetReturnProbabilityValidated=target_passed,
+                    targetReturnModelStatus='out_of_time_and_forward_validated' if target_passed else
+                        'auxiliary_forward_validation_insufficient_or_failed')
+                with self.service._connect() as db:
+                    db.execute('UPDATE model_versions SET artifact_json=? WHERE version=?', (_json(artifact), version))
             if key == 'championVersion':
                 registry['lastEvaluatedThrough'] = future_days[-1]
                 if not gates['passed']:
@@ -838,6 +1083,9 @@ class TaskLearner:
                                     activeAfterDay=now.date().isoformat(), activatedAt=now.isoformat())
                     return finish('shadow_passed_promoted')
                 return finish('shadow_failed_kept_prior_champion_or_rules')
+        preparation = training_split_readiness(samples, days, self.task_id)
+        if not preparation['ready']:
+            return finish('training_split_not_ready:' + ','.join(preparation['blockerCodes']))
         holdout_size = max(MIN_HOLDOUT_DAYS, math.ceil(len(days)*_VALIDATION['holdoutFraction']))
         boundary = len(days)-holdout_size
         holdout_days = days[boundary:]
@@ -887,6 +1135,10 @@ class TaskLearner:
                 registry['lastValidationAt'] = now.isoformat()
                 attempt['developmentFolds'] = folds
                 return finish('rolling_probability_calibration_failed')
+            if self.task_id == ENTRY_TASK_ID and any((fold['metrics'].get('winBrierSkill') or -1) <= 0 for fold in folds):
+                registry['developmentFolds'] = folds
+                attempt['developmentFolds'] = folds
+                return finish('rolling_win_probability_calibration_failed')
             aggregate = {name: np.concatenate([p[name] for p in development_predictions]) for name in development_predictions[0]}
             # Empty official scans are cash days, not missing days to erase.
             dev_days = sorted({day for fold in folds for day in fold['testDays']})
@@ -928,6 +1180,14 @@ class TaskLearner:
         artifact.update(version=f'{TASK_MODEL_VERSION}-{self.queue or "entry"}-{now.strftime("%Y%m%d%H%M%S%f")}',
             algorithmContractId=algorithm_id, holdoutThrough=holdout_days[-1],
             executionModel='morning-price-observation-T0' if self.task_id == MORNING_TASK_ID else 'task-specific-T1', dataLineage=lineage)
+        artifact.update(learning_contracts(self.contract))
+        if self.task_id == ENTRY_TASK_ID:
+            target_passed = bool(gates.get('targetReturnProbabilityCalibrated') and all(
+                (fold['metrics'].get('targetReturnBrierSkill') or -1) > 0 for fold in folds))
+            artifact.update(targetReturnProbabilityValidated=target_passed,
+                targetReturnHistoricalValidated=target_passed,
+                targetReturnModelStatus='out_of_time_validated' if target_passed else
+                    'auxiliary_validation_insufficient_or_failed' if artifact.get('targetClassifier') else artifact['targetReturnModelStatus'])
         with self.service._connect() as db:
             db.execute('INSERT INTO model_versions VALUES(?,?,?,?,?)',
                        (artifact['version'], 'shadow', _json(artifact), _json(gates), now.isoformat()))

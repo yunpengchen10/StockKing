@@ -4,6 +4,7 @@ import { GetStockKingRecommendationHistory, GetStockKingDelayedReviews, GetStock
 import { groupSignals, ledgerPercent, ledgerPrice, ledgerSigned, priceObservationPercent, statusLabel, reviewStatusLabel, reviewReasonLabel, visibleReviews, reviewProgress, learningEffect, reviewReturn, learningProgress, recordQuoteCode, signalPriceComparison, createRecordQuoteLoader, nextDaySignalOf, isNextDaySelection, signalSelectionLabel, nextDayPatternValue, nextDayQueueLabel, nextDayTouchLabel } from '../utils/pickLedger.mjs'
 import { withRecordReadTimeout } from '../utils/recordRead.mjs'
 import { learningTimeline, learningTaskLabel } from '../utils/learningStatus.mjs'
+import { entryExecutionSummary, dailyObservationRows, dailyObservationCategory, dailyObservationStatus, settlementHealthSummary } from '../utils/recommendationQuality.mjs'
 import { firstRecommendationEvidence, primaryRecommendationState, primaryAdmissionReasons, isDailySelection } from '../utils/pickLedger.mjs'
 
 // A separate, retained instance owns each ledger tab. Activation updates quotes only.
@@ -27,6 +28,9 @@ const quoteLoader = createRecordQuoteLoader({
 const reviews = computed(() => visibleReviews(payload.value.items, { includeControls: includeControls.value }))
 const nextDayReviews = computed(() => visibleReviews(payload.value.nextDayReview?.items, { includeControls: includeControls.value }))
 const nextDaySummaryGroups = computed(() => (payload.value.nextDayReview?.summary?.groups || []).filter(group => includeControls.value || group.selected === true))
+const dailyReview = computed(() => payload.value.dailyObservationReview)
+const dailyRows = computed(() => dailyObservationRows(dailyReview.value, includeControls.value))
+const dailyGroups = computed(() => (dailyReview.value?.groups || []).filter(group => includeControls.value || group.first_category !== 'unselected_control'))
 const reviewSummaries = computed(() => [
   { label: '次日价格模式', ...reviewProgress(nextDayReviews.value) },
   { label: '交易模拟', ...reviewProgress(reviews.value) },
@@ -161,6 +165,7 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
                 <template v-if="signal.nextDay"><dt>观察队列</dt><dd>{{ nextDayQueueLabel(signal.nextDay) }} · 扫描时{{ nextDayTouchLabel(signal.nextDay) }}</dd><dt>目标交易日</dt><dd>{{ signal.nextDay.targetSession || '未记录' }}</dd><dt>冲板观察分</dt><dd>{{ researchScore(signal.nextDay.score) }} · {{ signal.nextDay.scoreMeaning || '研究排序，不是涨停概率' }}</dd><dt>观察规则版本</dt><dd>{{ signal.nextDay.version || '未记录' }}</dd><dt>观察依据</dt><dd>{{ text(signal.nextDay.reasons) }}</dd><dt>待确认缺口</dt><dd>{{ text(signal.nextDay.gaps) }}</dd></template>
                 <template v-else><dt>当轮排序</dt><dd>{{ signal.rank ?? candidate(signal).rank ?? '未记录' }}</dd><dt>当轮排序版本</dt><dd>{{ (signal.daily ? candidate(signal).dailySignal?.version : candidate(signal).learningRankVersion) || '原记录未保存' }}</dd><dt>入选原因</dt><dd>{{ text(signal.reason || candidate(signal).selectionReasons) }}</dd></template>
                 <dt>风险</dt><dd>{{ text(candidate(signal).riskReasons || candidate(signal).risks || signal.risks) }}</dd><dt>触发条件</dt><dd>{{ text(signal.nextDay?.trigger || candidate(signal).triggerConditions || candidate(signal).entryPlan?.trigger) }}</dd><dt>失效条件</dt><dd>{{ text(signal.nextDay?.invalidation || candidate(signal).invalidationConditions || candidate(signal).entryPlan?.invalidations) }}</dd></dl>
+              <p v-if="candidate(signal).entryExecution" class="ledger-note">{{ entryExecutionSummary(candidate(signal).entryExecution).label }}。{{ entryExecutionSummary(candidate(signal).entryExecution).detail }} {{ entryExecutionSummary(candidate(signal).entryExecution).meaning }}</p>
               <div v-if="!signal.daily && !signal.nextDay && Object.keys(factors(signal)).length" class="factor-list"><span v-for="(value, key) in factors(signal)" :key="key">{{ key }} <b>{{ value == null ? '未取得' : Number(value).toFixed(1) }}</b></span></div>
               </template>
             </details>
@@ -175,6 +180,14 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
         <n-alert :type="effectiveLearning.type" :show-icon="false" class="review-learning"><b>{{ effectiveLearning.label }}</b><p>{{ effectiveLearning.detail }}</p><p v-if="learningError">学习状态读取失败：{{ learningError }}</p><p v-else-if="reviewLearning.reason">{{ reviewLearning.reason }}</p></n-alert>
         <div class="review-progress"><article v-for="summary in reviewSummaries" :key="summary.label"><b>{{ summary.label }} · 本次展示 {{ summary.total }} 条</b><p>有结论 {{ summary.concluded }} · 等待/未结算 {{ summary.waiting }} · 到期待执行 {{ summary.notRun }} · 证据待补 {{ summary.incomplete }} · 执行失败 {{ summary.failed }}<template v-if="summary.other"> · 其他状态 {{ summary.other }}</template></p></article></div>
         <p class="ledger-note">{{ includeControls ? '当前包含未入选对照样本' : '默认仅显示当时入选的交易候选与次日观察' }}。以上仅统计本次展示的信号与期限，同一股票可有多条；有结论包含未成交，不能作为推荐成功率。</p>
+        <section v-if="dailyReview" class="next-day-reviews">
+          <h3>日线与进攻观察 · 独立 T+1 / T+3 / T+5 复盘</h3>
+          <p class="ledger-note">{{ settlementHealthSummary(dailyReview.health) }}。结算状态覆盖全部日线观察；下方名单按查询条件展示。查询只读取结果，不执行补评或训练。</p>
+          <n-alert v-if="dailyReview.health?.overdueCount > 0 || dailyReview.health?.lastError" type="warning" :show-icon="false">存在到期未完成的结算，后台会从检查点重试。{{ dailyReview.health?.lastError ? `最近错误：${dailyReview.health.lastError}` : '' }}</n-alert>
+          <div v-if="dailyGroups.length" class="review-progress"><article v-for="group in dailyGroups" :key="`${group.trading_day}-${group.task_id}-${group.task_version}-${group.first_category}-${group.horizon}`"><b>{{ group.trading_day }} · {{ dailyObservationCategory(group.first_category) }} · T+{{ group.horizon }}</b><p>{{ group.task_version }} · 有效收盘覆盖 {{ group.covered }}/{{ group.signals }} · 上涨 {{ group.up }} · 下跌 {{ group.down }} · 持平 {{ group.flat }}</p><small>缺失不计成功或失败；首次参考价固定，跨版本可能包含同一股票。</small></article></div>
+          <div v-if="dailyRows.length" class="review-table-wrap"><table class="review-table"><thead><tr><th>股票 / 类别</th><th>信号日 / 版本</th><th>期限 / 目标日</th><th>证据状态</th><th>首次参考价</th><th>参考价至收盘变化</th><th>最近检查</th></tr></thead><tbody><tr v-for="row in dailyRows" :key="`${row.observationId}-${row.horizon}`"><td><button @click="$emit('open-chart', { code: row.code, name: row.name })">{{ row.name || row.code }}</button><small>{{ row.category }}</small></td><td>{{ row.tradingDay }}<small>{{ row.taskVersion }}</small></td><td>{{ row.horizon ? `T+${row.horizon}` : '待评' }}<small>{{ row.target_day || '日历待核验' }}</small></td><td>{{ dailyObservationStatus(row.status) }}<small v-if="!row.referenceVerified">首次报价证据不足</small></td><td>{{ ledgerPrice(row.referencePrice) }}</td><td>{{ row.status === 'observed' ? priceObservationPercent(row.gross_reference_change_pct) : '未取得' }}</td><td>{{ time(row.reviewed_at) }}</td></tr></tbody></table></div>
+          <p class="ledger-note">本节为未复权参考价变化，未扣费用，不是成交收益或正式推荐胜率。缺失的首次报价不能用后来价格补造。</p>
+        </section>
         <section v-if="payload.nextDayReview" class="next-day-reviews">
           <h3>次日冲板观察 · T+1价格模式复盘</h3>
           <p class="ledger-note">次日观察使用独立、尚未验证的人工研究规则；交易候选模型的训练与启用状态不代表次日观察规则已学习。本节只记录价格模式结果，不会自动调整次日评分。</p>
@@ -198,7 +211,7 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
         <n-alert :type="effectiveLearning.type" :show-icon="false" class="review-learning"><b>{{ effectiveLearning.label }}</b><p>{{ effectiveLearning.detail }}</p><p v-if="learning.rankingFallbackReason">{{ learning.rankingFallbackReason }}</p></n-alert>
         <div class="learning-header"><div><span>当前阶段</span><h3>{{ statusLabel(learning.stage) }}</h3><p>{{ learning.reason || '等待后台学习检查' }}</p></div><div><span>当前版本</span><b>{{ learning.effectiveRankVersion || learning.championVersion || '本地人工规则' }}</b><small v-for="item in learningTimes" :key="item.key">{{ item.label }} {{ item.at ? time(item.at) : '尚未完成' }}</small></div></div>
         <div class="learning-metrics"><article><span>独立成熟交易日</span><strong>{{ learning.matureDays ?? '—' }} <small>/ {{ minimumDays }}</small></strong><n-progress type="line" :percentage="learningProgress(learning.matureDays, minimumDays)" :show-indicator="false" /></article><article><span>有效成熟样本</span><strong>{{ learning.validSamples ?? '—' }} <small>/ {{ minimumSamples }}</small></strong><n-progress type="line" :percentage="learningProgress(learning.validSamples, minimumSamples)" :show-indicator="false" /></article><article><span>前瞻影子验证</span><strong>{{ learning.shadowDays ?? '—' }} <small>/ {{ learning.shadowRequiredDays ?? 20 }} 日</small></strong><small>{{ learning.shadowVersion || '尚无待晋升版本' }}</small></article></div>
-        <p class="ledger-note">训练仅使用本版本的主板信号与对照样本。按时间划分训练、校准和检验，边界隔离至少5个交易日。历史版本记录保留原口径。</p>
+        <p class="ledger-note">训练使用学习契约匹配或经过兼容性审计的主板信号与对照样本。按时间划分训练、校准和检验，边界隔离至少5个交易日；历史原始资格保持不变。最低日期数不等于每个训练折都已准备完成。</p>
         <div v-if="learningTasks.length" class="review-progress"><article v-for="task in learningTasks" :key="`${task.taskId}-${task.queue || ''}`"><b>{{ learningTaskLabel(task.taskId, task.queue) }}</b><p>{{ statusLabel(task.stage) }} · {{ task.validSamples ?? 0 }} 条有效样本 / {{ task.matureDays ?? 0 }} 个成熟交易日</p><p>{{ task.reason || '按本任务独立复盘、训练和验证' }}</p></article></div>
         <p class="ledger-note">交易收益与次日行情事件分别训练。行情触板不等于可成交盈利；下一交易日标签成熟即可供本任务使用，无须等待其他期限。</p>
         <h4>晋升检查</h4><p class="ledger-note">样本外扣费收益与相对当前规则的收益优势，其95%置信下界均须大于零，且回撤不恶化；随后完成20个交易日前瞻影子验证才可启用。推理失败或版本不兼容时自动回退。</p>

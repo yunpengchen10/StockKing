@@ -12,10 +12,30 @@ def build_admission_diagnostics(candidates, selected, quality, *, morning=False)
     formal = DEFAULT_PARAMETERS['history']['formalDays']
     missing = Counter()
     adverse = Counter()
+    warnings = Counter()
     for row in rows:
         admission = row.get('primaryAdmission') or {}
         missing.update(set(admission.get('missingReasons') or []))
         adverse.update(set(admission.get('reasons') or []))
+        warnings.update(set(admission.get('warnings') or []))
+
+    def warming_up(row):
+        return (row.get('baselineEvidence') or {}).get('baselineStatus') == 'session_warmup'
+
+    def current_data_unavailable(row):
+        return (row.get('baselineEvidence') or {}).get('baselineStatus') in (
+            'current_minutes_unavailable', 'current_minutes_stale', 'current_window_unavailable')
+
+    def history_pending(row):
+        return warming_up(row) or current_data_unavailable(row)
+
+    def current_window_ready(row):
+        baseline = row.get('baselineEvidence') or {}
+        if baseline.get('baselineStatus') in ('session_warmup', 'current_minutes_unavailable',
+                'current_minutes_stale', 'current_window_unavailable'):
+            return False
+        window = baseline.get('sessionWindow') or {}
+        return window.get('price5mWindowElapsed') is not False
 
     def sufficient_history(row):
         eligibility = row.get('dataEligibility') or {}
@@ -30,6 +50,8 @@ def build_admission_diagnostics(candidates, selected, quality, *, morning=False)
 
     checks = []
     definitions = [
+        ('current_window', '开盘后完整分钟窗口', current_window_ready,
+         '等待本交易时段形成完整窗口；不跨午休拼接分钟。'),
         ('history', f'{formal}日同刻量价基准', sufficient_history,
          '后台补齐缺失交易日并核验历史分钟数据；重复刷新只更新当前分钟。'),
         ('lineage', '分钟来源与历史核验',
@@ -55,9 +77,15 @@ def build_admission_diagnostics(candidates, selected, quality, *, morning=False)
          '刷新具有实际来源时间和完整覆盖的市场快照。'),
     ]
     for key, label, check, action in definitions:
-        passed = sum(check(row) for row in rows)
+        # A not-yet-formed current window cannot measure historical coverage.
+        # Show it as pending, never as 20 missing archive sessions.
+        pending = sum(history_pending(row) for row in rows) if key == 'history' else 0
+        passed = sum(check(row) for row in rows if key != 'history' or not history_pending(row))
         checks.append({'key': key, 'label': label, 'passed': passed,
-                       'blocked': total - passed, 'total': total, 'action': action})
+                       'blocked': total - passed - pending, 'pending': pending,
+                       'pendingReason': ('当前分钟尚未取得或窗口尚未形成，历史基准待核验，不计为历史缺失'
+                                         if key == 'history' and pending else None),
+                       'total': total, 'action': action})
     research = [row for row in rows if is_research_eligible(row)]
     admitted = [row for row in research if is_entry_eligible(row)]
     model_blocked = sum((row.get('morningSignal') or {}).get('selectionEligible') is not True
@@ -67,6 +95,8 @@ def build_admission_diagnostics(candidates, selected, quality, *, morning=False)
     blocked_checks = [check for check in checks if check['blocked']]
     if selected:
         state = 'selected'
+    elif total and all(warming_up(row) for row in rows):
+        state = 'session_warmup'
     elif blocked_checks or missing:
         state = 'data_incomplete'
     elif research and model_unavailable:
@@ -77,22 +107,32 @@ def build_admission_diagnostics(candidates, selected, quality, *, morning=False)
         state = 'conditions_not_met'
     fragments = [f"{check['label']}未通过{check['blocked']}/{total}只"
                  for check in sorted(blocked_checks, key=lambda item: -item['blocked'])[:3]]
-    if morning and not admitted:
+    if morning and research and not admitted:
         fragments.append('上午模型状态见独立验证进度' if model_unavailable or not research
                          else '已验证模型的收益或风险条件未满足')
     summary = f'本轮主推荐{len(selected)}只。'
+    warmup_count = sum(warming_up(row) for row in rows)
+    if warmup_count:
+        summary += f'{warmup_count}只正在等待开盘后的完整分钟窗口，不能据此判定历史缺失。'
+    current_missing_count = sum(current_data_unavailable(row) for row in rows)
+    if current_missing_count:
+        summary += f'{current_missing_count}只当前分钟未采集齐，历史基准待核验，不计为历史缺失。'
     if fragments:
         summary += '主要阻断：' + '；'.join(fragments) + '。'
     elif not selected:
         summary += '数据检查已完成，当前方向、价格或风险条件未满足。'
     return {
-        'version': 'primary-diagnostics-v1', 'status': state, 'total': total,
+        'version': 'primary-diagnostics-v2', 'status': state, 'total': total,
+        'sessionWarmupCount': warmup_count,
+        'currentMinuteUnavailableCount': current_missing_count,
+        'sessionWindows': {row['code']: (row.get('baselineEvidence') or {}).get('sessionWindow')
+                           for row in rows if warming_up(row)},
         'checks': checks, 'evidenceAndRiskPassed': len(research),
         'modelAdmissionPassed': len(admitted), 'morningModelBlocked': model_blocked,
         'morningModelUnavailable': model_unavailable,
         'selected': len(selected), 'missingReasonCounts': dict(missing),
-        'riskReasonCounts': dict(adverse), 'summary': summary,
+        'riskReasonCounts': dict(adverse), 'riskWarningCounts': dict(warnings), 'summary': summary,
         'countMeaning': '各项检查独立统计，同一股票可以有多个阻断原因，数量不可相加。',
         'collection': {key: quality.get(key, {}) for key in
-                       ('stageIncompleteCounts', 'stageMissingReasons', 'sectorCollection')},
+                       ('stageIncompleteCounts', 'stageMissingReasons', 'sectorCollection', 'fundCollection')},
     }

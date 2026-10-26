@@ -10,6 +10,24 @@ NOW = datetime(2026, 9, 18, 10, 30, tzinfo=SHANGHAI)
 DATES = [NOW.date()-timedelta(days=i) for i in range(1,21)]
 
 
+def test_fresh_book_is_preserved_when_history_prevents_aggregate_scoring():
+    from src.services.yao_scout.local_opportunities import LocalOpportunityService
+    candidate = _candidate()
+    candidate['quote']['order_book'] = {'source_time':NOW.isoformat(),
+        'asks':[{'price':10.1,'volume_shares':10000}],
+        'bids':[{'price':10.09,'volume_shares':10000}]}
+    minute = {'asOf':NOW.isoformat(), 'v11Inputs':{'history_days':0,'price_history_days':0}}
+    candidate.update(score_v11(candidate, minute, now=NOW))
+    LocalOpportunityService._factor_availability(candidate, minute)
+    assert candidate['factorScores']['L'] is not None
+    assert candidate['factorAvailability']['L']['available'] is True
+    assert candidate['finalScore'] is None
+    assert candidate['dataEligibility']['status'] == 'insufficient'
+    assert candidate['tradability']['executionVerified'] is False
+    candidate['quote']['order_book']['source_time'] = (NOW-timedelta(minutes=2)).isoformat()
+    assert score_v11(candidate, minute, now=NOW)['factorScores']['L'] is None
+
+
 def _bars(day, amount=1000, current=False):
     end = NOW.replace(year=day.year,month=day.month,day=day.day)
     rows = []

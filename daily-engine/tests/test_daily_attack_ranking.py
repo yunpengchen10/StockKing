@@ -55,11 +55,12 @@ def test_regular_selection_does_not_inherit_conservative_rejection_reason():
     ctx['financials']['cashPerShare'] = -.1
     result = run(ctx=ctx)
     ledger = result['dailyRejectionLedger'][0]
-    assert ledger['state'] == 'selected_regular' and ledger['reasons'] == []
+    assert ledger['state'] == 'observed_regular' and ledger['reasons'] == []
     assert ledger['profileDecisions']['conservative']['reasons'] == ['known_nonpositive_operating_cash_flow']
     assert ledger['profileDecisions']['regular']['rank'] == 1
-    assert ledger['profileDecisions']['regular']['selected'] is True
-    assert result['dailyAttackWatchlist'] == []  # separate alternatives, no duplicated recommendation
+    assert ledger['profileDecisions']['regular']['selected'] is False
+    assert ledger['profileDecisions']['regular']['observationSelected'] is True
+    assert result['dailyAttackWatchlist'] == []  # separate alternatives, no duplicated observation
 
 
 def test_qualified_below_quota_is_distinct_from_rejected_and_freezes_peer_ranks():
@@ -68,21 +69,25 @@ def test_qualified_below_quota_is_distinct_from_rejected_and_freezes_peer_ranks(
         {code: daily() for code in codes}, {code: quote(code=code) for code in codes}, NOW,
         contexts={code: context() for code in codes}, top_n=1)
     ledger = {row['code']: row for row in result['dailyRejectionLedger']}
-    assert ledger['600001']['state'] == 'selected_regular'
-    assert ledger['600002']['state'] == 'qualified_below_top_n'
+    assert ledger['600001']['state'] == 'observed_regular'
+    assert ledger['600002']['state'] == 'observation_below_top_n'
     assert ledger['600002']['reasons'] == []
     assert ledger['600002']['profileDecisions']['regular']['selected'] is False
+    assert ledger['600002']['profileDecisions']['regular']['observationSelected'] is False
     assert ledger['600002']['profileDecisions']['regular']['rank'] == 2
     assert result['dailyCandidates'][0]['dailyRankEvidence']['referencePeerCount'] == 2
     assert result['dailyAttackWatchlist'][0]['dailyRankEvidence']['referencePeerCount'] == 1
+    assert {row['code'] for row in result['dailyObservationResearch']} == set(codes)
 
 
-def test_bad_market_is_preserved_as_adverse_in_shadow_and_never_becomes_entry():
+def test_bad_market_is_preserved_as_risk_in_observations_and_never_becomes_entry():
     market = {'source': 'whole_market_snapshot', 'asOf': NOW.isoformat(),
         'features': {'source_coverage': 1., 'universe_count': 3000, 'advancing_pct': 40}}
-    result = run(market=market)
+    result = run(market=market, top_n=0)
     assert not result['dailyCandidates']
-    assert result['dailyAttackWatchlist'][0]['marketBreadth']['status'] == 'weak_market_veto'
-    assert result['dailyAttackWatchlist'][0]['entryEligible'] is False
+    observation = result['dailyObservationResearch'][0]
+    assert observation['marketBreadth']['status'] == 'observed_weak'
+    assert observation['entryEligible'] is False and observation['selected'] is False
+    assert observation['marketRiskState'] == 'weak'
     assert result['marketEmotionPanel']['features'] == market['features']
-    assert result['marketEmotionPanel']['decisionAssessment']['status'] == 'weak_market_veto'
+    assert result['marketEmotionPanel']['decisionAssessment']['status'] == 'observed_weak'

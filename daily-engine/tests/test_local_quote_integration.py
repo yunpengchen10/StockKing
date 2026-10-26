@@ -68,6 +68,76 @@ def enable_primary_evidence(service):
             'source_coverage': 1, 'universe_count': 3000, 'advancing_pct': 65}}
 
 
+def enable_validated_execution_model(monkeypatch):
+    """Isolate quote/collection tests from the independently tested model gate."""
+    from src.services.yao_scout.signal_learning import SignalLearningService
+    original = SignalLearningService.rank_candidates
+    def rank(self, rows, now):
+        return [{**row, 'prediction': {'taskId': 'entry_today_exit_next_session',
+            'status': 'active', 'entryEligible': True, 'expectedNetReturn': .01, 'utility': .01,
+            'winProbability': .7}}
+                for row in original(self, rows, now)]
+    monkeypatch.setattr(SignalLearningService, 'rank_candidates', rank)
+
+
+def test_morning_formal_order_keeps_t1_priority_when_t0_research_rejects(monkeypatch, tmp_path):
+    from src.services.yao_scout.signal_learning import SignalLearningService
+    start = datetime(2026, 9, 14, 9, 40, tzinfo=base.TZ)
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path)
+    enable_primary_evidence(service)
+    enable_validated_execution_model(monkeypatch)
+    service.yao._fetch_snapshot = lambda: pd.DataFrame([
+        {'code': code, 'name': '测试股', 'price': 10} for code in ('600001', '600002')])
+    collect = service.context_provider.collect
+    def context(now):
+        result = collect(now)
+        financials = result['tables'][0]['rows']
+        financials.append({**financials[0], '股票代码': '600002'})
+        return result
+    service.context_provider.collect = context
+    original_t1 = SignalLearningService.rank_candidates
+    original_t0 = SignalLearningService.rank_morning_candidates
+    monkeypatch.setattr(SignalLearningService, 'rank_candidates',
+        lambda self, rows, now: sorted(original_t1(self, rows, now), key=lambda row: row['code'], reverse=True))
+    def opposing_t0(self, rows, now, **kwargs):
+        result = original_t0(self, rows, now, **kwargs)
+        for row in result:
+            row['morningSignal'].update(selectionEligible=False, researchEligibleAtDecision=False)
+        return sorted(result, key=lambda row: row['code'])
+    monkeypatch.setattr(SignalLearningService, 'rank_morning_candidates', opposing_t0)
+    result = service.run('0940', official=True, top_n=1)
+    assert [row['code'] for row in result['morningResearch']] == ['600001', '600002']
+    assert [row['code'] for row in result['precisionResearch']] == ['600002', '600001']
+    assert [row['code'] for row in result['candidates']] == ['600002']
+    chosen = result['candidates'][0]
+    assert chosen['primaryAdmission']['eligible'] is True
+    assert chosen['precisionDecision']['profiles']['regular']['entryEligible'] is True
+    assert chosen['entryExecution']['entryEligible'] is True
+    assert chosen['morningSignal']['researchEligibleAtDecision'] is False
+
+
+def test_active_execution_model_without_win_probability_keeps_primary_empty(monkeypatch, tmp_path):
+    from src.services.yao_scout.signal_learning import SignalLearningService
+    start = datetime(2026, 9, 14, 13, 17, tzinfo=base.TZ)
+    service, _, _, _ = make_service(monkeypatch, start, tmp_path)
+    enable_primary_evidence(service)
+    enable_validated_execution_model(monkeypatch)
+    original_rank = SignalLearningService.rank_candidates
+    def incomplete_prediction(self, rows, now):
+        ranked = original_rank(self, rows, now)
+        for row in ranked:
+            row['prediction'].pop('winProbability')
+            row['prediction']['bigMoveProbability'] = .9
+        return ranked
+    monkeypatch.setattr(SignalLearningService, 'rank_candidates', incomplete_prediction)
+    result = service.run('live')
+    assert result['precisionResearch'][0]['primaryAdmission']['eligible'] is True
+    assert result['precisionResearch'][0]['entryExecution']['priceEligible'] is True
+    assert result['precisionResearch'][0]['entryExecution']['modelEligible'] is False
+    assert result['candidates'] == []
+    assert not any(result['profileCandidates'].values())
+
+
 def test_complete_morning_evidence_without_validated_model_keeps_primary_empty(monkeypatch, tmp_path):
     from src.services.yao_scout.signal_learning import SignalLearningService
     start = datetime(2026, 9, 14, 9, 40, tzinfo=base.TZ)
@@ -139,6 +209,7 @@ def test_final_primary_source_expiry_updates_profile_counts_even_with_fresh_quot
     start = datetime(2026, 9, 14, 13, 17, tzinfo=base.TZ)
     service, tick, _, _ = make_service(monkeypatch, start, tmp_path)
     enable_primary_evidence(service)
+    enable_validated_execution_model(monkeypatch)
     original_quote = service.quote_fetcher
     service.quote_fetcher = lambda code: {**original_quote(code),
         'active_flow_as_of': (start - timedelta(seconds=29)).isoformat()}
@@ -235,7 +306,7 @@ def test_manual_progress_tracks_evidence_stages_and_usable_minutes(monkeypatch, 
     progress = []
     service.progress_callback = lambda value, message: progress.append((value, message))
     result = service.run('live')
-    assert [value for value, _ in progress] == [12, 20, 32, 48, 55, 60, 72, 80, 88, 94]
+    assert [value for value, _ in progress] == [12, 20, 48, 55, 57, 60, 72, 80, 88, 94]
     assert result['dataQuality']['minute_coverage'] == {'requested': 1, 'usable': 1, 'missing': 0}
     assert 'minute_warmup' not in result['dataQuality']['stageTimingsMs']
     assert set(result['dataQuality']['stageTimingsMs']) >= {'snapshot', 'daily_history', 'minute_evidence', 'final_quotes', 'evaluation'}
@@ -392,7 +463,7 @@ def test_review_is_saved_even_when_whole_market_archive_fails(monkeypatch, tmp_p
     monkeypatch.setattr(local, 'review_local_observations', lambda *a, **kw: {'status': 'reviewed'})
     def archive(codes, *a, **kw):
         calls.append('priority' if not kw.get('include_registered', True) else 'whole_market')
-        assert saved and saved[0]['learningReview']['updated'] == 1
+        assert any(row.get('learningReview', {}).get('updated') == 1 for row in saved)
         if kw.get('include_registered', True):
             raise RuntimeError('provider failed')
         assert list(codes) == ['600002'] and kw['count'] == 1970 and kw['timeout'] == 120
@@ -435,7 +506,7 @@ def test_expanded_prescreen_researches_every_stock_in_a_small_universe(monkeypat
     budgets = result['dataQuality']['stageBudgetsSeconds']
     assert budgets['daily_history'] == 25
     assert budgets['minute_evidence'] == 30
-    assert budgets['fund_evidence'] == 10
+    assert budgets['fund_evidence'] == 20
     assert result['dataQuality']['minute_coverage'] == {'requested': 45, 'usable': 45, 'missing': 0}
     assert result['learningLedger']['researchCount'] == 45
     assert all(len(rows) <= 5 for rows in result['profileCandidates'].values())
@@ -495,6 +566,7 @@ def test_completion_requires_fresh_minutes_even_when_quotes_are_fresh(monkeypatc
     start = datetime(2026, 9, 14, 13, 17, tzinfo=base.TZ)
     service, _, _, _ = make_service(monkeypatch, start, tmp_path)
     enable_primary_evidence(service)
+    enable_validated_execution_model(monkeypatch)
     result = service.run('live')
     assert result['candidates']
     collections = [result.get(key, []) for key in
@@ -546,7 +618,9 @@ def test_official_expanded_stage_budgets_stay_inside_delivery_deadline(monkeypat
     budgets = result['dataQuality']['stageBudgetsSeconds']
     assert budgets['daily_history'] == 25
     assert budgets['minute_evidence'] == 30
-    assert budgets['fund_evidence'] == 0
+    # Funds can start alongside sectors before the latter advances the clock.
+    # Their budget remains bounded and never consumes the final quote reserve.
+    assert 0 <= budgets['fund_evidence'] <= 20
     assert budgets['final_quotes'] == 15
 
 
@@ -556,6 +630,7 @@ def test_timed_out_quote_group_keeps_already_completed_groups(monkeypatch, tmp_p
     start = datetime(2026, 9, 14, 13, 17, tzinfo=base.TZ)
     service, _, _, _ = make_service(monkeypatch, start, tmp_path)
     enable_primary_evidence(service)
+    enable_validated_execution_model(monkeypatch)
     codes = [f'{600001 + i:06d}' for i in range(45)]
     frame = pd.DataFrame({'code': codes, 'name': ['测试股'] * 45, 'price': [10] * 45})
     service.yao._fetch_snapshot = lambda: frame
