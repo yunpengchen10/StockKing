@@ -188,7 +188,7 @@ def _snapshot(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "stateLabel", "strategyId", "strategyBranch", "validationStatus", "horizon", "horizonId",
         "support", "resistance", "atr14", "structureRewardRisk", "biasMa5Pct", "atrExtension",
         "eventAssessment", "marketBreadth", "rankMeaning", "riskProfile", "executionQuoteData",
-        "trainingEligible", "minuteModelTrainingEligible", "entryEligible", "executable",
+        "trainingEligible", "minuteModelTrainingEligible", "learningSampleEligibility", "entryEligible", "executable",
         "trendEvidence", "intradayDirectionEvidence", "dailyRankEvidence",
         "observationOnly", "formalEligible", "dailyObservationEligible", "observationSelected",
     )
@@ -207,7 +207,7 @@ _COMPACT_KEYS = (
     "nextDayContinuationSelected", "recommendationKinds",
     "rawStructureRewardRisk", "entryRiskDistance", "entryRiskFloorAtr", "entryRiskBasis",
     "prediction", "learningDecision", "learningTaskContractId", "dataLineage",
-    "learningAlgorithmContractId", "entryExecution", "factorExperiments",
+    "learningAlgorithmContractId", "entryExecution", "factorExperiments", "learningSampleEligibility",
     "learningDataContractId", "dataContractId", "featureContractId", "labelContractId", "modelContractId", "compatibilityPolicy",
     "portfolioWeight", "portfolioWeightKind", "portfolioPolicy", "plannedWeight", "marketRegime",
     "dailySignal", "dailyEvidence", "dailyEvidenceStatus", "dailyProfileDecision",
@@ -264,14 +264,18 @@ def _scan_records(result: Mapping[str, Any]):
     for collection in ("candidates", "controls", "precisionResearch", "morningResearch", "invalidatedCandidates", "windvanes", "evidenceInsufficient"):
         for item in result.get(collection, []) or []:
             if isinstance(item, Mapping) and (code := _code(item.get("code"))):
-                if code not in records or collection == "candidates":
+                replace_daily = (_is_daily_signal(records.get(code) or {})
+                                 and not _is_daily_signal(item) and _current_entry_eligible(item))
+                if code not in records or collection == "candidates" or replace_daily:
                     records[code] = dict(item)
+                    if replace_daily:
+                        selected.discard(code)  # A daily selection is not a minute trade.
     # Research-only rows do not gain execution/training eligibility by existing
     # in a watchlist. Existing candidates/controls keep their original contract.
     execution_sources = {code for code, row in records.items() if not _is_daily_signal(row)}
-    # A profile-only daily recommendation must be frozen too. A daily record
-    # takes precedence over a same-code minute control: this ledger has one
-    # row per stock/run and must never combine the two training contracts.
+    # The independent daily ledger freezes daily publications separately. A
+    # same-code daily display must not erase a prospectively qualified minute
+    # control. Never merge daily and executable labels or feature vectors.
     daily_profiles: dict[str, set[str]] = defaultdict(set)
     for mapping in (result.get('profileCandidates'), result.get('dailyProfileCandidates')):
         if not isinstance(mapping, Mapping):
@@ -280,12 +284,14 @@ def _scan_records(result: Mapping[str, Any]):
             for row in rows or []:
                 if isinstance(row, Mapping) and _is_daily_signal(row) and (code := _code(row.get('code'))):
                     daily_profiles[code].add(str(profile))
-                    if not _is_daily_signal(records.get(code) or {}):
+                    if (not _is_daily_signal(records.get(code) or {})
+                            and not _current_entry_eligible(records.get(code) or {})):
                         records[code] = dict(row)
     for row in result.get('dailyCandidates') or []:
         if isinstance(row, Mapping) and _is_daily_signal(row) and (code := _code(row.get('code'))):
             daily_profiles[code].add('regular')
-            if not _is_daily_signal(records.get(code) or {}):
+            if (not _is_daily_signal(records.get(code) or {})
+                    and not _current_entry_eligible(records.get(code) or {})):
                 records[code] = dict(row)
     for code, record in records.items():
         if _is_daily_signal(record):
@@ -570,6 +576,7 @@ class SignalLearningService:
             scan_meta['learningAlgorithmContractId'] = learning_algorithm_contract(contract)['contractId']
             scan_meta['entryDataContractId'] = entry_contract_fields['learningDataContractId']
         if (result.get('primarySelectionMode') in {'daily_conditional', 'daily_observation'}
+                and not any(_current_entry_eligible(row) for row in records.values())
                 or records and all(_is_daily_signal(row) for row in records.values())):
             # A daily-only publication is not an observed minute-task session.
             scan_meta['algorithmContractId'] = None
@@ -603,6 +610,9 @@ class SignalLearningService:
         existing = False
         frozen_morning = {}
         frozen_daily = {}
+        frozen_samples = {}
+        sample_counts = {'trainingEligibleCount': 0, 'trainingControlCount': 0,
+                         'trainingSelectedCount': 0, 'sampleRejectedCount': 0}
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT 1 FROM signal_runs WHERE run_id=?", (run_id,)).fetchone() is not None
@@ -679,6 +689,7 @@ class SignalLearningService:
                         if item.get('nextDaySignal'):
                             frozen_daily[code]['nextDaySignal'] = item['nextDaySignal']
                     supplied_decision = item.get("decision_at")
+                    sample_preflight = bool(not daily and code in execution_sources and _signal_preflight(item, published_at))
                     try:
                         decision = _at(supplied_decision or timestamp)
                     except (TypeError, ValueError):
@@ -688,9 +699,39 @@ class SignalLearningService:
                         # Keep an auditable, unusable row without backdating it.
                         decision = timestamp
                         eligible = False
+                        sample_blockers = ['decision_timestamp_invalid']
                     else:
                         eligible = bool(not daily and code in execution_sources and official and run_usable and slot in ENTRY_SLOTS
-                                        and _signal_preflight(item, published_at) and quality['eligible'])
+                                        and sample_preflight and quality['eligible'])
+                        sample_blockers = []
+                    if daily:
+                        sample_blockers.append('independent_daily_task_not_minute_training')
+                    elif code not in execution_sources:
+                        sample_blockers.append('not_execution_research_source')
+                    if not official:
+                        sample_blockers.append('manual_audit_only')
+                    elif slot not in ENTRY_SLOTS:
+                        sample_blockers.append('outside_official_entry_slot')
+                    if not run_usable:
+                        sample_blockers.append('scan_unusable')
+                    if not daily and not sample_preflight:
+                        sample_blockers.append('signal_time_evidence_or_quote_failed')
+                    if not quality['eligible'] and not daily:
+                        sample_blockers.append('lineage_not_verified_at_publication')
+                    sample_eligibility = {'version': 'publication-sample-eligibility-v1',
+                        'eligible': eligible, 'selected': code in selected, 'official': official,
+                        'checkedAt': published_at.isoformat(), 'blockerCodes': list(dict.fromkeys(sample_blockers)),
+                        'modelRequired': False, 'immutable': True,
+                        'meaning': '发布时冻结的训练资格；未入选的合格对照同样保留，成熟标签仍须另行核验'}
+                    item = {**item, 'learningSampleEligibility': sample_eligibility,
+                            'trainingEligible': eligible, 'minuteModelTrainingEligible': eligible}
+                    if not daily:
+                        frozen_samples[code] = {key: item[key] for key in
+                            ('learningSampleEligibility', 'learningDataEligibility', 'trainingEligible', 'minuteModelTrainingEligible')}
+                    sample_counts['trainingEligibleCount'] += int(eligible)
+                    sample_counts['trainingControlCount'] += int(eligible and code not in selected)
+                    sample_counts['trainingSelectedCount'] += int(eligible and code in selected)
+                    sample_counts['sampleRejectedCount'] += int(not eligible and not daily)
                     signal_id = sha256(f"{run_id}:{code}".encode()).hexdigest()[:32]
                     snap = _snapshot(item)
                     db.execute(
@@ -725,7 +766,7 @@ class SignalLearningService:
                                            (signal_id, version, float(score[0]), predicted_at.isoformat()))
                             except (ImportError, ValueError):
                                 continue
-                if frozen_morning or frozen_daily:
+                if frozen_morning or frozen_daily or frozen_samples:
                     result = dict(result)
                     def frozen_row(row):
                         code = _code(row.get('code'))
@@ -737,7 +778,7 @@ class SignalLearningService:
                                         'prediction', 'learningDecision', 'dataLineage', 'v11Inputs', 'factorScores'):
                                 clean.pop(key, None)
                             return {**clean, **frozen_daily.get(code, {})}
-                        return {**row, **frozen_morning.get(code, {})}
+                        return {**row, **frozen_morning.get(code, {}), **frozen_samples.get(code, {})}
                     for collection in ('candidates', 'controls', 'precisionResearch', 'morningResearch',
                                        'invalidatedCandidates', 'evidenceInsufficient', 'windvanes', 'dailyCandidates'):
                         if collection in result:
@@ -747,15 +788,24 @@ class SignalLearningService:
                             result[mapping] = {profile: [frozen_row(row) for row in candidates]
                                 for profile, candidates in result[mapping].items()}
                     if frozen_morning:
-                        result['invalidatedCandidates'] = [{**records[code], **frozen}
+                        result['invalidatedCandidates'] = [{**records[code], **frozen, **frozen_samples.get(code, {})}
                             for code, frozen in frozen_morning.items() if frozen['currentSignalState'] == 'invalidated']
-                    scan_meta['result'] = result
-                    db.execute('UPDATE signal_runs SET scan_json=? WHERE run_id=?', (_json(scan_meta), run_id))
+                from .primary_readiness import cold_start_research
+                result = {**result, 'coldStartResearch': cold_start_research(
+                    [{**row, **frozen_samples.get(code, {})} for code, row in records.items()],
+                    slot=slot, official=official, ledger=sample_counts)}
+                scan_meta['result'] = result
+                scan_meta['sampleEligibilitySummary'] = sample_counts
+                db.execute('UPDATE signal_runs SET scan_json=? WHERE run_id=?', (_json(scan_meta), run_id))
                 from .daily_observation_outcomes import persist_scan as persist_daily_observations
                 persist_daily_observations(db, result, run_id, day, published_at)
             else:
                 saved = db.execute("SELECT scan_json FROM signal_runs WHERE run_id=?", (run_id,)).fetchone()
-                canonical = json.loads(saved[0]).get("result") if saved else None
+                saved_meta = json.loads(saved[0]) if saved else {}
+                canonical = saved_meta.get("result")
+                sample_counts = saved_meta.get('sampleEligibilitySummary') or {
+                    'trainingEligibleCount': None, 'trainingControlCount': None,
+                    'trainingSelectedCount': None, 'sampleRejectedCount': None}
                 if isinstance(canonical, Mapping):
                     result = canonical
                     selected, records, next_day, continuation, execution_sources = _scan_records(result)
@@ -771,7 +821,9 @@ class SignalLearningService:
             "dailySelectedCount": len(daily_selected), "minuteSelectedCount": len(selected & execution_sources),
             "dailyObservationCount": daily_observation_count,
             "savedRecommendationCount": len(selected | next_day | daily_selected),
-            "researchCount": len(records), "trainingEligible": bool(execution_sources and official and run_usable and slot in ENTRY_SLOTS),
+            "researchCount": len(records), **sample_counts,
+            "trainingEligible": sample_counts['trainingEligibleCount'] > 0 if sample_counts['trainingEligibleCount'] is not None else None,
+            "officialCollectionEligible": bool(execution_sources and official and run_usable and slot in ENTRY_SLOTS),
             "reviewEligible": bool(execution_sources and reviewable_run),
         }
         return output

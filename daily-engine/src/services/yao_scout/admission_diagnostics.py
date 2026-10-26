@@ -4,6 +4,8 @@ from collections import Counter
 from .local_algorithm import is_entry_eligible, is_research_eligible
 from .research_policy import DEFAULT_PARAMETERS
 from .precision_policy import execution_quote_data
+from .primary_readiness import admission_stage
+from .entry_execution_policy import model_entry_allowed
 
 
 def build_admission_diagnostics(candidates, selected, quality, *, morning=False):
@@ -88,10 +90,17 @@ def build_admission_diagnostics(candidates, selected, quality, *, morning=False)
                        'total': total, 'action': action})
     research = [row for row in rows if is_research_eligible(row)]
     admitted = [row for row in research if is_entry_eligible(row)]
-    model_blocked = sum((row.get('morningSignal') or {}).get('selectionEligible') is not True
-                        for row in research) if morning else 0
-    model_unavailable = sum((row.get('morningSignal') or {}).get('learningStatus') != 'active'
-                            for row in research) if morning else 0
+    stages = Counter(admission_stage(row) for row in rows)
+    model_unavailable = stages['model_not_ready']
+    model_rejected = stages['model_rejected']
+    entry_blocked = stages['entry_plan_blocked']
+    model_passed = sum(model_entry_allowed(row) for row in research)
+    # Morning fields are retained as independent direction-study diagnostics;
+    # they have no authority over the executable T+1 primary admission.
+    morning_blocked = sum((row.get('morningSignal') or {}).get('selectionEligible') is not True
+                          for row in research) if morning else 0
+    morning_unavailable = sum((row.get('morningSignal') or {}).get('learningStatus') != 'active'
+                              for row in research) if morning else 0
     blocked_checks = [check for check in checks if check['blocked']]
     if selected:
         state = 'selected'
@@ -101,15 +110,20 @@ def build_admission_diagnostics(candidates, selected, quality, *, morning=False)
         state = 'data_incomplete'
     elif research and model_unavailable:
         state = 'model_not_ready'
-    elif research and not admitted:
+    elif model_rejected:
         state = 'model_risk_rejected'
+    elif entry_blocked:
+        state = 'entry_plan_blocked'
     else:
         state = 'conditions_not_met'
     fragments = [f"{check['label']}未通过{check['blocked']}/{total}只"
                  for check in sorted(blocked_checks, key=lambda item: -item['blocked'])[:3]]
-    if morning and research and not admitted:
-        fragments.append('上午模型状态见独立验证进度' if model_unavailable or not research
-                         else '已验证模型的收益或风险条件未满足')
+    if model_unavailable:
+        fragments.append(f'{model_unavailable}只证据已通过，T+1净盈利模型尚未就绪，保留研究对照')
+    if model_rejected:
+        fragments.append(f'{model_rejected}只被已验证T+1模型的收益或风险条件拒绝')
+    if entry_blocked:
+        fragments.append(f'{entry_blocked}只模型已通过，但冻结买点失效、超时或价格不在区间内')
     summary = f'本轮主推荐{len(selected)}只。'
     warmup_count = sum(warming_up(row) for row in rows)
     if warmup_count:
@@ -122,14 +136,17 @@ def build_admission_diagnostics(candidates, selected, quality, *, morning=False)
     elif not selected:
         summary += '数据检查已完成，当前方向、价格或风险条件未满足。'
     return {
-        'version': 'primary-diagnostics-v2', 'status': state, 'total': total,
+        'version': 'primary-diagnostics-v3', 'status': state, 'total': total,
         'sessionWarmupCount': warmup_count,
         'currentMinuteUnavailableCount': current_missing_count,
         'sessionWindows': {row['code']: (row.get('baselineEvidence') or {}).get('sessionWindow')
                            for row in rows if warming_up(row)},
         'checks': checks, 'evidenceAndRiskPassed': len(research),
-        'modelAdmissionPassed': len(admitted), 'morningModelBlocked': model_blocked,
-        'morningModelUnavailable': model_unavailable,
+        'modelAdmissionPassed': model_passed, 'entryAdmissionPassed': len(admitted),
+        'modelNotReady': model_unavailable, 'modelRejected': model_rejected,
+        'entryPlanBlocked': entry_blocked, 'stageCounts': dict(stages),
+        'morningModelBlocked': morning_blocked, 'morningModelUnavailable': morning_unavailable,
+        'morningModelRole': 'independent_direction_research_only',
         'selected': len(selected), 'missingReasonCounts': dict(missing),
         'riskReasonCounts': dict(adverse), 'riskWarningCounts': dict(warnings), 'summary': summary,
         'countMeaning': '各项检查独立统计，同一股票可以有多个阻断原因，数量不可相加。',

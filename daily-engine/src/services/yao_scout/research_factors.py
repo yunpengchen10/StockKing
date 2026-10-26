@@ -5,6 +5,7 @@ observation archive, never a historical-universe reconstruction from today's lis
 """
 from __future__ import annotations
 
+from contextlib import closing as close_connection
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from functools import lru_cache
@@ -373,32 +374,55 @@ class MarketEmotionArchive:
     def _database(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         db = sqlite3.connect(self.path, timeout=20)
-        db.execute('''CREATE TABLE IF NOT EXISTS observations (
-            digest TEXT PRIMARY KEY, source_at TEXT NOT NULL, received_at TEXT NOT NULL,
-            trading_day TEXT NOT NULL, slot TEXT NOT NULL, is_close INTEGER NOT NULL,
-            payload TEXT NOT NULL)''')
+        try:
+            db.execute('''CREATE TABLE IF NOT EXISTS observations (
+                digest TEXT PRIMARY KEY, source_at TEXT NOT NULL, received_at TEXT NOT NULL,
+                trading_day TEXT NOT NULL, slot TEXT NOT NULL, is_close INTEGER NOT NULL,
+                payload TEXT NOT NULL)''')
+        except BaseException:
+            db.close()
+            raise
         return db
 
     def observe(self, snapshot, cutoff, *, received_at=None):
         now, received = _at(cutoff), _at(received_at)
         out = _packet(now, source='archived_full_mainboard_snapshots', regime='unknown',
                       exposureMultiplier=None, socialSentimentAvailable=False)
+        # A failed observation has no accepted source clock. Keep evaluation
+        # time separate so an early return cannot look like fresh market data.
+        out.update(asOf=None, evaluatedAt=now.isoformat() if now else None)
         out['emotionDiagnostics'] = _emotion_diagnostics({}, {}, [], self.policy, now)
         attrs = getattr(snapshot, 'attrs', {}) or {}
         received = received or _at(attrs.get('received_at'))
         if now is None or received is None or received > now:
             out['gaps'].append('快照接收时间未知、超前或缺少时区')
             return out
-        source = attrs.get('snapshot_source') or attrs.get('source')
-        if not source or attrs.get('stale') or attrs.get('complete') is False:
-            out['gaps'].append('快照来源未知或标记为陈旧')
-            return out
         frame = snapshot.copy() if isinstance(snapshot, pd.DataFrame) else pd.DataFrame(snapshot or [])
         if not {'code', 'name', 'price'}.issubset(frame.columns):
             out['gaps'].append('全主板快照字段不完整')
             return out
-        if 'market_quote' in frame.columns:
-            source = attrs.get('market_quote_source') or source
+        source = attrs.get('snapshot_source') or attrs.get('source')
+        if not source or source == 'unknown':
+            out['gaps'].append('全主板目录来源未核验')
+            return out
+        directory_complete = attrs.get('directory_complete', attrs.get('complete'))
+        enriched = 'market_quote' in frame.columns
+        if attrs.get('complete') is False or directory_complete is False or (
+                enriched and directory_complete is not True):
+            out['gaps'].append('全主板目录完整性未确认，不能改变市场指标分母')
+            return out
+        if enriched:
+            # The directory's old ranking fields retain their stale flag.
+            # Current whole-universe quotes carry independent prices/clocks;
+            # each is validated below against the unchanged directory size.
+            source = attrs.get('market_quote_source')
+            if source not in {'software:go/tencent', 'software:go/sina', 'software:go/sina+tencent'}:
+                out['gaps'].append('全主板补强报价来源未核验')
+                return out
+            quote_sources = set(source.split('/', 1)[1].split('+'))
+        elif attrs.get('stale'):
+            out['gaps'].append('快照来源未知或标记为陈旧')
+            return out
         frame['code'] = frame.code.astype(str).str.zfill(6)
         frame = frame.loc[frame.code.str.match(r'^(?:600|601|603|605|000|001|002|003)\d{3}$')
                           & ~frame.name.astype(str).str.contains(r'ST|退|整理|停牌', case=False, regex=True)]
@@ -417,7 +441,8 @@ class MarketEmotionArchive:
             observation = row
             if 'market_quote' in row:
                 packet = row.get('market_quote')
-                if not isinstance(packet, dict) or packet.get('code') != row['code']:
+                if (not isinstance(packet, dict) or packet.get('code') != row['code']
+                        or packet.get('source') not in quote_sources):
                     continue
                 observation = packet
             raw_stamp = observation.get('source_time') or observation.get('provider_timestamp')
@@ -479,7 +504,7 @@ class MarketEmotionArchive:
         packet = {'features': features, 'rows': data, 'source': str(source),
                   'measurementVersion': EMOTION_EVIDENCE_VERSION}
         digest = hashlib.sha256(json.dumps([at.isoformat(), packet], sort_keys=True).encode()).hexdigest()
-        with self._database() as db:
+        with close_connection(self._database()) as db, db:
             # Never replace first receipt or replay a snapshot before it was known.
             existing = db.execute('SELECT received_at FROM observations WHERE digest=?', (digest,)).fetchone()
             first_received = min(received.isoformat(), existing[0]) if existing else received.isoformat()

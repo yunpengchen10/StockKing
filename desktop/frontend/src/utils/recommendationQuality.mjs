@@ -41,3 +41,28 @@ export function settlementHealthSummary(health) {
   if (!health) return '尚无结算状态'
   return `应结算 ${health.dueCount ?? '—'} · 逾期待处理 ${health.overdueCount ?? '—'} · 行情待补 ${health.missingDataCount ?? '—'} · 最近成功批次 ${time(health.lastSuccessAt)}`
 }
+
+export function primaryReadinessSummary(report, research = {}) {
+  if (!report) return null
+  const progress = report.progress || {}
+  const modelReady = report.modelUsableNow === true || (report.status === 'active' && report.modelUsableNow !== false)
+  const stateUnknown = report.modelStatus === 'unknown' || report.blockerCodes?.includes('primary_registry_unavailable')
+  const modelPending = !stateUnknown && (report.modelUsableNow === false || (!modelReady && !report.configuredChampionVersion))
+  const known = report.progressKnown === true
+  const count = value => finite(value) ? Number(value) : '未审计'
+  const saved = research.trainingEligibleCount
+  return {
+    modelPending,
+    title: modelReady ? 'T+1模型已就绪' : modelPending ? 'T+1模型准备中' : 'T+1模型待核验',
+    sampleProgress: known
+      ? `有效样本 ${count(progress.validSamples)} 条 · 覆盖 ${count(progress.validSampleDays)} 个交易日`
+      : '当前任务的有效样本尚未完成审计，数量未知',
+    audit: `样本审计 ${time(report.countsAsOf)}${report.progressFresh === false && known ? '（历史统计）' : ''}`,
+    requirement: `滚动验证结构至少需要 ${count(report.minimumSignalDaysForAnyTraining || progress.trainingSplits?.minimumSignalDaysForAnyTraining)} 个成熟交易日期；样本、类别、留出和前瞻验证仍须分别通过。`,
+    recording: research.recordingMode === 'manual_audit_only'
+      ? '本轮为手动扫描，仅保留审计记录，不增加正式训练样本。'
+      : saved == null ? '本轮实际入池数量待发布核验。'
+        : `本轮实际获得训练资格 ${count(saved)} 条，其中未入选研究对照 ${count(research.trainingControlCount)} 条；成熟标签另行核验。`,
+    message: report.message || '模型准备状态待核验。',
+  }
+}

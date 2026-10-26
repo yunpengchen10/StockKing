@@ -63,9 +63,11 @@ class SoftwareMarketClient:
                 return False
         fresh_count = sum(fresh(row) for row in result.get('items', []))
         complete = bool(result.get('complete'))
+        selection_stale = fresh_count != len(frame) or frame.empty
         frame.attrs.update(source='software:go/eastmoney', fetched_at=result.get('fetched_at'),
-                           stale=not complete or fresh_count != len(frame) or frame.empty,
+                           stale=not complete or selection_stale,
                            complete=complete, directory_complete=complete,
+                           selection_fields_stale=selection_stale,
                            selection_fresh_count=fresh_count,
                            freshness_meaning='provider_row_clock_checked_independently_of_directory_completeness',
                            source_time_meaning=result.get('source_time_meaning'))
@@ -132,6 +134,7 @@ class SoftwareMarketClient:
             'status':'complete' if len(observations) == len(codes) and codes else 'partial',
             'requested':len(codes), 'observed':len(observations),
             'missing_batches':len(missing), 'source_time_meaning':'provider_quote_update_time',
+            'directory_complete':frame.attrs.get('directory_complete', frame.attrs.get('complete')),
             'price_fields_scope':'market_quote only; original selection fields retain original dates'}
         return frame
 

@@ -45,8 +45,9 @@ def sector_collection_plan(priorities, cache_dir):
     """Deterministic fair peer order, independent of the candidate queue order.
 
     Industries not reached in earlier scans get the next first turns. Within
-    a scan, each industry gets one peer per round; no large denominator needs
-    to be completed before another industry's first request is submitted.
+    the same service turn, complete the smallest remaining evidence gap first.
+    Keep each industry's peers together: spreading one request across every
+    industry can consume the entire budget without completing any denominator.
     """
     path = Path(cache_dir) / 'sector-collection-rotation-v1.json'
     with _sector_rotation_lock:
@@ -66,11 +67,11 @@ def sector_collection_plan(priorities, cache_dir):
     ordered = sorted(priorities, key=priority)
     queues = [(board, list(absent)) for _, _, board, absent in ordered]
     peers, seen = [], set()
-    for index in range(max((len(absent) for _, absent in queues), default=0)):
-        for _, absent in queues:
-            if index < len(absent) and absent[index] not in seen:
-                seen.add(absent[index])
-                peers.append(absent[index])
+    for _, absent in queues:
+        for peer in absent:
+            if peer not in seen:
+                seen.add(peer)
+                peers.append(peer)
     return peers, state, [board for board, _ in queues]
 
 
@@ -630,23 +631,28 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
         for peer in selected_boards[board]:
             requested_ends.setdefault(peer, set()).add(end)
     # Stable industry order is only a local-read tie breaker. Network service
-    # rotates by prior collection debt and round-robin below.
+    # rotates by prior collection debt, concentrating on completion below.
     ordered_boards = sorted(selected_boards, key=lambda board: (len(selected_boards[board]), str(board)))
     all_codes = list(dict.fromkeys(peer for board in ordered_boards
                                   for peer in sorted(set(selected_boards[board]))))
     def has_required_windows(code, normalized):
         ends = requested_ends.get(code) or {_datetime(cutoff)}
         return all(window(normalized, end, 6) for end in ends)
-    def sufficient(code, bars):
-        return has_required_windows(code, normalize_bars(bars, cutoff))
+    rows, normalized_rows = {}, {}
+    if archive:
+        cache_scope = str(Path(cache_dir).resolve())
+        with _recent_sector_lock:
+            memory_rows = {code:_recent_sector_bars.get((cache_scope, code)) for code in all_codes}
+        # Reuse all exact-window memory hits before the bounded SQLite queue.
+        # A slow disk read must not hide a later industry's already held bars.
+        for code, saved in memory_rows.items():
+            if saved and 0 <= monotonic()-saved[0] < 300:
+                normalized = normalize_bars(saved[1], cutoff)
+                if has_required_windows(code, normalized):
+                    rows[code], normalized_rows[code] = saved[1], normalized
+    memory_hits = len(rows)
     def cached_minutes(code):
         try:
-            with _recent_sector_lock:
-                saved = _recent_sector_bars.get((str(Path(cache_dir).resolve()), code))
-            # A longer cache lifetime reduces repeated SQLite reads, while the
-            # exact six-bar window check prevents stale bars counting as fresh.
-            if saved and 0 <= monotonic()-saved[0] < 300 and sufficient(code, saved[1]):
-                return code, saved[1]
             return code, archive.read_recent(code, cutoff, minutes=20)
         except Exception:
             return code, []
@@ -656,10 +662,10 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
     # shared industry constituents first, before the bounded local-read budget
     # is consumed by thousands of peers which may have no local session yet.
     cache_order = list(dict.fromkeys([code for code in codes if code in requested_ends]+all_codes))
-    cached, _ = bounded_fetch_map(cached_minutes, cache_order if archive else [], workers=8,
+    cached, _ = bounded_fetch_map(cached_minutes, [code for code in cache_order if code not in rows] if archive else [], workers=8,
         timeout=min(2., max(0,collection_deadline-monotonic())*.25))
-    rows = dict(cached)
-    normalized_rows = {code:normalize_bars(bars, cutoff) for code,bars in rows.items()}
+    rows.update(cached)
+    normalized_rows.update({code:normalize_bars(bars, cutoff) for code,bars in cached})
     missing = {code for code in all_codes if not has_required_windows(code, normalized_rows.get(code, {}))}
     errors = {}
     priorities = []
@@ -676,6 +682,7 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
         needed = max(0, required-available)
         priorities.append((needed, len(absent), str(board), absent))
     fair_order, _, industry_order = sector_collection_plan(priorities, cache_dir)
+    primary_by_board = {board:absent for _, _, board, absent in priorities}
 
     # A 170-stock scan can share thousands of constituents. Normalize each
     # accepted payload once and invalidate only the affected industry windows;
@@ -718,8 +725,10 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
                 sourceIds=sorted({source for peer in peers for source in sources.get(peer, set())}),
                 collectionPhase=phase,
                 fetchBudget={'seconds':timeout, 'returnReserveSeconds':return_reserve,
-                    'priority':'underserved_industry_round_robin_exact_window_cache',
+                    'priority':'completion_first_rotating_industries_exact_window_cache',
                     'industryOrder':industry_order,
+                    'maximumWorkers':8, 'maximumIndustryWorkers':4 if len(industry_order)>1 else 8,
+                    'memoryCacheUsablePeers':memory_hits,
                     'unfinishedPeers':unfinished_peers, 'failedPeers':len(failed_peers)})
             result['reasonCodes'] = []
             if not sector:
@@ -786,6 +795,10 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
     pending = {}
     usable_codes = set(all_codes)-missing
     peers_by_board = {str(board):peers for board,peers in selected_boards.items()}
+    maximum_per_industry = 4 if len(industry_order)>1 else 8
+
+    def has_capacity(board):
+        return len(set(pending.values()).intersection(peers_by_board[board])) < maximum_per_industry
 
     def ready_boards():
         return {board for board, peers in peers_by_board.items()
@@ -824,20 +837,34 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
             publish(unfinished, 'industry_snapshot', only_boards=complete-published_ready)
             published_ready = complete
 
-    def submit_available(available, count):
-        for code in available[:max(0, min(count, 8-len(pending)))]:
+    def submit_primary():
+        # Fill an industry's complete quota before spending its remaining
+        # 20%, but reserve capacity for another industry if this one is slow.
+        # The full denominator and exact-window checks above are unchanged.
+        while len(pending) < 8:
             if monotonic() >= collection_deadline:
+                break
+            complete = ready_boards()
+            board_order = [board for board in industry_order if board not in complete]
+            board_order += [board for board in industry_order if board in complete]
+            code = None
+            for board in board_order:
+                if not has_capacity(board):
+                    continue
+                code = next((peer for peer in primary_by_board[board] if peer not in attempted), None)
+                if code is not None:
+                    break
+            if code is None:
                 break
             attempted.add(code)
             pending[pool.submit(get_minutes, code)] = code
 
     try:
-        # A fair primary pass preserves the full requested universe and shares
-        # the same eight workers, including outstanding slow requests.
+        # Fairness operates across focused industry service turns, rather than
+        # sprinkling a few peers over dozens of incomplete industries.
         while monotonic() < collection_deadline:
             receive()
-            remainder = [peer for peer in fair_order if peer in unfinished and peer not in attempted]
-            submit_available(remainder, len(remainder))
+            submit_primary()
             if not pending:
                 break
             receive(block=True)
@@ -850,11 +877,14 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
             supplements = list(dict.fromkeys(supplements))
             while supplements and monotonic() < collection_deadline:
                 receive()
-                free = max(0, 8-len(pending))
-                for code in supplements[:free]:
+                for code in list(supplements):
+                    if len(pending) >= 8 or monotonic() >= collection_deadline:
+                        break
+                    if not any(has_capacity(str(board)) for board in peer_boards.get(code, ())):
+                        continue
                     unfinished.add(code)
                     pending[pool.submit(get_minutes, code, supplement=True)] = code
-                supplements = supplements[free:]
+                    supplements.remove(code)
                 if not pending:
                     break
                 receive(block=True)

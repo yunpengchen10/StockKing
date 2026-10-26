@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -44,7 +45,7 @@ def main():
                 from yao_runs where id in (select id from yao_runs
                 where mode in ({mode_slots}) and status in ({status_slots})
                 order by as_of_at desc,id desc limit ?)"""
-            with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
+            with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as db:
                 headers = db.execute(query, (*modes, *statuses, max(1, min(limit, 100)))).fetchall()
             rows = []
             for run_id, mode, raw, candidate_type, next_day_count, continuation_count in headers:
@@ -58,7 +59,7 @@ def main():
             return rows
 
         def get_yao_run(self, run_id):
-            with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
+            with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as db:
                 row = db.execute('select mode,result_json from yao_runs where run_id=?',
                                  (run_id,)).fetchone()
             return {'run_id': run_id, 'mode': row[0], 'result': json.loads(row[1])} if row else None
@@ -69,6 +70,8 @@ def main():
         os.environ["YAO_SCOUT_DATA_DIR"] = str(root / "picks")
         expected = LocalPicksDisplayStore(History()).read()
         assert expected.get("adaptive"), "No valid historical result for migration"
+        display_path = root / 'picks' / 'local-picks-display-v1.json'
+        frozen_display_bytes = display_path.read_bytes()
         if args.expected_recommendations is not None:
             assert expected.get("savedRecommendationCount") == args.expected_recommendations, "Saved research recommendation count is incorrect"
         if args.expected_premarket is not None:
@@ -123,7 +126,14 @@ def main():
                 started = time.monotonic()
                 actual = get("/api/v1/stock-king/picks/display")
                 durations.append(round((time.monotonic() - started) * 1000))
-                assert actual == expected, "Display changed after process restart"
+                current = actual.get('currentPrimaryReadiness')
+                assert isinstance(current, dict), 'Current primary readiness is missing from display API'
+                assert current['stateScope'] == 'current_registry'
+                assert current['taskId'] == 'entry_today_exit_next_session'
+                assert current['modelStatus'] == 'not_configured' and current['modelUsableNow'] is False
+                assert current['snapshotCandidatesReevaluated'] is False and current['currentScan'] is None
+                assert {key: value for key, value in actual.items() if key != 'currentPrimaryReadiness'} == expected, 'Frozen display changed after process restart'
+                assert display_path.read_bytes() == frozen_display_bytes, 'Current readiness was written into frozen display'
                 learning = get("/api/v1/stock-king/picks/learning")
                 assert learning["algorithm"] == algorithm_contract(), "Frozen validation contract differs from live algorithm"
                 assert learning["effectiveRankSource"] == "rules", "Isolated profile must use rules without a trained model"
@@ -159,7 +169,8 @@ def main():
             "primarySelectionMode": expected['adaptive'].get('primarySelectionMode'),
             "generatedAt": expected.get("generatedAt"), "displayReadMs": durations,
             "validationContract": validated_contract,
-            "historyDatabaseReadOnly": True, "profileIsolated": True}, ensure_ascii=False))
+            "historyDatabaseReadOnly": True, "profileIsolated": True,
+            "currentPrimaryReadinessVerified": True, "frozenDisplayUnchanged": True}, ensure_ascii=False))
     if original_data_dir is None:
         os.environ.pop("YAO_SCOUT_DATA_DIR", None)
     else:

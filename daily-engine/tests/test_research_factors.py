@@ -177,6 +177,7 @@ def snapshot(at, changes=(10., 1., -1.), *, highs=True, row_times=False):
     if highs:
         result['high'] = [max(10., price) for price in prices]
     result.attrs['snapshot_source'] = 'recorded-provider'
+    result.attrs['complete'] = True
     if row_times:
         result['source_time'] = at.isoformat()
     else:
@@ -187,6 +188,37 @@ def snapshot(at, changes=(10., 1., -1.), *, highs=True, row_times=False):
 def archive(tmp_path):
     return MarketEmotionArchive(tmp_path, calendar_provider=calendar,
         policy={'minimumUniverse': 3, 'historySessions': 2})
+
+
+@pytest.mark.parametrize('failure', [None, 'initialization', 'transaction'])
+def test_market_archive_closes_connections_before_temporary_directory_cleanup(monkeypatch, tmp_path, failure):
+    import sqlite3
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    original_connect = sqlite3.connect
+    connections = []  # Strong references prevent garbage collection from hiding a leak.
+    class Connection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            if ((failure == 'initialization' and sql.startswith('CREATE TABLE'))
+                    or (failure == 'transaction' and sql.startswith('SELECT received_at'))):
+                raise sqlite3.OperationalError('fixture archive failure')
+            return super().execute(sql, *args, **kwargs)
+    def connect(*args, **kwargs):
+        db = original_connect(*args, **kwargs, factory=Connection)
+        connections.append(db)
+        return db
+    monkeypatch.setattr(sqlite3, 'connect', connect)
+    with TemporaryDirectory(dir=tmp_path) as directory:
+        store = archive(directory)
+        if failure:
+            with pytest.raises(sqlite3.OperationalError, match='fixture archive failure'):
+                store.observe(snapshot(NOW), NOW, received_at=NOW)
+        else:
+            assert store.observe(snapshot(NOW), NOW, received_at=NOW)['features']['source_coverage'] == 1
+        assert len(connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match='closed database'):
+            connections[0].execute('SELECT 1')
+    assert not Path(directory).exists()
 
 
 def test_market_never_substitutes_receipt_date_or_fetch_time_for_source_clock(tmp_path):

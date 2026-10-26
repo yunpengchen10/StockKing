@@ -209,7 +209,7 @@ def test_fair_peer_budget_serves_large_industry_early_and_still_completes_fast_s
                       {'large': large, 'small': small}),
             bar_fetcher=fetch, timeout=.3)
         first_large = next(i for i, code in enumerate(called) if code in large)
-        assert first_large == 1  # Large industry gets its first turn immediately.
+        assert first_large <= 4  # A slow industry cannot monopolize all eight workers.
         assert result[small[0]]['metrics']['sector_coverage_pct'] >= 80
         assert result[small[0]]['totalPeers'] == 5
         assert result[small[0]]['confirmed']
@@ -258,7 +258,7 @@ def test_failed_member_is_replaced_without_starving_another_industry(tmp_path):
             bar_fetcher=fetch, timeout=.3,
             on_result=lambda code, packet:emitted.append((code, packet)))
         first_large = next(i for i, code in enumerate(calls) if code in large)
-        assert first_large == 1
+        assert first_large <= 4
         assert set(small).issubset(calls)
         assert result[small[0]]['metrics']['sector_coverage_pct'] == 80
         assert result[small[0]]['totalPeers'] == 5

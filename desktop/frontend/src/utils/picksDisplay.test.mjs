@@ -34,6 +34,37 @@ const zhengyuObservation = () => ({ code: '603089', name: '正裕工业', refere
   nextDaySignal: { queue: 'continuation', score: 90, signalSession: '2026-10-23', targetSession: '2026-10-26',
     reasons: ['已触板延续线索'], gaps: ['仅在展开详情后显示的待确认条件'] } })
 
+test('current model readiness explains an old empty snapshot without changing its frozen evidence', async () => {
+  const saved = researchSnapshot('2026-10-26T10:30:00+08:00')
+  saved.currentPrimaryReadiness = { modelUsableNow: false, progressKnown: true, progressFresh: true, countsAsOf: '2026-10-26T15:30:00+08:00', minimumSignalDaysForAnyTraining: 156, progress: { validSamples: 0, validSampleDays: 0 } }
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-26T15:35:00+08:00'))
+  try {
+    await flush()
+    assert.match(mounted.visibleText(), /主推荐 · 等待模型验证/)
+    assert.match(mounted.visibleText(), /当前 · T\+1模型准备中/)
+    assert.match(mounted.visibleText(), /有效样本 0 条.*156/s)
+    assert.equal(mounted.state().result.generatedAt, saved.generatedAt)
+    assert.equal(mounted.state().adaptive.primaryReadiness, undefined)
+    assert.doesNotMatch(mounted.visibleText(), /冷启动研究对照 ·/)
+  } finally { mounted.dispose() }
+})
+
+test('cold-start controls are visible separately from formal recommendations and show actual publication eligibility', async () => {
+  const saved = researchSnapshot('2026-10-26T10:30:00+08:00')
+  saved.adaptive.primaryReadiness = { modelUsableNow: false, progressKnown: false, minimumSignalDaysForAnyTraining: 156 }
+  saved.adaptive.coldStartResearch = { coldStartControlCount: 1, evidenceEligibleCount: 1, entryPlanReadyCount: 1, recordingMode: 'official_frozen', trainingEligibleCount: 1, trainingControlCount: 1,
+    items: [{ code: '600001', name: '研究样本', minimumPrice: 9.95, maximumPrice: 10.15, invalidationPrice: 9.5, expiresAt: '2026-10-26T10:35:00+08:00', trainingEligible: true }] }
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-26T10:31:00+08:00'))
+  try {
+    await flush()
+    assert.match(mounted.visibleText(), /数量未知/)
+    assert.match(mounted.visibleText(), /冷启动研究对照 · 1 只 · 未构成正式推荐/)
+    assert.match(mounted.visibleText(), /研究样本 600001.*保存时研究区间 ¥9.95–10.15/s)
+    assert.match(mounted.visibleText(), /训练资格 1 条.*对照 1 条/s)
+    assert.equal(mounted.state().adaptivePicks.length, 0)
+  } finally { mounted.dispose() }
+})
+
 // Exercise the real setup, template, and KeepAlive lifecycle without a browser
 // or Wails. Every timer, including those used by the imported utilities, is
 // controlled here so unresolved bridge calls cannot keep the test runner alive.

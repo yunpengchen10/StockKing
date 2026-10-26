@@ -114,7 +114,7 @@ def get_local_picks_display(
     db_manager: DatabaseManager = Depends(get_database_manager),
 ) -> Dict[str, Any]:
     store = LocalPicksDisplayStore(db_manager)
-    payload = store.read()
+    payload = store.with_current_primary_readiness(store.read())
     with _refresh_lock:
         active = _active_refresh(get_task_queue(), store.storage_key)
         if active:

@@ -7,7 +7,7 @@ import { toResearchCode } from '../utils/symbol'
 import PickIndicatorEvidence from './PickIndicatorEvidence.vue'
 import PicksLedger from './PicksLedger.vue'
 import { predictionSummary, portfolioSummary, nextDayPredictionSummary } from '../utils/learningStatus.mjs'
-import { entryExecutionSummary } from '../utils/recommendationQuality.mjs'
+import { entryExecutionSummary, primaryReadinessSummary } from '../utils/recommendationQuality.mjs'
 import { explainPick, PICK_BRANCHES, isEvidenceRuleVersion } from '../utils/pickExplain.mjs'
 import { createPicksRefreshController, readDisplayedPicks, saveDisplayedPicks, selectDisplayedPicks } from '../utils/picksRefresh.mjs'
 import { withRecordReadTimeout } from '../utils/recordRead.mjs'
@@ -160,6 +160,10 @@ const dailyEmotionMetrics = computed(() => {
 const dailyDisplayMessage = computed(() => precisionProfile.value === 'regular' ? dailyAssessment.value.message
   : `日线条件推荐${adaptivePicks.value.length}只（${{ conservative: '稳健', aggressive: '激进' }[precisionProfile.value] || precisionProfile.value}档）；查看本档价格与风险检查结果。`)
 const primaryContractKnown = computed(() => isDailyPrimary.value || hasDailyObservation.value || Boolean(adaptive.value.recommendationPolicy))
+const primaryReadiness = computed(() => primaryReadinessSummary(viewingHistory.value ? adaptive.value.primaryReadiness : result.value.currentPrimaryReadiness || adaptive.value.currentPrimaryReadiness || adaptive.value.primaryReadiness, adaptive.value.coldStartResearch))
+const primaryPicksTitle = computed(() => isDailyPrimary.value ? `日线条件推荐 · ${adaptivePicks.value.length} 只`
+  : primaryReadiness.value?.modelPending && !adaptivePicks.value.length ? '主推荐 · 等待模型验证'
+  : primaryContractKnown.value ? `主推荐 · ${adaptivePicks.value.length} 只通过准入` : `旧版候选 · ${adaptivePicks.value.length} 只`)
 const primaryObjective = computed(() => isDailyPrimary.value
   ? '日线评估目标：基于已完成日K、当日报价及披露风险筛选，观察下一交易日（T+1）的价格结构与合法退出条件。'
   : hasDailyObservation.value
@@ -692,6 +696,7 @@ onDeactivated(() => {
           </div>
         </div>
         <p v-if="!isDailyPrimary">数据、方向及风险同时通过 {{ adaptive.admissionDiagnostics.evidenceAndRiskPassed }} 只 · 模型准入通过 {{ adaptive.admissionDiagnostics.modelAdmissionPassed }} 只 · 最终主推荐 {{ adaptive.admissionDiagnostics.selected }} 只</p>
+        <p v-if="!isDailyPrimary && adaptive.admissionDiagnostics.version === 'primary-diagnostics-v3'">模型尚未就绪 {{ adaptive.admissionDiagnostics.modelNotReady }} 只 · 模型收益或风险未通过 {{ adaptive.admissionDiagnostics.modelRejected }} 只 · 买点条件未通过 {{ adaptive.admissionDiagnostics.entryPlanBlocked }} 只</p>
         <p v-else>分钟增强数据与风险通过 {{ adaptive.admissionDiagnostics.evidenceAndRiskPassed }} 只 · 分钟模型准入通过 {{ adaptive.admissionDiagnostics.modelAdmissionPassed }} 只</p>
         <small>{{ adaptive.admissionDiagnostics.countMeaning }}</small>
         <p v-if="adaptive.historyPreparation?.message">历史准备：{{ adaptive.historyPreparation.message }}</p>
@@ -701,7 +706,26 @@ onDeactivated(() => {
           <div v-for="queue in adaptive.morningReadiness.queues || []" :key="queue.queue"><b>{{ queue.label || queue.queue }}</b><p>{{ queue.message }}</p><p v-if="queue.action">{{ queue.action }}</p></div>
         </details>
       </details>
-      <div class="adaptive-summary saved-recommendations"><div><b>{{ isDailyPrimary ? `日线条件推荐 · ${adaptivePicks.length} 只` : primaryContractKnown ? `主推荐 · ${adaptivePicks.length} 只通过准入` : `旧版候选 · ${adaptivePicks.length} 只` }}</b><n-tag v-if="snapshotIsOld" size="small" type="warning" :bordered="false">历史结果</n-tag><small>本轮生成 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small><small v-if="adaptive.run_id || adaptive.runId">扫描编号 {{ adaptive.run_id || adaptive.runId }}</small></div><n-button v-if="result.adaptive" size="small" secondary @click="openRecommendationRecords">查看推荐与失效记录</n-button><span v-if="loading">扫描中 · 暂时保留原列表</span></div>
+      <section v-if="primaryReadiness && !isDailyPrimary" class="primary-readiness" aria-label="T+1模型准备状态">
+        <b>{{ viewingHistory ? '保存时' : '当前' }} · {{ primaryReadiness.title }}</b>
+        <p>{{ primaryReadiness.message }}</p><p>{{ primaryReadiness.sampleProgress }} · {{ primaryReadiness.audit }}</p>
+        <p>{{ primaryReadiness.requirement }}</p>
+        <p v-if="adaptive.coldStartResearch">{{ primaryReadiness.recording }}</p>
+        <p>正式主推荐须通过已验证模型。合格研究对照可以独立积累，待T+1标签核验后进入训练；无需先产生正式推荐。</p>
+      </section>
+      <details v-if="adaptive.coldStartResearch && !isDailyPrimary" class="sk-help-details" :open="!adaptivePicks.length">
+        <summary>冷启动研究对照 · {{ adaptive.coldStartResearch.coldStartControlCount }} 只 · 未构成正式推荐</summary>
+        <p>本轮保存时：证据与风险通过 {{ adaptive.coldStartResearch.evidenceEligibleCount }} 只；其中研究买点通过 {{ adaptive.coldStartResearch.entryPlanReadyCount }} 只。</p>
+        <p>{{ adaptive.coldStartResearch.meaning }}</p>
+        <p v-if="!adaptive.coldStartResearch.items?.length">本轮尚无同时满足证据、风险和研究买点的冷启动对照。</p>
+        <div v-for="pick in adaptive.coldStartResearch.items || []" :key="pick.code" class="daily-attack-row">
+          <p><b>{{ pick.name }} {{ pick.code }}</b> · 研究对照</p>
+          <p>保存时研究区间 ¥{{ dailyValue(pick.minimumPrice) }}–{{ dailyValue(pick.maximumPrice) }} · 失效参考 ¥{{ dailyValue(pick.invalidationPrice) }} · 原有效期至 {{ formatTime(pick.expiresAt) }}</p>
+          <p>{{ pick.trainingEligible === true ? '发布时获得训练资格，等待成熟标签核验' : pick.trainingEligible === false ? '未获得训练资格，仅保留审计' : '入池资格尚未核验' }}</p>
+        </div>
+        <p v-if="adaptive.coldStartResearch.itemsTruncated">仅展示前20只，完整记录保留在本轮审计中。</p>
+      </details>
+      <div class="adaptive-summary saved-recommendations"><div><b>{{ primaryPicksTitle }}</b><n-tag v-if="snapshotIsOld" size="small" type="warning" :bordered="false">历史结果</n-tag><small>本轮生成 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small><small v-if="adaptive.run_id || adaptive.runId">扫描编号 {{ adaptive.run_id || adaptive.runId }}</small></div><n-button v-if="result.adaptive" size="small" secondary @click="openRecommendationRecords">查看推荐与失效记录</n-button><span v-if="loading">扫描中 · 暂时保留原列表</span></div>
       <div class="recommendation-objectives"><p>{{ primaryObjective }}</p><p>T+1持有风险单独评估：A股当日买入通常不能当日卖出，仍须承担隔夜与下一交易日退出风险。当日价格观察不等于可实现收益。</p><p v-if="isDailyPrimary">日线条件尚未经过概率校准。{{ dailyRankMeaning }}；卡片保留本轮日K来源、报价时间和风险条件。</p><p v-else>规则分用于排序，不是上涨概率。刷新只更新本轮证据，首次主推荐的时间和参考价以已保存记录为准。</p></div>
       <p v-if="!isDailyPrimary && (adaptive.morningAssessment?.meaning || adaptive.morningAssessment?.message)" class="quote-coverage">{{ adaptive.morningAssessment.meaning || adaptive.morningAssessment.message }}</p>
       <p v-if="!primaryContractKnown && result.adaptive" class="quote-coverage">旧版快照保留原版本候选；未记录统一准入，不标记为通过当前规则。</p>
@@ -936,6 +960,7 @@ onDeactivated(() => {
 </template>
 
 <style scoped>
+.primary-readiness{margin:14px 0;padding:14px;border:1px solid var(--sk-border);border-left:3px solid #d39b36;border-radius:10px;background:var(--sk-surface);font-size:13px;line-height:1.7}.primary-readiness p{margin:7px 0;color:var(--sk-text-muted)}
 .admission-diagnostics{margin:14px 0;padding:14px;border:1px solid var(--sk-border);border-radius:10px;background:var(--sk-surface);font-size:12px;line-height:1.65}.admission-diagnostics>summary{font-size:14px;font-weight:600;cursor:pointer}.admission-diagnostics[open]>summary{margin-bottom:10px}.admission-check-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.admission-check{display:flex;flex-direction:column;gap:4px;padding:10px;background:var(--sk-surface-2);border-radius:6px;border-left:3px solid #18a058}.admission-check.check-blocked{border-left-color:#d39b36}.admission-check small,.admission-diagnostics>small{color:var(--sk-text-muted)}.admission-check b{font-variant-numeric:tabular-nums}.pick-body .daily-selection-reason{display:block;font-size:13px}.daily-facts{margin:10px 0}
 .premarket-plans{margin-bottom:22px;padding:16px;border:1px solid var(--sk-accent);border-radius:12px;background:color-mix(in srgb,var(--sk-surface-2) 45%,transparent)}.premarket-historical{border-color:var(--sk-border);background:var(--sk-surface-2)}.premarket-summary{margin-top:0}.premarket-notice{font-size:13px;line-height:1.7;margin:8px 0 14px}.premarket-historical .premarket-notice{font-weight:600}.premarket-data-gap{padding:10px 12px;border-left:3px solid #d39b36;background:var(--sk-surface);font-size:12px;line-height:1.7;margin:10px 0 16px}.premarket-card{border-top:3px solid var(--sk-accent)!important}.premarket-historical .premarket-card{border-top-color:var(--sk-border)!important}.pick-body>p.premarket-reason{display:block;line-height:1.7;margin:0 0 10px}.premarket-levels{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px;background:var(--sk-surface-2);border-radius:6px;margin:10px 0;font-size:12px}.premarket-levels>div{display:flex;justify-content:space-between;gap:8px}.premarket-levels b{font-variant-numeric:tabular-nums}.premarket-footnote{font-size:11px;color:var(--sk-text-muted);line-height:1.6;margin:14px 0 0}.premarket-plans .pick-grid{grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr))}
 .picks-loading{display:flex;align-items:center;justify-content:center;gap:12px;min-height:180px;color:var(--sk-text-muted)}

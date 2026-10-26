@@ -1014,6 +1014,9 @@ class LocalOpportunityService(DailyOpportunityService):
         from .admission_diagnostics import build_admission_diagnostics
         run['admissionDiagnostics'] = build_admission_diagnostics(
             researched, run['candidates'], quality, morning=is_morning)
+        from .primary_readiness import read_primary_readiness
+        run.update(read_primary_readiness(self.yao.data_dir, self.clock(),
+            candidates=researched, slot=slot, official=bool(run.get('official'))))
         quality['admission_diagnostics'] = run['admissionDiagnostics']
         if reviewable:
             run['message'] = (run['admissionDiagnostics']['summary']
@@ -1114,6 +1117,12 @@ class LocalOpportunityService(DailyOpportunityService):
             result['reviewProgress'] = {'stage': 'history_prepared', 'at': self.clock().isoformat()}
             self.db.save_yao_run(clean(result))
             try:
+                from .task_learning import TaskLearner
+                result['primaryReadiness'] = TaskLearner(learning).refresh_readiness(self.clock())
+            except Exception as error:
+                result['primaryReadiness'] = {'status': 'progress_unknown', 'reason': type(error).__name__,
+                    'message': 'T+1样本审计暂未完成；已保存本轮复盘，不把未知样本数记为零。'}
+            try:
                 result['morningReadiness'] = morning_readiness(learning, self.clock(), refresh=True)
             except Exception as error:
                 result['morningReadiness'] = {'status': 'deferred', 'reason': type(error).__name__,
@@ -1126,6 +1135,11 @@ class LocalOpportunityService(DailyOpportunityService):
             learning = SignalLearningService(self.yao.data_dir)
             result = learning.persist_scan(
                 result, slot, result.get('cutoff_at') or self.clock(), bool(result.get('official')))
+            from .primary_readiness import read_primary_readiness
+            if not (result.get('learningLedger') or {}).get('idempotentReplay'):
+                result.update(read_primary_readiness(self.yao.data_dir, self.clock(),
+                    candidates=[*result.get('controls', []), *result.get('candidates', [])],
+                    slot=slot, official=bool(result.get('official')), ledger=result.get('learningLedger')))
             try:
                 result['dailyObservationReview'] = learning.review_daily_observations(
                     self.clock(), max_labels=120, budget_seconds=1.0)

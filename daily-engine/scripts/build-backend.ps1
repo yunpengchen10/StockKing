@@ -107,6 +107,7 @@ $hiddenImports = @(
   'src.services.yao_scout.entry_execution_policy',
   'src.services.yao_scout.factor_experiments',
   'src.services.yao_scout.admission_diagnostics',
+  'src.services.yao_scout.primary_readiness',
   'src.services.yao_scout.history_preparation',
   'src.services.yao_scout.history_maintenance',
   'src.services.yao_scout.primary_policy',

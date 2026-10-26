@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { entryExecutionSummary, dailyObservationRows, dailyObservationStatus, settlementHealthSummary } from './recommendationQuality.mjs'
+import { entryExecutionSummary, dailyObservationRows, dailyObservationStatus, settlementHealthSummary, primaryReadinessSummary } from './recommendationQuality.mjs'
 import { predictionSummary } from './learningStatus.mjs'
 
 test('frozen entry display never claims a fill or resets trigger', () => {
@@ -28,4 +28,24 @@ test('net profit probability is distinct from five percent target probability', 
   assert.match(result.detail, /扣费盈利概率 55.00%/)
   assert.match(result.detail, /净收益达到5%概率 20.00%/)
   assert.match(predictionSummary({ status: 'active', bigMoveProbability: .9 }).detail, /扣费盈利概率 未取得/)
+})
+
+test('cold-start distinguishes unknown audit counts from real zero and manual scans from training samples', () => {
+  const unknown = primaryReadinessSummary({ progressKnown: false, modelUsableNow: false, minimumSignalDaysForAnyTraining: 156 }, { recordingMode: 'manual_audit_only', trainingEligibleCount: 99 })
+  assert.match(unknown.title, /准备中/)
+  assert.match(unknown.sampleProgress, /数量未知/)
+  assert.doesNotMatch(unknown.sampleProgress, /0 条/)
+  assert.match(unknown.recording, /手动扫描.*不增加正式训练样本/)
+  assert.match(unknown.requirement, /156.*留出.*前瞻/)
+  const zero = primaryReadinessSummary({ progressKnown: true, progressFresh: false, progress: { validSamples: 0, validSampleDays: 0 } }, { recordingMode: 'official_frozen', trainingEligibleCount: 0, trainingControlCount: 0 })
+  assert.match(zero.sampleProgress, /有效样本 0 条/)
+  assert.match(zero.audit, /历史统计/)
+  assert.match(zero.recording, /训练资格 0 条.*对照 0 条/)
+  const ready = primaryReadinessSummary({ status: 'active', modelUsableNow: true, configuredChampionVersion: 'v1' })
+  assert.equal(ready.modelPending, false)
+  assert.match(ready.title, /已就绪/)
+  assert.match(primaryReadinessSummary({ configuredChampionVersion: 'v1', modelUsableNow: null }).title, /待核验/)
+  const unreadable = primaryReadinessSummary({ modelStatus: 'unknown', modelUsableNow: null, blockerCodes: ['primary_registry_unavailable'] })
+  assert.equal(unreadable.modelPending, false)
+  assert.match(unreadable.title, /待核验/)
 })

@@ -29,13 +29,14 @@ def test_data_outage_is_distinct_from_adverse_market_and_counts_overlap():
     assert row == frozen
 
 
-def test_complete_data_can_fail_only_the_morning_model_without_false_source_gaps():
+def test_complete_data_can_wait_for_t1_model_without_false_source_gaps():
     row = ready()
     row['morningSignal'] = {'selectionEligible': False, 'learningStatus': 'rules_unvalidated'}
     result = build_admission_diagnostics([row], [], {}, morning=True)
     assert result['status'] == 'model_not_ready'
     assert result['evidenceAndRiskPassed'] == 1
     assert result['morningModelBlocked'] == 1
+    assert result['modelNotReady'] == 1 and result['modelRejected'] == 0
     assert all(x['blocked'] == 0 for x in result['checks'])
     assert '主要阻断' in result['summary']
 
@@ -55,9 +56,33 @@ def test_negative_direction_is_not_reported_as_missing_data():
 def test_active_model_rejection_is_not_missing_model():
     row = ready()
     row['morningSignal'] = {'selectionEligible': False, 'learningStatus': 'active'}
+    row['prediction'] = {'taskId': 'entry_today_exit_next_session', 'status': 'active',
+                         'entryEligible': False, 'expectedNetReturn': -.01, 'utility': -.02, 'winProbability': .4}
     result = build_admission_diagnostics([row], [], {}, morning=True)
     assert result['status'] == 'model_risk_rejected'
     assert result['morningModelUnavailable'] == 0
+    assert result['modelRejected'] == 1 and result['modelNotReady'] == 0
+
+
+def test_active_t0_never_claims_t1_model_is_ready():
+    row = ready()
+    row['morningSignal'] = {'selectionEligible': True, 'learningStatus': 'active'}
+    result = build_admission_diagnostics([row], [], {}, morning=True)
+    assert result['status'] == 'model_not_ready' and result['modelNotReady'] == 1
+    assert result['morningModelUnavailable'] == 0
+
+
+def test_entry_plan_failure_is_separate_from_model_rejection():
+    from src.services.yao_scout.entry_execution_policy import VERSION
+    row = ready()
+    row['prediction'] = {'taskId': 'entry_today_exit_next_session', 'status': 'active',
+                         'entryEligible': True, 'expectedNetReturn': .02, 'utility': .01, 'winProbability': .7}
+    row['entryExecution'] = {'version': VERSION, 'priceEligible': False, 'state': 'entry_plan_expired'}
+    result = build_admission_diagnostics([row], [], {})
+    assert result['status'] == 'entry_plan_blocked'
+    assert result['modelAdmissionPassed'] == 1 and result['entryAdmissionPassed'] == 0
+    assert result['modelRejected'] == result['modelNotReady'] == 0
+    assert result['entryPlanBlocked'] == 1
 
 
 def test_missing_active_classification_remains_a_data_failure():

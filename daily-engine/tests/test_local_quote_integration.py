@@ -251,7 +251,11 @@ def test_scheduled_local_scan_prepares_early_then_refreshes_at_target(monkeypatc
     assert result['generatedAt'] == target.isoformat()
     assert result['dataQuality']['quote_coverage']['fresh'] == 1
     assert result['llmUsed'] is False and result['delivery']['received_at'] is None
-    assert result['learningLedger']['trainingEligible'] is (slot != '0920')
+    assert result['learningLedger']['officialCollectionEligible'] is (slot != '0920')
+    # The official schedule permits collection; this timing fixture has no
+    # complete research/lineage admission and therefore adds no training sample.
+    assert result['learningLedger']['trainingEligibleCount'] == 0
+    assert result['learningLedger']['trainingEligible'] is False
     assert result['learningLedger']['researchCount'] == (0 if slot == '0920' else 1)
     if slot == '0920':
         assert records[0]['status'] == 'premarket'

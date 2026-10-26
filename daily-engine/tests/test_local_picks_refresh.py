@@ -125,7 +125,9 @@ def test_failed_or_skipped_refresh_preserves_previous_display(runtime, monkeypat
     done = completed_response(client, queue, client.post("/picks/refresh", json={}))
     assert done["status"] == "failed" and done["result"] is None and done["error"]
     assert store.path.read_bytes() == original
-    assert client.get("/picks/display").json() == old
+    shown = client.get("/picks/display").json()
+    assert {key: value for key, value in shown.items() if key != 'currentPrimaryReadiness'} == old
+    assert shown['currentPrimaryReadiness']['stateScope'] == 'current_registry'
 
 
 def test_valid_empty_manual_refresh_is_not_repopulated_by_equal_or_older_history(runtime, monkeypatch):
@@ -155,7 +157,8 @@ def test_display_uses_latest_valid_empty_history_then_newer_completed_scan_witho
     rows.insert(0, {"mode": "king_1030", "result": latest})
     shown = client.get("/picks/display").json()
     assert shown["adaptive"] == latest and shown["displaySource"] == "history"
-    assert LocalPicksDisplayStore(None).read() == shown
+    assert LocalPicksDisplayStore(None).read() == {
+        key: value for key, value in shown.items() if key != 'currentPrimaryReadiness'}
 
 
 def test_newer_scheduled_empty_replaces_manual_candidates_and_invalid_runs_are_ignored(runtime, monkeypatch):
@@ -306,10 +309,98 @@ def test_history_filters_before_limit_so_other_runs_do_not_hide_latest_picks(tmp
 
 def test_no_history_is_empty_and_successful_empty_history_can_migrate(runtime):
     client, _, rows, _ = runtime
-    assert client.get("/picks/display").json() == {}
+    first = client.get("/picks/display").json()
+    assert set(first) == {'currentPrimaryReadiness'}
+    assert first['currentPrimaryReadiness']['modelUsableNow'] is False
     rows.append({"mode": "king_live", "result": scan(None)})
     shown = client.get("/picks/display").json()
     assert shown["adaptive"]["candidates"] == [] and shown["displaySource"] == "migration"
+
+
+def test_current_readiness_does_not_reinterpret_old_active_candidates_or_rewrite_snapshot(runtime, monkeypatch):
+    from src.services.yao_scout.signal_learning import SignalLearningService
+    from src.services.yao_scout.task_learning import TaskLearner
+    client, db, _, _ = runtime
+    frozen_readiness = {'status': 'active', 'countsAsOf': '2026-09-29T10:30:00+08:00'}
+    frozen_research = {'status': 'research_controls_available', 'trainingEligibleCount': 1,
+                       'items': [{'code': '600002', 'status': 'research_only'}]}
+    run = scan(primaryReadiness=frozen_readiness, coldStartResearch=frozen_research)
+    run['candidates'][0]['prediction'] = {'taskId': 'entry_today_exit_next_session',
+        'status': 'active', 'modelVersion': 'historic-model', 'entryEligible': True}
+    store = LocalPicksDisplayStore(db)
+    saved = store.save(run)
+    before = store.path.read_bytes()
+    monkeypatch.setattr(SignalLearningService, '__init__', lambda *_a, **_k: pytest.fail('GET must not construct learning service'))
+    monkeypatch.setattr(TaskLearner, 'data', lambda *_a: pytest.fail('GET must not scan ledger'))
+    monkeypatch.setattr(TaskLearner, 'artifact', lambda *_a: pytest.fail('GET must not load models'))
+    shown = client.get('/picks/display').json()
+    current = shown['currentPrimaryReadiness']
+    assert current['modelStatus'] == 'not_configured' and current['modelUsableNow'] is False
+    assert current['snapshotCandidatesReevaluated'] is False and current['currentScan'] is None
+    assert current['stateScope'] == 'current_registry'
+    assert shown['adaptive'] == saved['adaptive']
+    assert shown['adaptive']['primaryReadiness'] == frozen_readiness
+    assert shown['adaptive']['coldStartResearch'] == frozen_research
+    assert store.path.read_bytes() == before
+    assert 'currentPrimaryReadiness' not in json.loads(before)
+
+
+def test_current_readiness_updates_after_registry_change_while_frozen_research_stays_identical(runtime):
+    from contextlib import closing
+    import sqlite3
+    from datetime import timezone, timedelta
+    from src.services.yao_scout.task_learning import TaskLearner
+    from src.services.yao_scout.local_algorithm import algorithm_contract
+    client, db, _, _ = runtime
+    store = LocalPicksDisplayStore(db)
+    saved = store.save(scan(coldStartResearch={'trainingEligibleCount': 0, 'items': []}))
+    before = store.path.read_bytes()
+    learner = TaskLearner(None)
+    now = datetime.now(timezone(timedelta(hours=8)))
+    state = {'taskContractId': learner.contract['taskContractId'],
+        'algorithmContractId': algorithm_contract()['contractId'],
+        'readinessSnapshot': learner._readiness_snapshot(now, ([], [], True)),
+        'lastLearningCheckAt': now.isoformat()}
+    path = store.path.parent / 'signal-learning-v1.sqlite3'
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute('CREATE TABLE learning_registry(registry_key TEXT PRIMARY KEY,payload_json TEXT)')
+        connection.execute('INSERT INTO learning_registry VALUES(?,?)', ('v11', json.dumps(state)))
+        connection.commit()
+    first = client.get('/picks/display').json()
+    assert first['currentPrimaryReadiness']['progress']['validSamples'] == 0
+    state['readinessSnapshot']['validSamples'] = 7
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute('UPDATE learning_registry SET payload_json=? WHERE registry_key=?', (json.dumps(state), 'v11'))
+        connection.commit()
+    second = client.get('/picks/display').json()
+    assert second['currentPrimaryReadiness']['progress']['validSamples'] == 7
+    assert second['adaptive'] == first['adaptive'] == saved['adaptive']
+    assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize('problem', ['invalid_json', 'locked'])
+def test_current_registry_read_failure_is_unknown_not_missing_model(runtime, problem):
+    from contextlib import closing
+    import sqlite3
+    client, db, _, _ = runtime
+    store = LocalPicksDisplayStore(db)
+    saved = store.save(scan())
+    before = store.path.read_bytes()
+    path = store.path.parent / 'signal-learning-v1.sqlite3'
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute('CREATE TABLE learning_registry(registry_key TEXT PRIMARY KEY,payload_json TEXT)')
+        connection.execute('INSERT INTO learning_registry VALUES(?,?)', ('v11', '{broken' if problem == 'invalid_json' else '{}'))
+        connection.commit()
+        if problem == 'locked':
+            connection.execute('BEGIN EXCLUSIVE')
+        shown = client.get('/picks/display').json()
+    current = shown['currentPrimaryReadiness']
+    assert current['modelStatus'] == 'unknown' and current['modelUsableNow'] is None
+    assert current['status'] == 'progress_unknown'
+    assert 'primary_registry_unavailable' in current['blockerCodes']
+    assert 'validated_model_missing' not in current['blockerCodes']
+    assert '不能据此判断模型缺失' in current['message']
+    assert shown['adaptive'] == saved['adaptive'] and store.path.read_bytes() == before
 
 
 def test_premarket_missing_quotes_explains_why_and_atomic_write_failure_preserves_old(runtime, monkeypatch):

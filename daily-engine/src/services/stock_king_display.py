@@ -206,6 +206,31 @@ class LocalPicksDisplayStore:
             pass
         return {}
 
+    def with_current_primary_readiness(self, payload: dict[str, Any], *, now=None) -> dict[str, Any]:
+        """Enrich only the API response; frozen scans never become live evidence.
+
+        In particular, do not pass historical candidates to the readiness
+        reader: an old active prediction is not proof of a usable model now.
+        The cold-start research list stays exactly as published in the snapshot.
+        """
+        from src.services.yao_scout.primary_readiness import read_primary_readiness
+        current_at = now or datetime.now(_SHANGHAI_TZ)
+        current = read_primary_readiness(self.path.parent, current_at)['primaryReadiness']
+        configured = current.get('configuredChampionVersion')
+        unavailable = 'primary_registry_unavailable' in current.get('blockerCodes', [])
+        current = {**current, 'stateScope': 'current_registry', 'observedAt': current_at.isoformat(),
+            'modelStatus': 'unknown' if unavailable else 'configured_requires_runtime_validation' if configured else 'not_configured',
+            'modelUsableNow': None if unavailable or configured else False,
+            'snapshotCandidatesReevaluated': False,
+            'currentScan': None,
+            'meaning': '当前学习登记状态；没有重新扫描行情、重算历史推荐或重新核验模型，研究列表仍为原快照。'}
+        if unavailable:
+            current.update(status='progress_unknown',
+                message='当前学习登记状态读取失败，模型和样本进度未知；不能据此判断模型缺失。',
+                action='稍后重试读取学习登记状态；继续保留原推荐快照。',
+                blockerCodes=[code for code in current['blockerCodes'] if code != 'validated_model_missing'])
+        return {**payload, 'currentPrimaryReadiness': current}
+
     def read(self) -> dict[str, Any]:
         # Reading history never starts a live scan. Filter at the database so
         # unrelated/review runs cannot consume its bounded history window.

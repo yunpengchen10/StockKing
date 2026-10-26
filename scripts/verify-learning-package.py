@@ -27,14 +27,15 @@ for suffix in (
     "precision_policy", "research_factors", "premarket", "daily_primary", "admission_diagnostics",
     "history_preparation", "history_maintenance", "v11_factors", "trend_evidence",
     "scan_routing", "daily_observation_outcomes", "daily_observation_queue",
-    "learning_contracts", "entry_execution_policy", "factor_experiments",
+    "learning_contracts", "entry_execution_policy", "factor_experiments", "primary_readiness",
 ):
     name = "src.services.yao_scout." + suffix
     frozen = pyz.extract(name)
     source = root / "daily-engine" / Path(*name.split(".")).with_suffix(".py")
     checks[name] = frozen == compile(source.read_text(encoding="utf-8"), frozen.co_filename,
                                     "exec", dont_inherit=True, optimize=0)
-for name in ('src.services.software_market', 'src.services.stock_king_display', 'src.storage'):
+for name in ('src.services.software_market', 'src.services.stock_king_display', 'src.storage',
+             'api.v1.endpoints.stock_king'):
     frozen = pyz.extract(name)
     source = root / 'daily-engine' / Path(*name.split('.')).with_suffix('.py')
     checks[name] = frozen == compile(source.read_text(encoding='utf-8'), frozen.co_filename,
