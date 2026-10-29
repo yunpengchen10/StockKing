@@ -73,8 +73,14 @@ def research_selection_row(row, now, *, source=None, source_time=None):
             'meaning': '每个初筛字段使用自身供应商源时；缺失指标不参与名次，未借新报价给旧快照续期'}}
 
 
-def research_queue(frame, limit=None, *, now=None):
-    """Prioritize activity/recovery leaders within a universe-sized research budget."""
+def research_queue(frame, limit=None, *, now=None, previous_frame=None, catalysts=None):
+    """Allocate bounded research across activity and independent discovery lanes.
+
+    previous_frame is a prior whole-universe observation with timezone-aware
+    attrs['captured_at']; catalysts maps security codes to archived per-stock
+    context packets (forecasts and optional structured disclosures). Neither
+    input triggers requests. No evidence here grants trading eligibility.
+    """
     if limit is not None and limit < 0:
         raise ValueError('research limit must not be negative')
     if frame.empty:
@@ -99,7 +105,26 @@ def research_queue(frame, limit=None, *, now=None):
     data['_research_rank'] = pd.concat(ranks, axis=1).min(axis=1)
     # Missing activity evidence stays missing; code order only resolves equal queue ranks.
     data = data.sort_values(['_research_rank', 'code'], na_position='last')
-    return data.head(limit).drop(columns=['_research_rank']).to_dict('records')
+    ordered = data.drop(columns=['_research_rank']).to_dict('records')
+    if now is None:
+        return ordered[:limit]
+    from .opportunity_discovery import allocate_discovery, discovery_lanes
+    previous_rows, previous_at = [], None
+    if previous_frame is not None and not previous_frame.empty:
+        try:
+            previous_at = datetime.fromisoformat(str(previous_frame.attrs.get('captured_at') or ''))
+            if previous_at.tzinfo is None or previous_at >= now:
+                previous_at = None
+        except (TypeError, ValueError):
+            previous_at = None
+        if previous_at is not None:
+            previous_rows = [research_selection_row(row, previous_at,
+                source=previous_frame.attrs.get('source') or previous_frame.attrs.get('snapshot_source'),
+                source_time=previous_frame.attrs.get('source_time'))
+                for row in previous_frame.drop_duplicates('code').to_dict('records')]
+    lanes, packets = discovery_lanes(ordered, now, previous_rows=previous_rows,
+        previous_at=previous_at, catalysts=catalysts)
+    return allocate_discovery(ordered, limit, lanes, packets)
 
 
 def daily_evidence(frame, cutoff):

@@ -4,6 +4,7 @@ export const LEDGER_STATUS = {
   review_not_run: '已到期，尚未执行', calendar_unavailable: '交易日历待核验',
   mature_price_pattern: '价格模式已观察', observation_only: '仅观察记录',
   daily_observation_only: '日线记录，尚未作独立效果验证',
+  opportunity_research_only: '机会研究记录 · 未验证成交收益',
   missing_data: '待补齐', pending_data: '待补齐', incomplete: '待补齐',
   complete: '已复盘', completed: '已复盘', reviewed: '已复盘', mature: '已复盘',
   filled: '模拟已成交', unfilled: '未成交', not_filled: '未成交',
@@ -170,6 +171,7 @@ export function flattenSignals(payload = {}) {
     return signals.map(signal => ({
       ...signal,
       runId: signal.runId || run.runId || run.run_id || '',
+      displayRunId: signal.displayRunId || run.displayRunId || '',
       slot: signal.slot || run.slot || run.scanSlot || '',
       modelVersion: signal.modelVersion || signal.algorithmVersion || run.modelVersion || run.algorithmVersion || '',
       decisionAt: signal.decisionAt || signal.timestamp || run.asOf || run.as_of || '',
@@ -188,6 +190,17 @@ export function isNextDaySelection(signal = {}) {
 }
 export function isDailySelection(signal = {}) {
   return signal.dailySelected === true || (Array.isArray(signal.recommendationKinds) && signal.recommendationKinds.includes('daily_condition'))
+}
+export function isOpportunitySelection(signal = {}) {
+  return signal.opportunitySelected === true || signal.recommendationKinds?.includes('opportunity_recommendation') === true
+}
+// The current view is tied to the displayed, persisted scan. A missing run must
+// never silently fall back to unrelated history, including an empty opportunity list.
+export function recordDisplayPayload(payload = {}, { scope = 'history', runId = '', opportunityOnly = false } = {}) {
+  if (scope !== 'current') return payload
+  if (!runId) return { ...payload, items: [] }
+  return { ...payload, items: flattenSignals(payload).filter(signal => (signal.displayRunId || signal.runId) === runId
+    && (!opportunityOnly || isOpportunitySelection(signal))) }
 }
 export function nextDayQueueLabel(signal = {}) {
   return signal.queue === 'first_board' ? '未触板潜伏' : signal.queue === 'continuation' ? '已触板延续' : '次日观察（旧版未分队列）'
@@ -287,6 +300,8 @@ export function firstRecommendationEvidence(pick = {}) {
 export function signalSelectionLabel(signal = {}) {
   const nextDay = nextDaySignalOf(signal)
   const candidate = signal.snapshot || signal.features?.candidate || signal.candidate || signal.features || signal
+  if (isOpportunitySelection(signal)) return candidate.opportunity?.channel === 'E' ? '早期启动 · 机会研究'
+    : candidate.opportunity?.channel === 'M' ? '主升确认 · 机会研究' : '机会研究推荐'
   const state = isDailyPrimaryPick(candidate) ? candidate.dailyCurrentSignalState || candidate.dailySignal?.currentSignalState : candidate.currentSignalState
   if (['invalidated', 'withdrawn'].includes(state)) return primaryRecommendationState(candidate)
   if (isDailyObservationPick(candidate)) return '日线观察'
@@ -303,7 +318,7 @@ export function groupSignals(payload, { includeControls = false } = {}) {
   for (const signal of flattenSignals(payload)) {
     const candidate = signal.snapshot || signal.features?.candidate || signal.candidate || signal.features || signal
     const wasPrimary = ['invalidated', 'withdrawn'].includes(candidate.currentSignalState || candidate.dailyCurrentSignalState || candidate.dailySignal?.currentSignalState)
-    if (!includeControls && signal.selected !== true && !isDailySelection(signal) && !isNextDaySelection(signal) && !wasPrimary) continue
+    if (!includeControls && signal.selected !== true && !isOpportunitySelection(signal) && !isDailySelection(signal) && !isNextDaySelection(signal) && !wasPrimary) continue
     const signalId = signal.signalId || signal.signal_id
     if (signalId && seen.has(signalId)) continue
     if (signalId) seen.add(signalId)

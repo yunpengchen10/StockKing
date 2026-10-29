@@ -1,0 +1,374 @@
+[
+  {
+    "sourceRunId": "king-v1.1-signal-ledger:2026-10-29:0955:official",
+    "originalGrade": "E-A",
+    "asOf": "2026-10-29T09:55:12.988069+08:00",
+    "candidate": {
+      "code": "600506",
+      "name": "统一股份",
+      "dataLineage": {
+        "status": "verified"
+      },
+      "fundEvidence": {
+        "asOf": "2026-10-29T09:53:00+08:00",
+        "metrics": {
+          "main_net_flow": -36810947.0,
+          "main_net_flow_1m_deltas": [
+            -997337.0,
+            -2023505.0,
+            -1641197.0
+          ],
+          "main_net_flow_3m": -4662039.0,
+          "main_net_positive_fraction_3m": 0.0
+        },
+        "source": "Tencent分钟资金流（供应商大单分类估算）"
+      },
+      "sectorEvidence": {
+        "asOf": "2026-10-29T09:53:00+08:00",
+        "metrics": {
+          "sector_breadth": 13.513513513513514,
+          "sector_coverage_pct": 88.0952380952381,
+          "sector_peer_count": 37,
+          "sector_rank_5m": 38,
+          "sector_relative_5m_pct": -2.438602283473733,
+          "sector_return_5m_pct": -0.25269059251570425
+        },
+        "source": "Eastmoney行业成分 + 已核验代码的同刻1分钟K线"
+      },
+      "quote": {
+        "code": "600506",
+        "price": 18.23,
+        "pre_close": 18.3,
+        "open_price": 17.74,
+        "high": 19.0,
+        "low": 17.55,
+        "change_pct": -0.3825,
+        "source": "sina",
+        "source_time": "2026-10-29T09:55:07+08:00",
+        "provider_timestamp": "2026-10-29T09:55:07+08:00",
+        "active_buy_share_pct": 52.011871652245574,
+        "active_flow_source": "Tencent 外盘/内盘分类估算",
+        "active_flow_as_of": "2026-10-29T09:55:04+08:00",
+        "order_book": {
+          "source": "sina",
+          "source_time": "2026-10-29T09:55:07+08:00",
+          "asks": [
+            {
+              "price": 18.24,
+              "source_volume": 28700.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 28700.0
+            },
+            {
+              "price": 18.25,
+              "source_volume": 5800.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 5800.0
+            },
+            {
+              "price": 18.26,
+              "source_volume": 29000.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 29000.0
+            },
+            {
+              "price": 18.29,
+              "source_volume": 11400.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 11400.0
+            },
+            {
+              "price": 18.3,
+              "source_volume": 38800.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 38800.0
+            }
+          ],
+          "bids": [
+            {
+              "price": 18.23,
+              "source_volume": 76400.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 76400.0
+            },
+            {
+              "price": 18.21,
+              "source_volume": 400.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 400.0
+            },
+            {
+              "price": 18.2,
+              "source_volume": 8700.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 8700.0
+            },
+            {
+              "price": 18.19,
+              "source_volume": 800.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 800.0
+            },
+            {
+              "price": 18.18,
+              "source_volume": 4200.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 4200.0
+            }
+          ]
+        }
+      }
+    },
+    "minute": {
+      "source": "tdx-mac",
+      "asOf": "2026-10-29T09:53:00+08:00",
+      "historyDays": 20.0,
+      "v11Inputs": {
+        "a1_pct_per_min": 1.248253113701443,
+        "a3_pct_per_min": -0.6464539787312059,
+        "accelerationPerMinute": 1.248253113701443,
+        "activeBuySharePct": 52.011871652245574,
+        "amount_15m": 158862096.0,
+        "amount_1m": 6478904.0,
+        "amount_30m": null,
+        "amount_3m": 20198163.0,
+        "amount_5m": 36740403.0,
+        "baseline_amount_15m": 31798521.5,
+        "baseline_amount_3m": 5402442.5,
+        "baseline_amount_5m": 9268292.0,
+        "baseline_volume_15m": 1974650.0,
+        "baseline_volume_3m": 357200.0,
+        "baseline_volume_5m": 611400.0,
+        "failed_breakout_risk": 0.0,
+        "fundFlow3m": -4662039.0,
+        "history_days": 20.0,
+        "local_high_5m": 18.95,
+        "local_low_5m": 18.31,
+        "lower_high_risk": 100.0,
+        "pathEfficiency15m": 0.0897879105884184,
+        "price_efficiency_r5_v5": -0.6789171101958216,
+        "price_history_days": 20.0,
+        "r15_pct": 1.4301430143014437,
+        "r1_pct": 0.7099945385035555,
+        "r30_pct": null,
+        "r3_pct": -1.6533333333333289,
+        "r5_pct": -2.6912928759894372,
+        "rankingChangeRate": 1.248253113701443,
+        "recentPullbackRankAdjustment": 0.0,
+        "relative_amount_3m_20d": 3.738709481868618,
+        "short_rebound_in_long_weak": 0.0,
+        "v15_ratio": 4.995895673954527,
+        "v3_ratio": 3.738709481868618,
+        "v5_ratio": 3.964096405249209,
+        "va_ratio": 0.7483561959389803,
+        "volume_15m": 8542000.0,
+        "volume_1m": 352100.0,
+        "volume_30m": null,
+        "volume_3m": 1091000.0,
+        "volume_5m": 1975700.0,
+        "vwap": 18.381845667450417,
+        "vwap_reclaim": 1.0,
+        "vwap_retest_success": 1.0,
+        "vwap_slope_5m_pct": 0.17640316742115747,
+        "z_a1_pct_per_min": 5.586052130782006,
+        "z_a3_pct_per_min": -3.4018900882896266,
+        "z_amount_15m": 4.76461589870127,
+        "z_amount_3m": 3.482462113374802,
+        "z_amount_5m": 3.820697379399395,
+        "z_r15_pct": 0.5907676058799252,
+        "z_r1_pct": 3.1356594353638743,
+        "z_r30_pct": null,
+        "z_r3_pct": -2.7241379837062447,
+        "z_r5_pct": -4.380595918032711
+      },
+      "dataLineage": {
+        "status": "verified"
+      }
+    },
+    "evidenceBoundary": "Only persisted decision-time metrics and quote; minute currentPrice absent in original record remains absent. Latest quote breaking local low independently invalidates the opportunity."
+  },
+  {
+    "sourceRunId": "king-v1.1-signal-ledger:2026-10-29:1030:official",
+    "originalGrade": "E-A",
+    "asOf": "2026-10-29T10:30:23.248285+08:00",
+    "candidate": {
+      "code": "601188",
+      "name": "龙江交通",
+      "dataLineage": {
+        "status": "verified"
+      },
+      "fundEvidence": {
+        "asOf": "2026-10-29T10:28:00+08:00",
+        "metrics": {
+          "main_net_flow": 153357543.0,
+          "main_net_flow_1m_deltas": [
+            439620.0,
+            -258908.0,
+            0.0
+          ],
+          "main_net_flow_3m": 180712.0,
+          "main_net_positive_fraction_3m": 0.3333333333333333
+        },
+        "source": "Tencent分钟资金流（供应商大单分类估算）"
+      },
+      "sectorEvidence": {
+        "asOf": "2026-10-29T10:28:00+08:00",
+        "metrics": {
+          "sector_coverage_pct": 3.225806451612903,
+          "sector_peer_count": 1
+        },
+        "source": "Eastmoney行业成分 + 已核验代码的同刻1分钟K线"
+      },
+      "quote": {
+        "code": "601188",
+        "price": 3.36,
+        "pre_close": 3.18,
+        "open_price": 3.19,
+        "high": 3.5,
+        "low": 3.18,
+        "change_pct": 5.6604,
+        "source": "sina",
+        "source_time": "2026-10-29T10:30:09+08:00",
+        "provider_timestamp": "2026-10-29T10:30:09+08:00",
+        "active_buy_share_pct": 36.732455496463274,
+        "active_flow_source": "Tencent 外盘/内盘分类估算",
+        "active_flow_as_of": "2026-10-29T10:30:09+08:00",
+        "order_book": {
+          "source": "sina",
+          "source_time": "2026-10-29T10:30:09+08:00",
+          "asks": [
+            {
+              "price": 3.37,
+              "source_volume": 54500.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 54500.0
+            },
+            {
+              "price": 3.38,
+              "source_volume": 69800.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 69800.0
+            },
+            {
+              "price": 3.39,
+              "source_volume": 22000.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 22000.0
+            },
+            {
+              "price": 3.4,
+              "source_volume": 44400.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 44400.0
+            },
+            {
+              "price": 3.41,
+              "source_volume": 39400.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 39400.0
+            }
+          ],
+          "bids": [
+            {
+              "price": 3.36,
+              "source_volume": 15100.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 15100.0
+            },
+            {
+              "price": 3.35,
+              "source_volume": 347500.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 347500.0
+            },
+            {
+              "price": 3.34,
+              "source_volume": 401900.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 401900.0
+            },
+            {
+              "price": 3.33,
+              "source_volume": 632500.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 632500.0
+            },
+            {
+              "price": 3.32,
+              "source_volume": 263300.0,
+              "source_volume_unit": "shares",
+              "volume_shares": 263300.0
+            }
+          ]
+        }
+      }
+    },
+    "minute": {
+      "source": "tdx-mac",
+      "asOf": "2026-10-29T10:28:00+08:00",
+      "historyDays": 20.0,
+      "v11Inputs": {
+        "a1_pct_per_min": 0.5290941397691928,
+        "a3_pct_per_min": -0.3319624481579786,
+        "accelerationPerMinute": 0.5290941397691928,
+        "activeBuySharePct": 36.732455496463274,
+        "amount_15m": 44288541.0,
+        "amount_1m": 491012.0,
+        "amount_30m": 82833733.0,
+        "amount_3m": 2785626.0,
+        "amount_5m": 7171541.0,
+        "baseline_amount_15m": 9851215.5,
+        "baseline_amount_3m": 967250.0,
+        "baseline_amount_5m": 2366472.0,
+        "baseline_volume_15m": 3161950.0,
+        "baseline_volume_3m": 297000.0,
+        "baseline_volume_5m": 728650.0,
+        "failed_breakout_risk": 0.0,
+        "fundFlow3m": 180712.0,
+        "history_days": 20.0,
+        "local_high_5m": 3.46,
+        "local_low_5m": 3.38,
+        "lower_high_risk": 0.0,
+        "pathEfficiency15m": 0.08397463884700182,
+        "price_efficiency_r5_v5": -0.38481744868880846,
+        "price_history_days": 20.0,
+        "r15_pct": 0.5934718100890191,
+        "r1_pct": 0.2958579881656931,
+        "r30_pct": 0.5934718100890191,
+        "r3_pct": -0.877192982456132,
+        "r5_pct": -1.1661807580174988,
+        "rankingChangeRate": 0.5290941397691928,
+        "recentPullbackRankAdjustment": 0.0,
+        "relative_amount_3m_20d": 2.879944171620574,
+        "short_rebound_in_long_weak": 0.0,
+        "v15_ratio": 4.495743799331159,
+        "v3_ratio": 2.879944171620574,
+        "v5_ratio": 3.030477859023897,
+        "va_ratio": 0.6405934813387341,
+        "volume_15m": 12958300.0,
+        "volume_1m": 144900.0,
+        "volume_30m": 24422500.0,
+        "volume_3m": 820700.0,
+        "volume_5m": 2095400.0,
+        "vwap": 3.4289981462685217,
+        "vwap_reclaim": 0.0,
+        "vwap_retest_success": 1.0,
+        "vwap_slope_5m_pct": -0.002631444129974625,
+        "z_a1_pct_per_min": 2.7060710400636774,
+        "z_a3_pct_per_min": -3.614883130503189,
+        "z_amount_15m": 2.8675141929831307,
+        "z_amount_3m": 1.3782314259913566,
+        "z_amount_5m": 1.5729923874277292,
+        "z_r15_pct": 1.1388250942000653,
+        "z_r1_pct": 5.917159763313862,
+        "z_r30_pct": 0.8164500670665449,
+        "z_r3_pct": -2.726586449394319,
+        "z_r5_pct": -2.0842049432818475
+      },
+      "dataLineage": {
+        "status": "verified"
+      }
+    },
+    "evidenceBoundary": "Only persisted decision-time metrics and quote; minute currentPrice absent in original record remains absent. Latest quote breaking local low independently invalidates the opportunity."
+  }
+]

@@ -245,6 +245,43 @@ def _compact_features(payload: Mapping[str, Any]) -> dict[str, float]:
             and (value := _number(raw)) is not None}
 
 
+def _project_opportunity_records(signals, rows, run, code_filter=None):
+    """Expose the published E/M list, without manufacturing execution samples.
+
+    The frozen recommendations array is the authority, including old releases
+    that omitted these rows from signal_events. Reading never re-scores it.
+    """
+    by_code = {row['code']: row for row in signals}
+    for candidate in rows:
+        if not isinstance(candidate, Mapping):
+            continue
+        code = _code(candidate.get('code'))
+        if not code or (code_filter and code != code_filter):
+            continue
+        row = by_code.get(code)
+        if row is None:
+            row = {
+                'signalId': sha256(f"{run['run_id']}:{code}".encode()).hexdigest()[:32],
+                'code': code, 'name': str(candidate.get('name') or code),
+                'selected': False, 'recommendationKinds': [],
+                'decisionAt': candidate.get('decision_at') or run['as_of'],
+                'sourceTime': _source_time(candidate),
+                'signalPrice': _number(candidate.get('signalPrice') or candidate.get('referencePrice'), positive=True),
+                'firstTradablePrice': None, 'reviewStatus': 'observation_only',
+                'trainingEligible': False, 'reviewEligible': False,
+                'features': _feature_values(candidate), 'reason': candidate.get('selectionReasons') or [],
+                'snapshot': {key: candidate[key] for key in _COMPACT_KEYS if key in candidate},
+                'ledgerRecordOrigin': 'saved_scan_projection',
+            }
+            signals.append(row)
+            by_code[code] = row
+        row['opportunitySelected'] = True
+        row['snapshot']['opportunity'] = candidate.get('opportunity') or {}
+        if 'opportunity_recommendation' not in row['recommendationKinds']:
+            row['recommendationKinds'].append('opportunity_recommendation')
+    return signals
+
+
 def _source_time(candidate: Mapping[str, Any]) -> str | None:
     quote = candidate.get("quote") if isinstance(candidate.get("quote"), Mapping) else {}
     value = quote.get("provider_timestamp") or quote.get("source_time") or candidate.get("sourceTime")
@@ -820,6 +857,7 @@ class SignalLearningService:
             "nextDaySelectedCount": len(next_day), "continuationSelectedCount": len(continuation),
             "dailySelectedCount": len(daily_selected), "minuteSelectedCount": len(selected & execution_sources),
             "dailyObservationCount": daily_observation_count,
+            "opportunityRecommendationCount": len((result.get('opportunityChannels') or {}).get('recommendations') or []),
             "savedRecommendationCount": len(selected | next_day | daily_selected),
             "researchCount": len(records), **sample_counts,
             "trainingEligible": sample_counts['trainingEligibleCount'] > 0 if sample_counts['trainingEligibleCount'] is not None else None,
@@ -935,6 +973,9 @@ class SignalLearningService:
             return self._compact_history(filters)
         limit = max(1, min(int(filters.get("limit") or 30), MAX_HISTORY))
         where, args = [], []
+        if filters.get("run_id"):
+            where.append("(r.run_id=? OR json_extract(r.scan_json,'$.result.run_id')=?)")
+            args.extend([str(filters["run_id"])] * 2)
         if filters.get("date"):
             where.append("r.trading_day=?")
             args.append(str(filters["date"]))
@@ -946,8 +987,10 @@ class SignalLearningService:
                          "OR EXISTS(SELECT 1 FROM json_each(r.scan_json,'$.result.nextDayWatchlist') x "
                          "WHERE substr(json_extract(x.value,'$.code'),1,6)=?) "
                          "OR EXISTS(SELECT 1 FROM json_each(r.scan_json,'$.result.nextDayContinuationWatchlist') x "
+                         "WHERE substr(json_extract(x.value,'$.code'),1,6)=?) "
+                         "OR EXISTS(SELECT 1 FROM json_each(r.scan_json,'$.result.opportunityChannels.recommendations') x "
                          "WHERE substr(json_extract(x.value,'$.code'),1,6)=?))")
-            args.extend([code, code, code])
+            args.extend([code] * 4)
         if filters.get("version"):
             where.append("r.version=?")
             args.append(str(filters["version"]))
@@ -1017,8 +1060,12 @@ class SignalLearningService:
                         "features": _feature_values(frozen), "reason": frozen.get("selectionReasons") or [],
                         "snapshot": _snapshot(frozen), "ledgerRecordOrigin": "saved_scan_projection",
                     })
+                _project_opportunity_records(signals,
+                    (frozen_result.get('opportunityChannels') or {}).get('recommendations') or [],
+                    run, _code(filters.get('symbol')) if filters.get('symbol') else None)
                 items.append({
                     "runId": run["run_id"], "slot": run["slot"], "asOf": run["as_of"],
+                    "displayRunId": frozen_result.get('run_id') or run['run_id'],
                     "official": bool(run["official"]), "modelVersion": run["version"],
                     "status": run["status"], "signals": signals,
                     "scan": scan,
@@ -1041,6 +1088,9 @@ class SignalLearningService:
             if filters.get(key):
                 where.append(column + "=?")
                 args.append(str(filters[key]))
+        if filters.get('run_id'):
+            where.append("(r.run_id=? OR json_extract(r.scan_json,'$.result.run_id')=?)")
+            args.extend([str(filters['run_id'])] * 2)
         code_filter = _code(filters.get("symbol")) if filters.get("symbol") else None
         if filters.get("symbol") and code_filter is None:
             return {"items": [], "count": 0, "compact": True}
@@ -1049,8 +1099,10 @@ class SignalLearningService:
                          "OR EXISTS(SELECT 1 FROM json_each(r.scan_json,'$.result.nextDayWatchlist') x "
                          "WHERE substr(json_extract(x.value,'$.code'),1,6)=?) "
                          "OR EXISTS(SELECT 1 FROM json_each(r.scan_json,'$.result.nextDayContinuationWatchlist') x "
+                         "WHERE substr(json_extract(x.value,'$.code'),1,6)=?) "
+                         "OR EXISTS(SELECT 1 FROM json_each(r.scan_json,'$.result.opportunityChannels.recommendations') x "
                          "WHERE substr(json_extract(x.value,'$.code'),1,6)=?))")
-            args.extend([code_filter] * 3)
+            args.extend([code_filter] * 4)
         clause = " WHERE " + " AND ".join(where) if where else ""
         snapshot_sql = _json_projection("e.snapshot_json", _COMPACT_KEYS)
         frozen_sql = _json_projection("w.value", _COMPACT_KEYS)
@@ -1064,7 +1116,8 @@ class SignalLearningService:
         items = []
         with self._connect() as db:
             runs = db.execute(
-                "SELECT r.run_id,r.slot,r.as_of,r.trading_day,r.official,r.version,r.status "
+                "SELECT r.run_id,r.slot,r.as_of,r.trading_day,r.official,r.version,r.status,"
+                "json_extract(r.scan_json,'$.result.run_id') display_run_id "
                 "FROM signal_runs r" + clause + " ORDER BY r.as_of DESC LIMIT ?", (*args, limit)).fetchall()
             for run in runs:
                 frozen_rows = db.execute(
@@ -1078,12 +1131,20 @@ class SignalLearningService:
                     if code := _code(candidate.get("code")):
                         frozen[code] = candidate
                         (continuation if row["queue"] == 1 else next_day).add(code)
+                opportunity_sql = _json_projection('w.value', (*_COMPACT_KEYS, 'opportunity'))
+                opportunity_rows = db.execute(
+                    'SELECT ' + opportunity_sql + " payload FROM signal_runs r,"
+                    "json_each(r.scan_json,'$.result.opportunityChannels.recommendations') w WHERE r.run_id=?",
+                    (run['run_id'],)).fetchall()
+                opportunities = [{key: value for key, value in json.loads(row['payload']).items() if value is not None}
+                                 for row in opportunity_rows]
+                opportunity_codes = {_code(row.get('code')) for row in opportunities} - {None}
                 event_where, event_args = ["e.run_id=?"], [run["run_id"]]
                 if code_filter:
                     event_where.append("e.code=?")
                     event_args.append(code_filter)
                 if not include_controls:
-                    chosen = sorted(next_day | continuation)
+                    chosen = sorted(next_day | continuation | opportunity_codes)
                     watch_clause = " OR e.code IN (" + ",".join("?" for _ in chosen) + ")" if chosen else ""
                     event_where.append("(e.selected=1 OR json_extract(e.snapshot_json,'$.nextDaySignal.selected')=1"
                                        " OR json_extract(e.snapshot_json,'$.dailySignal.selected')=1"
@@ -1132,7 +1193,9 @@ class SignalLearningService:
                         "reviewEligible": False, "features": _feature_values(candidate),
                         "reason": candidate.get("selectionReasons") or [], "snapshot": candidate,
                         "ledgerRecordOrigin": "saved_scan_projection"})
+                _project_opportunity_records(signals, opportunities, run, code_filter)
                 items.append({"runId": run["run_id"], "slot": run["slot"], "asOf": run["as_of"],
+                    "displayRunId": run['display_run_id'] or run['run_id'],
                     "tradingDay": run["trading_day"], "official": bool(run["official"]), "modelVersion": run["version"],
                     "status": run["status"], "signals": signals, "scan": {"status": run["status"],
                         "selectedCodes": [row["code"] for row in signals if row["selected"]],

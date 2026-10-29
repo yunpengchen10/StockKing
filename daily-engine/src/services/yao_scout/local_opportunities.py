@@ -1,6 +1,6 @@
 """Local-only T..T+5 selection. No language model is reachable from scans."""
 from __future__ import annotations
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from time import monotonic
 import json
 import os
@@ -43,7 +43,7 @@ def allocate_profile_candidates(ordered, profile, limit):
 
 class LocalOpportunityService(DailyOpportunityService):
     persistent_claims = True
-    def __init__(self, yao, ai_config=None, *, minute_fetcher=None, sector_fetcher=None, fund_fetcher=None, context_provider=None, progress_callback=None, selection_mode='auto', **kwargs):
+    def __init__(self, yao, ai_config=None, *, minute_fetcher=None, sector_fetcher=None, fund_fetcher=None, context_provider=None, progress_callback=None, selection_mode='auto', opportunity_research=True, **kwargs):
         super().__init__(yao, None, **kwargs)
         self.minute_fetcher = minute_fetcher
         self.sector_fetcher, self.fund_fetcher = sector_fetcher, fund_fetcher
@@ -52,6 +52,7 @@ class LocalOpportunityService(DailyOpportunityService):
         if selection_mode not in ('auto', 'intraday'):
             raise ValueError('selection_mode must be auto or intraday')
         self.selection_mode = selection_mode
+        self.opportunity_research = bool(opportunity_research)
 
     def _progress(self, progress, message):
         if self.progress_callback:
@@ -76,9 +77,9 @@ class LocalOpportunityService(DailyOpportunityService):
         quality.update(research_count=len(queued), research_universe_count=universe_count,
                        deep_research_count=0,
                        research_limit=research_queue_limit(universe_count),
-                       research_policy='mainboard_10pct_min300_v1',
+                       research_policy='mainboard_activity_and_transition_discovery_v2',
                        research_coverage=(f'全主板初筛{universe_count}只；按主板池10%向上取整、至少300只'
-                                          f'且不超过实际股票数，本轮{len(queued)}只进入深研；'
+                                          f'且不超过实际股票数，活跃度与状态变化/事件分通道发现，本轮{len(queued)}只进入深研；'
                                           '未深研股票不作已排除或无机会结论'))
 
     @staticmethod
@@ -268,6 +269,10 @@ class LocalOpportunityService(DailyOpportunityService):
             snapshot = snapshots[0]
         snapshot_received_at = self.clock()
         frame = mainboard(snapshot)
+        from .discovery_snapshot import DiscoverySnapshotStore
+        discovery_store = DiscoverySnapshotStore(self.yao.data_dir)
+        previous_frame = discovery_store.read(snapshot_received_at) if self.opportunity_research else None
+        frame.attrs['captured_at'] = snapshot_received_at.isoformat()
         if frame.empty and opening_mode and overnight:
             snapshot = pd.DataFrame(overnight).drop_duplicates('code')
             snapshot.attrs.update(stale=True, snapshot_source='previous_session_saved_research')
@@ -283,7 +288,8 @@ class LocalOpportunityService(DailyOpportunityService):
         # The former heat score is no longer a fallback recommendation engine.
         # A queue gives several forms of activity a chance to be researched;
         # independent price, structure and remaining-space evidence decides entry.
-        queued = clean(research_queue(frame, now=None if opening_mode else self.clock()))
+        queued = clean(research_queue(frame, now=None if opening_mode else self.clock(),
+                                      previous_frame=previous_frame))
         if opening_mode:
             # Overnight selections seed the research queue, never the new result.
             # Recheck every name against completed daily bars and today's quote.
@@ -303,8 +309,8 @@ class LocalOpportunityService(DailyOpportunityService):
         run['recommendationPolicy'] = policy_contract()
         old = {p.get('code') for p in previous.get('candidates', [])}
         quality.update(model_universe_count=0,
-                       selection_method='仅使用各字段真实源时30秒内的成交额/量比/换手/同源开盘修复名次；缺失指标不参与，目录尾部仅补充研究覆盖',
-                       chatgpt_alignment='V1.2按阶段评分；历史与事件风险单独准入，事件、股性和市场情绪逐项保存真实证据；参数尚未收益验证')
+                       selection_method='各字段独立源时核验；活跃度、跨扫描状态变化、低位修复和已披露事件分通道发现；缺失不视为利空',
+                       chatgpt_alignment='E早期启动与M主升确认独立机会精选；确认项用于支持和反证，规则分不是胜率')
         software_market.read_timeout = 12
         stage('daily_history', 20, f'已读取 {len(frame)} 只主板股票，正在核验 {len(queued)} 只日线证据')
         from .research_factors import character_factor, event_factor
@@ -467,7 +473,7 @@ class LocalOpportunityService(DailyOpportunityService):
         # Timed scans only read that cache and fetch the current incremental page.
         # Batch fundamentals/events while preparing; never age the final quote
         # with vendor calls. Archives record observedAt independently of reports.
-        from src.services.akshare_context import AkshareContextProvider, for_stock
+        from src.services.akshare_context import AkshareContextProvider, for_stock, for_stocks
         from .precision_policy import evaluate as evaluate_precision
         stage('fundamental_context', 48, '正在核验财务、业绩预告与解禁信息')
         provider = self.context_provider or AkshareContextProvider(self.yao.data_dir / 'akshare-context', clock=self.clock, timeout=25)
@@ -491,11 +497,12 @@ class LocalOpportunityService(DailyOpportunityService):
             snapshot = snapshots[0]
             snapshot_received_at = self.clock()
             frame = mainboard(snapshot)
+            frame.attrs['captured_at'] = snapshot_received_at.isoformat()
             if frame.empty or (snapshot.attrs.get('stale') and not (
                     getattr(software_market, 'available', False) and snapshot.attrs.get('directory_complete'))):
                 raise ValueError('目标时点全市场复核行情不可用，未用提前准备名单冒充本轮筛选')
             emotion = self._observe_market_emotion(frame, snapshot_received_at)
-            queued = clean(research_queue(frame, now=self.clock()))
+            queued = clean(research_queue(frame, now=self.clock(), previous_frame=previous_frame))
             self._research_coverage(quality, frame, queued)
             quality.update(self.yao._snapshot_meta(snapshot, point_in_time_ok=False))
             quality.update(snapshot_count=len(snapshot), mainboard_count=len(frame))
@@ -515,7 +522,18 @@ class LocalOpportunityService(DailyOpportunityService):
         # Quote enrichment changes the evidence available for INITIAL ranking,
         # not only market breadth. Rebuild the full queue and prepare new names.
         prepared_codes = {row['code'] for row in queued}
-        queued = clean(research_queue(frame, now=self.clock()))
+        discovery_at = self.clock()
+        frame.attrs['captured_at'] = discovery_at.isoformat()
+        # Context lookup is local and bounded; it does not trigger a per-stock
+        # news request. Unknown event coverage is not an exclusion condition.
+        discovery_contexts = for_stocks(context_bundle, frame['code'].astype(str), discovery_at) if self.opportunity_research else {}
+        queued = clean(research_queue(frame, now=discovery_at, previous_frame=previous_frame,
+                                      catalysts=discovery_contexts))
+        if self.opportunity_research:
+            try:
+                quality['discoverySnapshotSaved'] = discovery_store.save(frame, discovery_at)
+            except (OSError, ValueError, TypeError):
+                quality['discoverySnapshotSaved'] = False
         self._research_coverage(quality, frame, queued)
         newly_queued = [row for row in queued if row['code'] not in daily]
         if newly_queued:
@@ -540,6 +558,14 @@ class LocalOpportunityService(DailyOpportunityService):
         minute_cutoff = self.clock().replace(second=0, microsecond=0)
         minute_queued, daily_queued, routing = partition_queue(all_queued, preparation, minute_cutoff,
             force_intraday=self.selection_mode == 'intraday')
+        if self.opportunity_research:
+            # Twenty prior sessions are a model feature requirement, not a
+            # prerequisite to observe today's genuine start. Current-page-only
+            # requests retain the existing global deadline and never backfill.
+            routing['earlyMinuteResearchCount'] = len(daily_queued)
+            routing['currentMinuteRequestedCount'] = len(all_queued)
+            routing['earlyHistoryRequirement'] = 'current_verified_path; historical_baselines_optional'
+            minute_queued = list(all_queued)
         quality['stockRouting'] = routing
         run['historyPreparationCodes'] = all_codes
         run['primarySelectionMode'] = ('mixed_intraday_and_daily_observation' if minute_queued and daily_queued
@@ -553,7 +579,7 @@ class LocalOpportunityService(DailyOpportunityService):
         prepared_research = {}
         for code in codes:
             at = self.clock()
-            prepared_context[code] = for_stock(context_bundle, code, at)
+            prepared_context[code] = discovery_contexts.get(code) or for_stock(context_bundle, code, at)
             prepared_research[code] = {
                 'C': event_factor(prepared_context[code], at),
                 'G': (daily.get(code) or {}).get('characterFactor', {}),
@@ -703,9 +729,16 @@ class LocalOpportunityService(DailyOpportunityService):
         quotes = {code: quote for batch in quote_batches for code, quote in batch.items()}
         verification = self._verify_archived_quotes(codes,self.clock(),quotes=quotes,
             timeout=min(10,remaining()),lineage_cutoff=minute_cutoff)
+        # Preserve the received current-window values for the independent lane;
+        # its own validator can distinguish verified today from tainted history.
+        # The established model path still quarantines its entire feature vector.
+        from copy import deepcopy
+        opportunity_minutes = deepcopy(intraday) if self.opportunity_research else {}
         for code,lineage in verification.pop('lineages').items():
             intraday[code]['dataLineage'] = self._refresh_verified_lineage(
                 intraday[code].get('dataLineage'),lineage)
+            if code in opportunity_minutes:
+                opportunity_minutes[code]['dataLineage'] = deepcopy(intraday[code]['dataLineage'])
             if intraday[code]['dataLineage'].get('status') == 'tainted':
                 intraday[code].update(metrics={}, v11Inputs={})
                 intraday[code].setdefault('gaps',[]).append('独立报价核验发现分钟价格或计算版本冲突，本轮隔离')
@@ -1036,6 +1069,51 @@ class LocalOpportunityService(DailyOpportunityService):
             'source_time_min': quote_stamps[0] if quote_stamps else None,
             'source_time_max': quote_stamps[-1] if quote_stamps else None,
             'providers': sorted({q['source'] for q in quotes.values() if q.get('source')})}
+        if self.opportunity_research:
+            from .opportunity_channels import build_opportunity_channels
+            prior_channels = next(((record.get('result') or {}).get('opportunityChannels')
+                for record in history if (record.get('result') or {}).get('opportunityChannels')), {})
+            completed = self.clock()
+            # Readiness/diagnostic tail work can cross the delivery boundary
+            # after finish_profiles. Recheck the original slot immediately
+            # before the independent opportunity assessment; never backfill it.
+            completed_clock = completed.time().replace(tzinfo=None)
+            late = (completed-datetime.fromisoformat(target_at)).total_seconds() if target_at else None
+            window_status = None
+            if slot == '1455' and completed_clock >= time(14, 57):
+                window_status = 'expired'
+            elif run.get('official') and late is not None and late >= 120:
+                window_status = 'missed_slot'
+            if target_at:
+                run['delivery']['late_seconds'] = max(0., late)
+            if window_status:
+                run.update(status=window_status, candidates=[], nextDayWatchlist=[],
+                           nextDayContinuationWatchlist=[],
+                           message='机会评估完成时已超过本轮发布窗口，仅保留遗漏记录，不补发推荐')
+                run['profileCandidates'] = {key: [] for key in run.get('profileCandidates', {})}
+                reviewable = False
+            else:
+                reviewable = run['status'] in {'completed_observations', 'no_candidates_with_coverage_limits'}
+                # The legacy formal lane expires every candidate at 14:57.
+                # Its rule does not own a manual E/M research request, whose
+                # quote/book/evidence checks still apply until the close.
+                if (slot == 'live' and not run.get('official') and run['status'] == 'expired'
+                        and time(14, 57) <= completed_clock < time(15)):
+                    run['legacySelectionStatus'] = 'expired'
+                    run['status'] = 'no_candidates_with_coverage_limits'
+                    reviewable = True
+            quality['opportunityPublication'] = {'checkedAt': completed.isoformat(),
+                'scanSlot': slot, 'official': bool(run.get('official')), 'targetAt': target_at,
+                'permitted': reviewable, 'windowStatus': window_status or run['status']}
+            run['opportunityChannels'] = build_opportunity_channels(
+                researched if reviewable else [], completed, top_n=top_n,
+                minute_packets=opportunity_minutes, daily_packets=daily,
+                contexts=prepared_context, previous=prior_channels)
+            run['opportunityRecommendationCount'] = len(run['opportunityChannels']['recommendations'])
+            quality['opportunityDiscovery'] = run['opportunityChannels']['diagnostics']
+            if reviewable:
+                run['message'] = (f'机会精选{run["opportunityRecommendationCount"]}只（E早期启动 / M主升确认）；'
+                    f'模型验证精选{len(run["candidates"])}只。确认项和缺口逐股展示，规则排序不代表上涨概率。')
 
     def _persist_run(self, run):
         """Finish research and ledger work inside the official slot claim."""

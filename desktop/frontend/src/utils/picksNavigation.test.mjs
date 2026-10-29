@@ -11,7 +11,7 @@ import * as recommendationQuality from './recommendationQuality.mjs'
 const flush = async () => { for (let n = 0; n < 12; n++) await Promise.resolve(); await vue.nextTick() }
 
 // Run the real SFC setup and Vue watchers without a browser or the Wails bridge.
-function mountLedger(api, initialMode = 'records') {
+function mountLedger(api, initialMode = 'records', options = {}) {
   const source = readFileSync(new URL('../components/PicksLedger.vue', import.meta.url), 'utf8')
   const { descriptor } = parse(source)
   const modules = { vue, '../../wailsjs/go/main/App': api, '../utils/pickLedger.mjs': ledger, '../utils/recordRead.mjs': recordRead, '../utils/learningStatus.mjs': learningStatus, '../utils/recommendationQuality.mjs': recommendationQuality }
@@ -33,18 +33,20 @@ function mountLedger(api, initialMode = 'records') {
   const component = new Function('modules', 'setTimeout', 'clearTimeout', 'document', compiled)(modules,
     setBrowserTimeout, clearBrowserTimeout, { visibilityState: 'visible' })
   component.render = function () { instance = vue.getCurrentInstance(); return null }
-  const active = vue.ref(true)
+  const active = vue.ref(initialMode !== 'records' || options.scope === 'current')
   const refreshToken = vue.ref(0)
+  const display = vue.reactive({ displayRunId: '', displayAsOf: '', displayHasOpportunities: false, ...options })
   const renderer = vue.createRenderer({
     createElement: type => ({ type }), createText: text => ({ text }), createComment: text => ({ text }),
     insert() {}, remove() {}, setElementText() {}, setText() {}, patchProp() {}, parentNode: () => null, nextSibling: () => null,
   })
-  const app = renderer.createApp({ setup: () => () => vue.h(component, { mode: initialMode, active: active.value, refreshToken: refreshToken.value }) })
+  const app = renderer.createApp({ setup: () => () => vue.h(component, { mode: initialMode, active: active.value, refreshToken: refreshToken.value, ...display }) })
   app.mount({})
-  return { active, refreshToken, timers, state: () => instance.setupState, dispose: () => app.unmount() }
+  if (initialMode === 'records' && options.scope !== 'current') { instance.setupState.recordsScope = 'history'; active.value = true }
+  return { active, refreshToken, display, timers, state: () => instance.setupState, dispose: () => app.unmount() }
 }
 
-test('returning to recommendation records updates only prices and preserves filters, order, and original signals', async () => {
+test('returning to historical recommendation records updates only prices and preserves filters, order, and original signals', async () => {
   let historyCalls = 0, quoteCalls = 0
   const saved = { items: [{ runId: 'scan-1', asOf: '2026-10-08T10:30:00+08:00', signals: [
     { signalId: 'first', code: '600001', selected: true, signalPrice: 10, rank: 1 },
@@ -157,10 +159,10 @@ test('next-day price-pattern reviews remain visible when the trading review list
   } finally { mounted.dispose() }
 })
 
-test('the explicit latest-records action queries once while ordinary returns keep the saved record list', async () => {
+test('the explicit current-records action follows picks while preserving historical filters', async () => {
   let calls = 0
   const queries = []
-  const mounted = mountLedger({ GetStockKingRecommendationHistory: async (...args) => { queries.push(args); return { items: [{ signalId: `run-${++calls}`, selected: true }] } }, GetStockKingRecordQuotes: async () => ({ quotes: {} }) })
+  const mounted = mountLedger({ GetStockKingRecommendationHistory: async (...args) => { queries.push(args); return { items: [{ signalId: `run-${++calls}`, runId: 'display-run', selected: true }] } }, GetStockKingRecordQuotes: async () => ({ quotes: {} }) }, 'records', { displayRunId: 'display-run' })
   try {
     await flush()
     mounted.state().date = '2026-09-01'; mounted.state().symbol = '600001'; mounted.state().version = 'v1.1'
@@ -170,12 +172,13 @@ test('the explicit latest-records action queries once while ordinary returns kee
     assert.deepEqual([mounted.state().date, mounted.state().symbol, mounted.state().version], ['2026-09-01', '600001', 'v1.1'])
     mounted.refreshToken.value++; await flush()
     assert.equal(calls, 2)
-    assert.deepEqual(queries.at(-1), ['', '', '', false])
-    assert.deepEqual([mounted.state().date, mounted.state().symbol, mounted.state().version], ['', '', ''])
+    assert.deepEqual(queries.at(-1), ['', '', '', false, 'display-run'])
+    assert.deepEqual([mounted.state().date, mounted.state().symbol, mounted.state().version], ['2026-09-01', '600001', 'v1.1'])
+    assert.equal(mounted.state().recordsScope, 'current')
     assert.equal(mounted.state().payload.items[0].signalId, 'run-2')
     mounted.active.value = false; await flush()
     mounted.active.value = true; await flush()
-    assert.equal(calls, 2)
+    assert.equal(calls, 3)
   } finally { mounted.dispose() }
 })
 
@@ -222,5 +225,39 @@ test('next-day price summaries show selected losses and keep controls separate',
     mounted.state().includeControls = true; await flush()
     assert.equal(mounted.state().nextDaySummaryGroups.length, 2)
     assert.equal(mounted.state().nextDaySummaryGroups[1].selected, false)
+  } finally { mounted.dispose() }
+})
+
+
+test('current records follow displayed runs, discard stale replies, and keep empty opportunity rounds empty', async () => {
+  const pending = new Map(), queries = []
+  const mounted = mountLedger({
+    GetStockKingRecommendationHistory: (...args) => { queries.push(args); return new Promise(resolve => pending.set(args[4], resolve)) },
+    GetStockKingRecordQuotes: async () => ({ quotes: {} }),
+  }, 'records', { scope: 'current', displayRunId: 'display-1', displayAsOf: '2026-10-28T18:30:00Z', displayHasOpportunities: true })
+  const packet = (id, code, opportunity = true) => ({ items: [{ runId: `ledger-${id}`, displayRunId: id, signals: [
+    { signalId: `signal-${id}`, code, selected: false, opportunitySelected: opportunity, nextDaySelected: !opportunity,
+      snapshot: { opportunity: { channel: 'M', grade: 'M-A' } } },
+  ] }] })
+  try {
+    await flush()
+    assert.deepEqual(queries[0], ['2026-10-29', '', '', false, 'display-1'])
+    mounted.display.displayRunId = 'display-2'; await flush()
+    pending.get('display-2')(packet('display-2', '603517')); await flush()
+    assert.deepEqual(mounted.state().groups.map(group => group.code), ['603517'])
+    assert.equal(mounted.state().displayGroups[0].signals[0].opportunity.grade, 'M-A')
+    pending.get('display-1')(packet('display-1', '600001')); await flush()
+    assert.deepEqual(mounted.state().groups.map(group => group.code), ['603517'])
+    mounted.active.value = false; await flush()
+    mounted.display.displayRunId = 'display-empty'; await flush()
+    assert.equal(mounted.state().groups.length, 0)
+    assert.equal(pending.has('display-empty'), false, 'hidden views wait to read but cannot display the previous round')
+    mounted.active.value = true; await flush()
+    pending.get('display-empty')(packet('display-empty', '600002', false)); await flush()
+    assert.equal(mounted.state().groups.length, 0, 'empty opportunity rounds cannot fall back to next-day observations')
+    mounted.state().recordsScope = 'history'; await flush()
+    assert.deepEqual(queries.at(-1), ['', '', '', false, ''])
+    pending.get('')({ items: [...packet('display-2', '603517').items, ...packet('display-empty', '600002', false).items] }); await flush()
+    assert.deepEqual(mounted.state().groups.map(group => group.code).sort(), ['600002', '603517'])
   } finally { mounted.dispose() }
 })

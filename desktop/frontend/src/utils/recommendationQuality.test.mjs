@@ -23,6 +23,22 @@ test('observations and controls stay separate; missing outcomes remain missing',
   assert.match(settlementHealthSummary({ dueCount: 3, overdueCount: 2, missingDataCount: 1 }), /应结算 3.*逾期待处理 2.*行情待补 1/)
 })
 
+test('opportunity reference changes retain their independent category and controls stay opt-in', () => {
+  const review = { items: [
+    { code: '600001', observation_id: 'opportunity-first', first_category: 'opportunity_recommendation', reference_price: 10,
+      outcomes: [{ horizon: 1, status: 'observed', gross_reference_change_pct: -2 }] },
+    { code: '600001', observation_id: 'opportunity-control', first_category: 'opportunity_control', reference_price: 9.8, outcomes: [] },
+    { code: '600001', observation_id: 'daily-first', first_category: 'observation_watchlist', reference_price: 10.2, outcomes: [] },
+  ] }
+  const rows = dailyObservationRows(review)
+  assert.deepEqual(rows.map(row => row.category), ['机会精选', '日线观察'])
+  assert.deepEqual(rows.map(row => row.referencePrice), [10, 10.2])
+  assert.equal(rows[0].gross_reference_change_pct, -2)
+  assert.equal(rows[0].net_return, undefined)
+  assert.equal(dailyObservationRows(review, true)[1].category, '机会对照')
+  assert.equal(dailyObservationRows(review, true)[1].status, 'not_reviewed')
+})
+
 test('net profit probability is distinct from five percent target probability', () => {
   const result = predictionSummary({ status: 'active', expectedNetReturn: .01, winProbability: .55, bigMoveProbability: .2 })
   assert.match(result.detail, /扣费盈利概率 55.00%/)

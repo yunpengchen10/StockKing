@@ -9,6 +9,9 @@ def service_for(monkeypatch, tmp_path):
     service, tick, events, saved = make_service(monkeypatch,
         datetime(2026, 9, 14, 10, 30, tzinfo=TZ), tmp_path)
     service.selection_mode = 'auto'
+    # Exercise the legacy daily-only compatibility path in this fixture. New
+    # default E/M cold starts have their own current-minute integration tests.
+    service.opportunity_research = False
     raw = service.yao.history_fetcher()
     raw.attrs['daily_adjustment'] = 'unadjusted'
     raw.attrs['daily_source'] = 'sina'
@@ -101,12 +104,52 @@ def test_daily_observation_collects_whole_market_before_last_quote(monkeypatch, 
     assert result['recommendationPolicy']['missingPolicy'] == 'research_only'
 
 
+def test_old_directory_to_refreshed_daily_scan_can_publish_without_redating_old_fields(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from src.services import software_market
+    from src.services.stock_king_display import LocalPicksDisplayStore, displayable_run
+    from src.services.yao_scout.service import YaoScoutService
+    service, tick, _, _ = service_for(monkeypatch, tmp_path)
+    frame = service.yao._fetch_snapshot()
+    frame.attrs.update(source='software:go/eastmoney', stale=True,
+                       directory_complete=True, selection_fields_stale=True)
+    frame['source_time'] = (tick[0]-timedelta(days=3)).isoformat()
+    service.yao._fetch_snapshot = lambda: frame.copy()
+    metadata_owner = SimpleNamespace(screening=SimpleNamespace(snapshot_source_priority=[]))
+    service.yao._snapshot_meta = lambda frame, **kwargs: YaoScoutService._snapshot_meta(metadata_owner, frame, **kwargs)
+    raw = service.yao.history_fetcher().copy()
+    class Gateway:
+        available = True
+        def bars(self, code, **kwargs):
+            return {'source': 'fixture', 'adjustment': 'none', 'bars': [
+                {**row, 'end': row['date'].isoformat()} for row in raw.to_dict('records')]}
+        def enrich_snapshot_quotes(self, frame, **kwargs):
+            frame = frame.copy()
+            frame['market_quote'] = [{'code': code, 'source': 'tencent',
+                'source_time': tick[0].isoformat(), 'price': 10., 'open': 9.7,
+                'amount_cny': 980000000} for code in frame.code]
+            return frame
+    monkeypatch.setattr(software_market.SoftwareMarketClient, 'from_environment', lambda: Gateway())
+    monkeypatch.setenv('YAO_SCOUT_DATA_DIR', str(tmp_path/'display'))
+    result = service.run('live')
+    quality = result['dataQuality']
+    assert quality['source'] == 'software:go/eastmoney'
+    assert quality['stale'] is quality['selection_fields_stale'] is quality['directory_complete'] is True
+    assert quality['selectionInputFreshness']['freshRankedCount'] == 1
+    assert result['dailyAssessment']['quoteUsableCount'] == 1
+    assert result['candidates'] == [] and result['dailyCandidates']
+    assert displayable_run(result)
+    saved = LocalPicksDisplayStore(None).save(result)
+    assert LocalPicksDisplayStore(None).read() == saved
+
+
 def mixed_service_for(monkeypatch, tmp_path, start):
     from copy import deepcopy
     import pandas as pd
     from src.services.yao_scout import history_preparation
     service, tick, events, saved = make_service(monkeypatch, start, tmp_path)
     service.selection_mode = 'auto'
+    service.opportunity_research = False  # Legacy model-routing compatibility.
     service.yao.history_fetcher().attrs.update(daily_source='sina', daily_adjustment='unadjusted')
     service.yao._fetch_snapshot = lambda: pd.DataFrame([
         {'code': code, 'name': '测试股', 'price': 10} for code in ('600001', '600002')])

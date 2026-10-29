@@ -349,8 +349,8 @@ func (a *App) GetKingPicksHistory(limit int) (map[string]any, error) {
 	return a.kingPicksControl(http.MethodGet, fmt.Sprintf("/api/v1/stock-king/picks/history?limit=%d", limit), nil)
 }
 
-func (a *App) GetStockKingRecommendationHistory(date, symbol, version string, includeControls bool) (map[string]any, error) {
-	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/records?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}, "compact": {"true"}, "include_controls": {strconv.FormatBool(includeControls)}}.Encode(), nil)
+func (a *App) GetStockKingRecommendationHistory(date, symbol, version string, includeControls bool, runId string) (map[string]any, error) {
+	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/records?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}, "run_id": {runId}, "compact": {"true"}, "include_controls": {strconv.FormatBool(includeControls)}}.Encode(), nil)
 }
 func (a *App) GetStockKingDelayedReviews(date, symbol, version string) (map[string]any, error) {
 	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/reviews?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}}.Encode(), nil)

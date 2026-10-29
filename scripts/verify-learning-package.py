@@ -22,6 +22,7 @@ pyz = archive.open_embedded_archive(next(name for name in archive.toc if name.lo
 checks = {}
 for suffix in (
     "local_algorithm", "local_opportunities", "local_observation_review", "signal_learning",
+    "opportunity_channels", "opportunity_discovery", "discovery_snapshot",
     "task_learning", "decision_policy", "research_policy", "minute_integrity", "minute_history",
     "next_day_watch", "recommendation_evidence", "sector_fund_evidence", "morning_task", "primary_policy",
     "precision_policy", "research_factors", "premarket", "daily_primary", "admission_diagnostics",
@@ -34,7 +35,7 @@ for suffix in (
     source = root / "daily-engine" / Path(*name.split(".")).with_suffix(".py")
     checks[name] = frozen == compile(source.read_text(encoding="utf-8"), frozen.co_filename,
                                     "exec", dont_inherit=True, optimize=0)
-for name in ('src.services.software_market', 'src.services.stock_king_display', 'src.storage',
+for name in ('src.services.software_market', 'src.services.stock_king_display', 'src.services.akshare_context', 'src.storage',
              'api.v1.endpoints.stock_king'):
     frozen = pyz.extract(name)
     source = root / 'daily-engine' / Path(*name.split('.')).with_suffix('.py')

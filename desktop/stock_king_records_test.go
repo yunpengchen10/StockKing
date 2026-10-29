@@ -25,7 +25,7 @@ func TestRecommendationReadIsCompactAndHasShortDeadline(t *testing.T) {
 				if query.Get("compact") != "true" || query.Get("include_controls") != map[bool]string{false: "false", true: "true"}[includeControls] {
 					t.Fatalf("invalid record query: %v", query)
 				}
-				if query.Get("version") != "v1.2 + fixed" || query.Get("symbol") != "600001" || query.Get("date") != "2026-10-12" {
+				if query.Get("version") != "v1.2 + fixed" || query.Get("symbol") != "600001" || query.Get("date") != "2026-10-12" || query.Get("run_id") != "king-live-test" {
 					t.Fatalf("filters changed: %v", query)
 				}
 				deadline, ok := request.Context().Deadline()
@@ -35,7 +35,7 @@ func TestRecommendationReadIsCompactAndHasShortDeadline(t *testing.T) {
 				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"items":[],"count":0}`))}, nil
 			})},
 		}}
-		result, err := app.GetStockKingRecommendationHistory("2026-10-12", "600001", "v1.2 + fixed", includeControls)
+		result, err := app.GetStockKingRecommendationHistory("2026-10-12", "600001", "v1.2 + fixed", includeControls, "king-live-test")
 		if err != nil || result["count"] != float64(0) {
 			t.Fatalf("read failed: %v %v", result, err)
 		}

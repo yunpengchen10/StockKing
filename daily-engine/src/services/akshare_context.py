@@ -29,9 +29,53 @@ FIELDS = {
                    "营业总收入-同比增长", "净资产收益率", "每股经营现金流量", "所处行业"],
     "forecast": ["股票代码", "公告日期", "预测指标", "预告类型", "业绩变动幅度"],
     "unlock": ["股票代码", "解禁时间", "解禁数量", "占解禁前流通市值比例"],
+    "disclosures": ["股票代码", "公告日期", "公告标题", "公告标识", "公告链接"],
 }
 ENDPOINTS = {"financials": "stock_yjbb_em", "forecast": "stock_yjyg_em",
-             "unlock": "stock_restricted_release_detail_em"}
+             "unlock": "stock_restricted_release_detail_em", "disclosures": "stock_notice_report"}
+
+DISCLOSURE_URL = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+
+
+def fetch_recent_disclosures(endpoint, params, timeout, *, getter=None):
+    """One bounded page of the same public announcement API used by desktop.
+
+    This is explicitly partial discovery coverage, never a complete risk scan.
+    Only vendor security associations and original titles are retained; no
+    title is asserted to be a positive earnings surprise or complete document.
+    """
+    from .eastmoney_context import _get, HEADERS
+    response = (getter or _get)(DISCLOSURE_URL, params={'page_size': '100', 'page_index': '1',
+        'ann_type': 'SHA,CYB,SZA,BJA,INV', 'client_source': 'web', 'f_node': '0', 'stock_list': ''},
+        headers=HEADERS, timeout=min(float(timeout), 6))
+    response.raise_for_status()
+    payload = response.json()
+    listing = (payload.get('data') or {}).get('list')
+    if not isinstance(listing, list) or len(listing) > 100:
+        raise ValueError('disclosure_list_schema_changed')
+    rows, seen = [], set()
+    for item in listing:
+        if not isinstance(item, dict) or not all(item.get(k) for k in ('art_code', 'title', 'notice_date')):
+            raise ValueError('disclosure_record_schema_changed')
+        securities = item.get('codes')
+        if not isinstance(securities, list):
+            raise ValueError('disclosure_security_schema_changed')
+        article = str(item['art_code'])
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', article):
+            raise ValueError('disclosure_identity_invalid')
+        for security in securities:
+            code = code_of(security.get('stock_code')) if isinstance(security, dict) else ''
+            if not code or (code, article) in seen:
+                continue
+            seen.add((code, article))
+            rows.append({'股票代码': code, '公告日期': str(item['notice_date'])[:10],
+                         '公告标题': str(item['title']), '公告标识': article,
+                         '公告链接': f'https://data.eastmoney.com/notices/detail/{code}/{article}.html'})
+    frame = pd.DataFrame(rows, columns=FIELDS['disclosures'])
+    frame.attrs.update(source='Eastmoney public company announcements', sourceUrl=DISCLOSURE_URL,
+        pages=1, recordCount=len(rows), complete=False,
+        collectionMethod='bounded_latest_100_announcements_not_full_coverage')
+    return frame
 
 
 def timestamp(value):
@@ -145,16 +189,18 @@ class AkshareContextProvider:
         self.timeout = timeout
 
     def _table(self, kind, params, cutoff, refresh):
-        direct_table = EASTMONEY_TABLES[ENDPOINTS[kind]] if self.fetcher is fetch_eastmoney_context else None
+        direct_table = EASTMONEY_TABLES.get(ENDPOINTS[kind]) if self.fetcher is fetch_eastmoney_context else None
         source = ('Eastmoney datacenter/' + direct_table['report']) if direct_table else 'AKShare/' + ENDPOINTS[kind]
-        source_url = direct_table['url'] if direct_table else None
+        if kind == 'disclosures' and self.fetcher is fetch_eastmoney_context:
+            source = 'Eastmoney public company announcements'
+        source_url = direct_table['url'] if direct_table else DISCLOSURE_URL if kind == 'disclosures' else None
         key = hashlib.sha256(json.dumps([kind, params], sort_keys=True).encode()).hexdigest()[:20]
         folder = self.directory / key
         for path in sorted(folder.glob("*.json"), reverse=True):
             try:
                 packet = json.loads(path.read_text(encoding="utf-8"))
                 age = (cutoff - timestamp(packet["observedAt"])).total_seconds()
-                if 0 <= age <= 21600 and packet.get("version") == VERSION:
+                if 0 <= age <= (900 if kind == 'disclosures' else 21600) and packet.get("version") == VERSION:
                     if any(not row.get('_firstSeenAt') for row in packet.get('rows', [])):
                         packet['rows'] = _first_seen_rows(folder, kind, params, packet['rows'],
                                                          timestamp(packet['observedAt']))
@@ -165,11 +211,13 @@ class AkshareContextProvider:
             return {"kind": kind, "status": "unavailable", "rows": [], "params": params,
                     "source": source, "sourceUrl": source_url, "reason": "截止时点前无有效归档；禁止用当前数据补历史"}
         try:
-            frame = self.fetcher(ENDPOINTS[kind], params, self.timeout)
-            required = {"股票代码", "最新公告日期" if kind == "financials" else "公告日期" if kind == "forecast" else "解禁时间"}
+            fetcher = fetch_recent_disclosures if kind == 'disclosures' and self.fetcher is fetch_eastmoney_context else self.fetcher
+            frame = fetcher(ENDPOINTS[kind], params, self.timeout)
+            required = {"股票代码", "最新公告日期" if kind == "financials" else "公告日期" if kind in {"forecast", "disclosures"} else "解禁时间"}
             required.update({'financials': {'净利润-净利润', '每股收益', '每股经营现金流量'},
                              'forecast': {'预测指标', '预告类型'},
-                             'unlock': {'占解禁前流通市值比例'}}[kind])
+                             'unlock': {'占解禁前流通市值比例'},
+                             'disclosures': {'公告标题', '公告标识', '公告链接'}}[kind])
             if not isinstance(frame, pd.DataFrame) or not required.issubset(frame.columns):
                 raise ValueError("provider_schema_changed")
             # Explicit allowlist discards unlock post-event returns and other future fields.
@@ -210,6 +258,7 @@ class AkshareContextProvider:
         jobs += [("forecast", {"date": d.strftime("%Y%m%d")}) for d in (forecast_period, periods[0])]
         jobs += [("unlock", {"start_date": cutoff.strftime("%Y%m%d"),
                              "end_date": (cutoff + timedelta(days=14)).strftime("%Y%m%d")})]
+        jobs += [('disclosures', {})]
         with ThreadPoolExecutor(max_workers=3) as pool:
             tables = list(pool.map(lambda job: self._table(*job, cutoff, refresh), jobs))
         return {"version": VERSION, "tables": tables, "requestedAt": cutoff.isoformat(),
@@ -219,7 +268,7 @@ class AkshareContextProvider:
 def for_stock(bundle, code, cutoff):
     cutoff = timestamp(cutoff)
     code = code_of(code)
-    output = {"version": VERSION, "financials": None, "forecasts": [], "unlocks": [],
+    output = {"version": VERSION, "code": code, "financials": None, "forecasts": [], "unlocks": [], "disclosures": [],
               "coverage": {}, "gaps": [], "decisionAt": cutoff.isoformat()}
     finances = []
     covered = {kind: [] for kind in FIELDS}
@@ -229,13 +278,18 @@ def for_stock(bundle, code, cutoff):
             continue
         try:
             observed = timestamp(table["observedAt"])
-            usable = table.get("status") == "available" and 0 <= (cutoff - observed).total_seconds() <= 21600
+            usable = table.get("status") == "available" and 0 <= (cutoff - observed).total_seconds() <= (900 if kind == 'disclosures' else 21600)
         except (ValueError, TypeError, KeyError):
             usable = False
         covered[kind].append(usable)
         if not usable:
             output["gaps"].append(kind + " 数据未取得、过期或尚未可知")
             continue
+        if kind == 'disclosures':
+            output['disclosureCoverage'] = {'status': 'partial', 'complete': False,
+                'observedAt': observed.isoformat(), 'source': table.get('source'),
+                'collection': table.get('collection') or {},
+                'meaning': '最新公告有界列表；未出现不代表无公告或无风险，标题不代表全文与利好'}
         for row in table.get("rows", []):
             if code_of(row.get("股票代码")) != code:
                 continue
@@ -273,6 +327,28 @@ def for_stock(bundle, code, cutoff):
                     base.update(type=str(row.get("预告类型") or "未知"), metric=str(row.get("预测指标") or "未知"),
                                 changePct=number(row.get("业绩变动幅度")))
                     output["forecasts"].append(base)
+            elif kind == 'disclosures':
+                try:
+                    published_day = date.fromisoformat(str(row.get('公告日期'))[:10])
+                    if published_day > observed.date() or published_day > cutoff.date():
+                        raise ValueError('future publication date')
+                except (TypeError, ValueError):
+                    covered[kind].append(False)
+                    output['gaps'].append('公告日期无效或尚未可知')
+                    continue
+                title = str(row.get('公告标题') or '')
+                categories = [('order', r'中标|合同|订单'), ('capital_action', r'回购|增持|重组|收购'),
+                              ('industry', r'投产|量产|产业|投资|项目|技术|产品|批准|认证'),
+                              ('policy', r'政策|补贴|补助')]
+                category = next((name for name, pattern in categories if re.search(pattern, title)), None)
+                if category is None:
+                    continue
+                base.update(code=code, category=category, impact='neutral', title=title, body='',
+                    evidenceText=title, sourceUrl=row.get('公告链接'), publishedDate=published_day.isoformat(),
+                    availableAt=first_seen.isoformat(), availabilityBasis='observed_public_listing_date_only',
+                    evidenceScope='title_only', researchCandidate=True,
+                    interpretation='公告主题待验证；不推断利好、履约结果或收益概率')
+                output['disclosures'].append(base)
             else:
                 try:
                     event_date = date.fromisoformat(str(row.get("解禁时间"))[:10])
@@ -296,3 +372,19 @@ def for_stock(bundle, code, cutoff):
     output["coverage"] = {kind: bool(values) and all(values) for kind, values in covered.items()}
     output["gaps"] = list(dict.fromkeys(output["gaps"]))
     return output
+
+
+def for_stocks(bundle, codes, cutoff):
+    """Index source tables once, retaining identical for_stock coverage semantics."""
+    unique = list(dict.fromkeys(code_of(code) for code in codes))
+    unique = [code for code in unique if code]
+    indexed = []
+    for table in bundle.get('tables', []):
+        by_code = {}
+        for row in table.get('rows') or []:
+            code = code_of(row.get('股票代码'))
+            if code:
+                by_code.setdefault(code, []).append(row)
+        indexed.append((table, by_code))
+    return {code: for_stock({**bundle, 'tables': [
+        {**table, 'rows': index.get(code, [])} for table, index in indexed]}, code, cutoff) for code in unique}

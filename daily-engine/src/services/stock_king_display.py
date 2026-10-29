@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -47,9 +48,12 @@ def display_counts(run: dict[str, Any]) -> dict[str, Any]:
                     row.get("observationOnly") is True or row.get("status") == "daily_observation"))}
     trade, watch, continuation = (codes(key) for key in
                                   ("candidates", "nextDayWatchlist", "nextDayContinuationWatchlist"))
+    opportunities = {row.get('code') for row in (run.get('opportunityChannels') or {}).get('recommendations') or []
+                     if isinstance(row, dict) and row.get('code')}
     return {
         "displayRunId": run.get("run_id") or run.get("runId"),
         "tradeCandidateCount": len(trade),
+        "opportunityRecommendationCount": len(opportunities),
         "dailyCandidateCount": len(trade) if run.get("primarySelectionMode") == "daily_conditional"
             else len(codes("dailyCandidates")) if run.get("primarySelectionMode") in _DAILY_OBSERVATION_MODES else 0,
         "dailyObservationCount": len(codes("dailyCandidates")) if run.get("primarySelectionMode") in _DAILY_OBSERVATION_MODES else 0,
@@ -69,6 +73,9 @@ def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(run, dict):
         return payload
     shown = {key: value for key, value in run.items() if key not in {"controls", "windvanes", "morningResearch", "dailyObservationResearch"}}
+    if isinstance(run.get('opportunityChannels'), dict):
+        shown['opportunityChannels'] = {key: value for key, value in run['opportunityChannels'].items()
+                                        if key != 'researchCandidates'}
     if isinstance(run.get("precisionWatchlist"), list):
         shown["precisionWatchlist"] = []
         for pick in run["precisionWatchlist"]:
@@ -128,6 +135,157 @@ def _daily_assessment_valid(run: dict[str, Any], *, historical: bool = False) ->
         return False
 
 
+def _refreshed_daily_observation(run: dict[str, Any], *, historical: bool = False) -> bool:
+    """Old directory rank fields cannot veto independently refreshed research.
+
+    This exception never admits formal candidates, including alternate profiles.
+    The stale flag remains true in the saved evidence; only its scope changes.
+    """
+    quality = run.get("dataQuality") or run.get("data_quality") or {}
+    selection = quality.get("selectionInputFreshness") or {}
+    coverage = quality.get("quote_coverage") or {}
+    profiles = run.get("profileCandidates") or {}
+    if not all(isinstance(value, dict) for value in (selection, coverage, profiles)):
+        return False
+    snapshot, ranked, directory_only, requested, fresh = (
+        quality.get("snapshot_count"), selection.get("freshRankedCount"),
+        selection.get("directoryOnlyCount"), coverage.get("requested"), coverage.get("fresh"))
+    return bool(run.get("primarySelectionMode") in _DAILY_OBSERVATION_MODES
+        and run.get("candidates") == []
+        and all(isinstance(rows, list) and not rows for rows in profiles.values())
+        and quality.get("directory_complete") is True
+        and quality.get("selection_fields_stale") is True
+        and selection.get("version") == "fresh-selection-inputs-v1"
+        and selection.get("rebuiltAfterWholeMarketQuotes") is True
+        and all(type(value) is int for value in (snapshot, ranked, directory_only, requested, fresh))
+        and snapshot >= ranked > 0 and directory_only >= 0
+        and ranked + directory_only <= snapshot and 0 < fresh <= requested
+        and _daily_assessment_valid(run, historical=historical))
+
+
+def _daily_refresh_error(run: dict[str, Any]) -> str:
+    """Explain the failed evidence gate, rather than implying a scan is pending."""
+    quality = run.get("dataQuality") or run.get("data_quality") or {}
+    assessment = run.get("dailyAssessment") or {}
+    coverage = quality.get("quote_coverage") or {}
+    if quality.get("snapshot_count") == 0:
+        reason = "全市场股票目录为空"
+    elif not isinstance(assessment, dict) or not assessment:
+        reason = "本轮日线评估记录缺失"
+    elif not _daily_assessment_valid(run):
+        if type(assessment.get("dailyUsableCount")) is int and assessment["dailyUsableCount"] <= 0:
+            reason = "本轮可用日线为0"
+        elif type(assessment.get("quoteUsableCount")) is int and assessment["quoteUsableCount"] <= 0:
+            reason = "本轮日线与当日报价核验通过数为0"
+        else:
+            reason = "本轮日线评估的版本、数据计数、基准交易日或时段校验未通过"
+    elif coverage.get("requested", 0) > 0 and not coverage.get("fresh", 0):
+        reason = "本轮全部实时报价缺失或过期"
+    elif quality.get("stale"):
+        if quality.get("directory_complete") is not True:
+            reason = "初筛快照已过期，股票目录完整性尚未核验"
+        elif run.get("candidates") or any((run.get("profileCandidates") or {}).values()):
+            reason = "初筛快照已过期，日线观察核验不能代替正式候选校验"
+        else:
+            reason = "初筛快照已过期，当轮新鲜筛选输入或报价覆盖核验未通过"
+    else:
+        reason = "本轮日线结果状态或结构未通过展示校验"
+    return reason + "；已保留上次结果"
+
+
+def _opportunity_versions(*, historical: bool = False) -> set[str]:
+    """Known frozen contracts survive upgrades; fresh publications use current rules."""
+    from src.services.yao_scout.opportunity_channels import VERSION
+    return {VERSION, 'opportunity-em-20261028-v1'} if historical else {VERSION}
+
+
+def _opportunity_assessment_valid(run: dict[str, Any], *, historical: bool = False) -> bool:
+    from src.services.yao_scout.daily_opportunities import quote_check
+    packet = run.get('opportunityChannels') or {}
+    if not isinstance(packet, dict):
+        return False
+    rows = packet.get('recommendations')
+    version = packet.get('version')
+    if version not in _opportunity_versions(historical=historical) or not isinstance(rows, list) or len(rows) > 5:
+        return False
+    published = _generated_at(run).astimezone(_SHANGHAI_TZ)
+    try:
+        assessed = datetime.fromisoformat(packet.get('asOf') or '')
+        if not assessed.tzinfo or not 0 <= (published-assessed).total_seconds() <= 30:
+            return False
+        if not rows:
+            # A real completed empty assessment replaces yesterday's picks.
+            # A label/count alone cannot turn a source outage into "no picks".
+            research = packet.get('researchCandidates')
+            observations = packet.get('observations')
+            diagnostics = packet.get('diagnostics') or {}
+            if (not isinstance(research, list) or not research or not isinstance(observations, list)
+                    or not isinstance(diagnostics, dict)
+                    or (packet.get('policy') or {}).get('version') != version
+                    or any(type(diagnostics.get(key)) is not int for key in
+                           ('researchedCount', 'recommendationCount', 'observationCount'))
+                    or diagnostics['researchedCount'] != len(research)
+                    or diagnostics['recommendationCount'] != 0
+                    or diagnostics['observationCount'] != len(observations)
+                    or len(observations) != len(research)):
+                return False
+            seen, evidence_count = set(), 0
+            for row in research:
+                if not isinstance(row, dict) or not row.get('code') or row['code'] in seen:
+                    return False
+                seen.add(row['code'])
+                opportunity = row.get('opportunity') or {}
+                if (opportunity.get('version') != version or row.get('ruleRecommendation') is not False
+                        or opportunity.get('grade') not in {'E-A', 'M-A', 'B', 'C'}
+                        or opportunity.get('detectedAt') != packet.get('asOf')):
+                    return False
+                sources, metrics = opportunity.get('sourceEvidence') or {}, opportunity.get('metrics') or {}
+                try:
+                    minute = datetime.fromisoformat(sources.get('minuteAsOf') or '')
+                    fresh_minute = bool(minute.tzinfo and 0 <= (assessed-minute).total_seconds() < 300
+                                        and minute.astimezone(_SHANGHAI_TZ).date() == assessed.astimezone(_SHANGHAI_TZ).date())
+                except (TypeError, ValueError, OverflowError):
+                    fresh_minute = False
+                has_change = any(type(metrics.get(key)) in (float, int) and math.isfinite(metrics[key])
+                                 for key in ('r1_pct', 'r3_pct', 'r5_pct', 'r15_pct'))
+                if (fresh_minute and sources.get('minuteSource') and has_change
+                        and not quote_check(row.get('quote') or {}, row['code'], published)):
+                    evidence_count += 1
+            return evidence_count > 0
+        return all(isinstance(row, dict) and row.get('ruleRecommendation') is True
+            and (row.get('opportunity') or {}).get('version') == version
+            and (row.get('opportunity') or {}).get('grade') in {'E-A', 'M-A'}
+            and not (row.get('opportunity') or {}).get('hardVetoes')
+            and ((row.get('opportunity') or {}).get('buyWindow') or {}).get('status') == 'observed'
+            and not quote_check(row.get('quote') or {}, row.get('code'), published) for row in rows)
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _opportunity_header_valid(row: dict[str, Any], *, historical: bool = False) -> bool:
+    """Select a small independent-assessment header for full-result validation."""
+    marker = row.get('opportunity_assessment') or {}
+    run = row.get('result') or {}
+    if not all(isinstance(value, dict) for value in (marker, run)):
+        return False
+    diagnostics = marker.get('diagnostics') or {}
+    if not isinstance(diagnostics, dict):
+        return False
+    count, rows, selected = (diagnostics.get('researchedCount'), marker.get('researchRowCount'),
+                             row.get('opportunity_recommendation_count'))
+    try:
+        at = datetime.fromisoformat(marker.get('asOf') or '')
+        return bool(run.get('status') in _VALID_STATUSES
+            and marker.get('version') in _opportunity_versions(historical=historical)
+            and marker.get('policyVersion') == marker.get('version') and at.tzinfo
+            and 0 <= (_generated_at(run)-at).total_seconds() <= 30
+            and all(type(value) is int for value in (count, rows, selected)) and count == rows > 0
+            and type(diagnostics.get('recommendationCount')) is int
+            and diagnostics['recommendationCount'] == selected and 0 <= selected <= 5)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def displayable_run(run: Any, *, historical: bool = False) -> bool:
     """A source outage is not an empty selection. Old snapshots do not expire here."""
     if not isinstance(run, dict) or run.get("status") not in _VALID_STATUSES:
@@ -135,6 +293,12 @@ def displayable_run(run: Any, *, historical: bool = False) -> bool:
     if run.get("scanSlot") in {"review", "weekly", "0925"}:
         return False
     if not isinstance(run.get("candidates"), list):
+        return False
+    opportunity = run.get('opportunityChannels')
+    if opportunity is not None and (not isinstance(opportunity, dict)
+            or opportunity.get('version') not in _opportunity_versions(historical=historical)):
+        # A valid daily branch cannot publish an unsupported or old opportunity
+        # contract as a new result. Historical reads retain the recorded version.
         return False
     quality = run.get("dataQuality") or run.get("data_quality") or {}
     if run.get('premarketAssessment'):
@@ -157,7 +321,13 @@ def displayable_run(run: Any, *, historical: bool = False) -> bool:
                 and not run['candidates'])
         except (TypeError, ValueError, OverflowError):
             return False
-    if quality.get("stale") or quality.get("snapshot_count") == 0:
+    if quality.get("snapshot_count") == 0:
+        return False
+    # Valid E/M evidence is independent of the daily trend/model gates. Validate
+    # its original publication, never refresh a saved quote when opening a page.
+    if _opportunity_assessment_valid(run, historical=historical):
+        return True
+    if quality.get("stale") and not _refreshed_daily_observation(run, historical=historical):
         return False
     coverage = quality.get("quote_coverage") or {}
     if coverage.get("requested", 0) > 0 and not coverage.get("fresh", 0):
@@ -240,8 +410,10 @@ class LocalPicksDisplayStore:
             try:
                 rows = self.db.list_yao_display_runs(limit=100, modes=_SCAN_MODES,
                                                     statuses=tuple(sorted(_VALID_STATUSES)))
-                valid = [row for row in rows
-                         if row.get("mode") in _SCAN_MODES and displayable_run(row.get("result"), historical=True)]
+                valid = [row for row in rows if row.get("mode") in _SCAN_MODES
+                         and (displayable_run(row.get("result"), historical=True)
+                              or row.get('opportunity_recommendation_count', 0) > 0
+                              or _opportunity_header_valid(row, historical=True))]
                 newest = max(valid, key=lambda row: _generated_at(row["result"]), default=None)
                 with _display_lock:
                     saved = self._read_saved()
@@ -279,7 +451,7 @@ class LocalPicksDisplayStore:
             if run.get('premarketAssessment'):
                 message = '昨夜已完成日线不足或开盘预案窗口已结束，本轮未生成有效预案；已保留上次结果'
             elif run.get('primarySelectionMode') in _DAILY_OBSERVATION_MODES | {'daily_conditional'}:
-                message = '本轮日线、当日报价或本时段日线评估尚未核验完成；已保留上次结果'
+                message = _daily_refresh_error(run)
             elif quote_missing or minute_missing:
                 message = ("本轮全部实时报价缺失或过期，无法核验推荐；已保留上次结果" if quote_missing
                            else "本轮全部有效分钟价格结构缺失，无法核验推荐；已保留上次结果")

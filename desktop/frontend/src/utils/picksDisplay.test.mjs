@@ -10,6 +10,7 @@ import * as recommendationQuality from './recommendationQuality.mjs'
 import * as pickExplain from './pickExplain.mjs'
 import * as pickLedger from './pickLedger.mjs'
 import * as premarket from './premarket.mjs'
+import * as opportunityDisplay from './opportunityDisplay.mjs'
 
 const flush = async () => { for (let n = 0; n < 30; n++) await Promise.resolve(); await vue.nextTick() }
 const deferred = () => {
@@ -40,7 +41,7 @@ test('current model readiness explains an old empty snapshot without changing it
   const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-26T15:35:00+08:00'))
   try {
     await flush()
-    assert.match(mounted.visibleText(), /主推荐 · 等待模型验证/)
+    assert.match(mounted.visibleText(), /模型验证精选 · 等待模型验证/)
     assert.match(mounted.visibleText(), /当前 · T\+1模型准备中/)
     assert.match(mounted.visibleText(), /有效样本 0 条.*156/s)
     assert.equal(mounted.state().result.generatedAt, saved.generatedAt)
@@ -62,6 +63,126 @@ test('cold-start controls are visible separately from formal recommendations and
     assert.match(mounted.visibleText(), /研究样本 600001.*保存时研究区间 ¥9.95–10.15/s)
     assert.match(mounted.visibleText(), /训练资格 1 条.*对照 1 条/s)
     assert.equal(mounted.state().adaptivePicks.length, 0)
+  } finally { mounted.dispose() }
+})
+
+const earlyOpportunity = () => ({ code: '600001', name: '早期启动样本', referencePrice: 10.1,
+  quote: { price: 10.1, source: 'tencent', source_time: '2026-10-28T10:29:55+08:00' },
+  opportunity: { channel: 'E', grade: 'E-A', rankScore: 82, supports: ['价格方向突变，短时量能增加'],
+    missing: 'VWAP与板块同步尚未确认', counterEvidence: [], invalidation: ['回落并持续无法收复开盘价'],
+    firstDetectionAt: '2026-10-28T10:29:00+08:00', firstDetectionPrice: 10, triggerAt: null,
+    buyWindow: { status: 'observed', askPrice: 10.1, sourceTime: '2026-10-28T10:29:55+08:00' } } })
+
+test('early opportunity renders before the research lists and unready model with its unconfirmed evidence visible', async () => {
+  const saved = researchSnapshot('2026-10-28T10:30:00+08:00', { continuation: [zhengyuObservation()] })
+  saved.adaptive.opportunityChannels = { version: 'opportunity-v1', recommendations: [earlyOpportunity()], observations: [] }
+  saved.adaptive.primaryReadiness = { modelUsableNow: false, progressKnown: false }
+  const before = JSON.stringify(saved)
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:00+08:00'))
+  try {
+    await flush()
+    const text = mounted.visibleText()
+    assert.match(text, /机会精选 · 早期启动 \/ 主升确认/)
+    assert.match(text, /早期启动样本600001E-A · 早期启动/)
+    assert.match(text, /价格方向突变，短时量能增加/)
+    assert.match(text, /VWAP与板块同步尚未确认/)
+    assert.match(text, /回落并持续无法收复开盘价/)
+    assert.match(text, /当日新买通常不能当日卖出/)
+    assert.ok(text.indexOf('早期启动样本') < text.indexOf('研究观察 · 不计入主推荐'))
+    assert.ok(text.indexOf('早期启动样本') < text.indexOf('模型验证精选 · 等待模型验证'))
+    assert.equal(mounted.state().adaptivePicks.length, 0, 'independent opportunities cannot become validated model selections')
+    assert.equal(refresh.readDisplayedPicks(mounted.storage).adaptive.opportunityChannels.recommendations[0].code, '600001')
+    assert.equal(JSON.stringify(saved), before)
+  } finally { mounted.dispose() }
+})
+
+test('expired opportunity quotes stay visible as historical evidence and failed refreshes preserve the cards', async () => {
+  const saved = researchSnapshot('2026-10-28T10:30:00+08:00')
+  saved.adaptive.opportunityChannels = { recommendations: [earlyOpportunity()] }
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved,
+    StartKingPicksRefresh: async () => { throw new Error('报价服务暂不可用') },
+  }, null, Date.parse('2026-10-28T10:30:00+08:00'))
+  try {
+    await flush()
+    assert.match(mounted.visibleText(), /源时间在30秒内/)
+    mounted.setNow(Date.parse('2026-10-28T10:30:26+08:00'))
+    await mounted.runTimer(1000)
+    assert.match(mounted.visibleText(), /早期启动样本/)
+    assert.match(mounted.visibleText(), /历史参考价 · 行情已过期/)
+    assert.doesNotMatch(mounted.visibleText(), /源时间在30秒内/)
+    await mounted.state().refresh(); await flush()
+    assert.match(mounted.visibleText(), /报价服务暂不可用/)
+    assert.match(mounted.visibleText(), /早期启动样本/)
+    assert.equal(refresh.readDisplayedPicks(mounted.storage).adaptive.opportunityChannels.recommendations.length, 1)
+  } finally { mounted.dispose() }
+})
+
+test('unselected qualified opportunities keep their real grades alongside B and C observations', async () => {
+  const saved = researchSnapshot('2026-10-28T10:30:00+08:00')
+  const observations = ['E-A', 'M-A', 'B', 'C'].map((grade, index) => ({ ...earlyOpportunity(),
+    code: `60000${index + 2}`, name: `保留等级${index + 1}`,
+    opportunity: { ...earlyOpportunity().opportunity, grade, channel: grade === 'M-A' ? 'M' : 'E' } }))
+  saved.adaptive.opportunityChannels = { recommendations: [earlyOpportunity()], observations }
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:01+08:00'))
+  try {
+    await flush()
+    assert.match(mounted.visibleText(), /其他机会与待确认线索 · 4 只/)
+    assert.doesNotMatch(mounted.text(), /B \/ C 待确认线索/)
+    for (const row of observations) assert.ok(mounted.text().includes(`${row.name} ${row.code} · ${row.opportunity.grade}`))
+    assert.equal(mounted.state().opportunities.cards.length, 1)
+    assert.equal(mounted.state().adaptivePicks.length, 0)
+  } finally { mounted.dispose() }
+})
+
+test('opportunity scan history retains E/M grades and does not backfill model-selected counts', async () => {
+  const saved = researchSnapshot('2026-10-28T10:30:00+08:00')
+  saved.adaptive.opportunityChannels = { recommendations: [earlyOpportunity()] }
+  const historyItem = { run_id: 'opportunity-run', mode: 'king_1030', result: saved.adaptive }
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved, GetKingPicksHistory: async () => ({ items: [historyItem] }) }, null, Date.parse('2026-10-28T10:30:01+08:00'))
+  try {
+    await flush()
+    await mounted.state().openHistory(); await flush()
+    assert.match(mounted.visibleText(), /机会精选 · 1 只 · 保存时研究等级/)
+    mounted.state().restoreHistory(historyItem)
+    await flush()
+    assert.match(mounted.visibleText(), /历史快照 · 未做当前核验/)
+    assert.match(mounted.visibleText(), /早期启动样本/)
+    assert.equal(mounted.state().adaptivePicks.length, 0)
+    assert.equal(mounted.state().viewingHistory, true)
+  } finally { mounted.dispose() }
+})
+
+test('large opportunity observation lists show ten initially and expand without changing saved decisions', async () => {
+  let saved = researchSnapshot('2026-10-28T10:30:00+08:00')
+  const observations = Array.from({ length: 300 }, (_, index) => ({ ...earlyOpportunity(),
+    code: String(600002 + index), name: `观察队列样本${index + 1}`,
+    opportunity: { ...earlyOpportunity().opportunity, grade: ['E-A', 'M-A', 'B', 'C'][index % 4] } }))
+  saved.adaptive.opportunityChannels = { recommendations: [earlyOpportunity()], observations }
+  const before = JSON.stringify(saved)
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:01+08:00'))
+  try {
+    await flush()
+    assert.match(mounted.visibleText(), /其他机会与待确认线索 · 300 只/)
+    assert.match(mounted.text(), /当前展示 10 \/ 300 只/)
+    assert.match(mounted.text(), /查看全部 300 条/)
+    assert.ok(mounted.text().includes('观察队列样本10 600011 · M-A'))
+    assert.ok(!mounted.text().includes('观察队列样本11 600012'))
+    assert.equal(mounted.state().visibleOpportunityObservations.length, 10)
+    mounted.state().toggleOpportunityObservations(); await flush()
+    assert.match(mounted.text(), /当前展示 300 \/ 300 只/)
+    assert.ok(mounted.text().includes('观察队列样本300 600301 · C'))
+    assert.match(mounted.text(), /收起至前10条/)
+    mounted.state().toggleOpportunityObservations(); await flush()
+    assert.equal(mounted.state().visibleOpportunityObservations.length, 10)
+    assert.equal(JSON.stringify(saved), before)
+    assert.equal(mounted.state().opportunities.cards.length, 1)
+    assert.equal(mounted.state().adaptivePicks.length, 0)
+    mounted.state().toggleOpportunityObservations(); await flush()
+    saved = { ...saved, generatedAt: '2026-10-28T10:31:00+08:00',
+      adaptive: { ...saved.adaptive, generatedAt: '2026-10-28T10:31:00+08:00' } }
+    await mounted.runTimer(30000)
+    assert.equal(mounted.state().showAllOpportunityObservations, false, 'a newly saved scan starts with a bounded list')
+    assert.equal(mounted.state().visibleOpportunityObservations.length, 10)
   } finally { mounted.dispose() }
 })
 
@@ -105,6 +226,7 @@ function mountPicks(api = {}, cached = null, now = null) {
     '../utils/pickExplain.mjs': pickExplain,
     '../utils/pickLedger.mjs': pickLedger,
     '../utils/premarket.mjs': premarket,
+    '../utils/opportunityDisplay.mjs': opportunityDisplay,
     '../utils/picksRefresh.mjs': {
       ...refresh,
       createPicksRefreshController: options => refresh.createPicksRefreshController({ ...options, setTimer: clock.setTimeout, clearTimer: clock.clearTimeout }),
@@ -631,7 +753,7 @@ for (const formalCount of [0, 1]) test(`new daily observations stay separate wit
     assert.equal(mounted.state().isDailyPrimary, false)
     assert.equal(mounted.state().adaptivePicks.length, formalCount)
     assert.equal(mounted.state().dailyPicks.length, 1)
-    assert.match(mounted.text(), new RegExp(`主推荐 · ${formalCount} 只通过准入`))
+    assert.match(mounted.text(), new RegExp(`模型验证精选 · ${formalCount} 只通过准入`))
     assert.match(mounted.text(), /日线观察 · 1 只 · 不计入主推荐/)
     assert.match(mounted.text(), /独立日线观察样本/)
     assert.match(mounted.text(), /本轮日线观察 2026\/10\/22 10:41:49/)

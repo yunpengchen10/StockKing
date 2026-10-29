@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--expected-recommendations", type=int)
     parser.add_argument("--expected-premarket", type=int)
     parser.add_argument("--expected-daily", type=int)
+    parser.add_argument("--expected-opportunities", type=int)
     args = parser.parse_args()
     source = args.history_db.resolve(strict=True)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "daily-engine"))
@@ -38,24 +39,37 @@ def main():
             query = f"""select run_id, mode,
                 json_extract(result_json, '$.generatedAt', '$.as_of', '$.cutoff_at',
                     '$.scanSlot', '$.status', '$.dataQuality', '$.data_quality', '$.premarketAssessment',
-                    '$.primarySelectionMode', '$.primaryObjective', '$.dailyAssessment'),
+                    '$.primarySelectionMode', '$.primaryObjective', '$.dailyAssessment',
+                    '$.opportunityChannels.version', '$.opportunityChannels.asOf',
+                    '$.opportunityChannels.diagnostics', '$.opportunityChannels.policy.version'),
                 json_type(result_json, '$.candidates'),
+                json_array_length(result_json, '$.candidates'),
+                (SELECT COUNT(*) FROM json_each(yao_runs.result_json, '$.profileCandidates')
+                    WHERE type <> 'array' OR json_array_length(value) <> 0),
                 json_array_length(result_json, '$.nextDayWatchlist'),
-                json_array_length(result_json, '$.nextDayContinuationWatchlist')
+                json_array_length(result_json, '$.nextDayContinuationWatchlist'),
+                json_array_length(result_json, '$.opportunityChannels.recommendations'),
+                json_array_length(result_json, '$.opportunityChannels.researchCandidates')
                 from yao_runs where id in (select id from yao_runs
                 where mode in ({mode_slots}) and status in ({status_slots})
                 order by as_of_at desc,id desc limit ?)"""
             with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as db:
                 headers = db.execute(query, (*modes, *statuses, max(1, min(limit, 100)))).fetchall()
             rows = []
-            for run_id, mode, raw, candidate_type, next_day_count, continuation_count in headers:
+            for run_id, mode, raw, candidate_type, candidate_count, nonempty_profiles, next_day_count, continuation_count, opportunity_count, opportunity_research_count in headers:
+                values = json.loads(raw)
                 metadata = dict(zip(('generatedAt', 'as_of', 'cutoff_at', 'scanSlot',
                     'status', 'dataQuality', 'data_quality', 'premarketAssessment',
-                    'primarySelectionMode', 'primaryObjective', 'dailyAssessment'), json.loads(raw)))
-                metadata.update(candidates=[] if candidate_type == 'array' else None,
+                    'primarySelectionMode', 'primaryObjective', 'dailyAssessment'), values[:11]))
+                opportunity_assessment = dict(zip(('version', 'asOf', 'diagnostics', 'policyVersion'), values[11:]))
+                opportunity_assessment['researchRowCount'] = opportunity_research_count or 0
+                metadata.update(candidates=([True] if candidate_count else []) if candidate_type == 'array' else None,
+                    profileCandidates={'nonempty': [True]} if nonempty_profiles else {},
                     nextDayWatchlist=[True] if next_day_count else [],
                     nextDayContinuationWatchlist=[True] if continuation_count else [])
-                rows.append({'run_id': run_id, 'mode': mode, 'result': metadata})
+                rows.append({'run_id': run_id, 'mode': mode, 'result': metadata,
+                             'opportunity_recommendation_count': opportunity_count or 0,
+                             'opportunity_assessment': opportunity_assessment})
             return rows
 
         def get_yao_run(self, run_id):
@@ -74,6 +88,8 @@ def main():
         frozen_display_bytes = display_path.read_bytes()
         if args.expected_recommendations is not None:
             assert expected.get("savedRecommendationCount") == args.expected_recommendations, "Saved research recommendation count is incorrect"
+        if args.expected_opportunities is not None:
+            assert expected.get('opportunityRecommendationCount') == args.expected_opportunities, 'Saved E/M opportunity count is incorrect'
         if args.expected_premarket is not None:
             assert expected.get("premarketCandidateCount") == args.expected_premarket, "Saved opening plan count is incorrect"
             assert expected['adaptive']['candidates'] == [], "Opening plans must not become intraday entries"
@@ -164,6 +180,7 @@ def main():
             "nextDayCandidateCount": len(expected["adaptive"].get("nextDayWatchlist") or []),
             "continuationCandidateCount": len(expected["adaptive"].get("nextDayContinuationWatchlist") or []),
             "savedRecommendationCount": expected.get("savedRecommendationCount"),
+            "opportunityRecommendationCount": expected.get('opportunityRecommendationCount'),
             "premarketCandidateCount": expected.get("premarketCandidateCount"),
             "dailyCandidateCount": expected.get("dailyCandidateCount"),
             "primarySelectionMode": expected['adaptive'].get('primarySelectionMode'),

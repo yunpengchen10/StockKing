@@ -348,7 +348,7 @@ export function GetStockKingLearningState():Promise<Record<string, any>>;
 
 export function GetStockKingPreference(arg1:string):Promise<string>;
 
-export function GetStockKingRecommendationHistory(arg1:string,arg2:string,arg3:string,arg4:boolean):Promise<Record<string, any>>;
+export function GetStockKingRecommendationHistory(arg1:string,arg2:string,arg3:string,arg4:boolean,arg5:string):Promise<Record<string, any>>;
 
 export function GetStockKingRecordQuotes(arg1:Array<string>):Promise<Record<string, any>>;
 

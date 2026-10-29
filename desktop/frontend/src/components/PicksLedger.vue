@@ -5,21 +5,23 @@ import { groupSignals, ledgerPercent, ledgerPrice, ledgerSigned, priceObservatio
 import { withRecordReadTimeout } from '../utils/recordRead.mjs'
 import { learningTimeline, learningTaskLabel } from '../utils/learningStatus.mjs'
 import { entryExecutionSummary, dailyObservationRows, dailyObservationCategory, dailyObservationStatus, settlementHealthSummary } from '../utils/recommendationQuality.mjs'
-import { firstRecommendationEvidence, primaryRecommendationState, primaryAdmissionReasons, isDailySelection } from '../utils/pickLedger.mjs'
+import { shanghaiDate, isOpportunitySelection, recordDisplayPayload, firstRecommendationEvidence, primaryRecommendationState, primaryAdmissionReasons, isDailySelection } from '../utils/pickLedger.mjs'
 
-// A separate, retained instance owns each ledger tab. Activation updates quotes only.
-const props = defineProps({ mode: { type: String, required: true }, active: { type: Boolean, default: true }, refreshToken: { type: Number, default: 0 } })
+// Keep historical filters, but follow the displayed persisted scan in current mode.
+const props = defineProps({ mode: { type: String, required: true }, active: { type: Boolean, default: true }, refreshToken: { type: Number, default: 0 }, displayRunId: { type: String, default: '' }, displayAsOf: { type: String, default: '' }, displayHasOpportunities: { type: Boolean, default: false } })
 defineEmits(['open-chart'])
 const date = ref(''), symbol = ref(''), version = ref(''), includeControls = ref(false)
+const recordsScope = ref('current')
+const currentRecords = computed(() => props.mode === 'records' && recordsScope.value === 'current')
 const loading = ref(false), error = ref(''), payload = ref({ items: [] })
 const visibleGroupCount = ref(30), expandedSignals = ref(new Set())
 const queriedAt = ref(''), reviewLearning = ref({}), learningError = ref('')
 const quotesLoading = ref(false), quotesError = ref(''), quotes = ref({})
 let requestId = 0, disposed = false, initialized = false, quoteTimer = null, quoteUpdateGeneration = 0
-const groups = computed(() => groupSignals(payload.value, { includeControls: includeControls.value }))
+const groups = computed(() => groupSignals(recordDisplayPayload(payload.value, { scope: currentRecords.value ? 'current' : 'history', runId: props.displayRunId, opportunityOnly: props.displayHasOpportunities }), { includeControls: !currentRecords.value && includeControls.value }))
 const displayGroups = computed(() => groups.value.slice(0, visibleGroupCount.value).map(group => ({
   ...group,
-  signals: group.signals.map(signal => ({ ...signal, daily: isDailySelection(signal), nextDay: isNextDaySelection(signal) ? nextDaySignalOf(signal) : null, priceComparison: signalPriceComparison(signal, quotes.value[recordQuoteCode(signal.code)]) })),
+  signals: group.signals.map(signal => ({ ...signal, opportunity: isOpportunitySelection(signal) ? candidate(signal).opportunity || {} : null, daily: isDailySelection(signal), nextDay: isNextDaySelection(signal) ? nextDaySignalOf(signal) : null, priceComparison: signalPriceComparison(signal, quotes.value[recordQuoteCode(signal.code)]) })),
 })))
 const quoteLoader = createRecordQuoteLoader({
   fetchQuotes: GetStockKingRecordQuotes,
@@ -30,7 +32,7 @@ const nextDayReviews = computed(() => visibleReviews(payload.value.nextDayReview
 const nextDaySummaryGroups = computed(() => (payload.value.nextDayReview?.summary?.groups || []).filter(group => includeControls.value || group.selected === true))
 const dailyReview = computed(() => payload.value.dailyObservationReview)
 const dailyRows = computed(() => dailyObservationRows(dailyReview.value, includeControls.value))
-const dailyGroups = computed(() => (dailyReview.value?.groups || []).filter(group => includeControls.value || group.first_category !== 'unselected_control'))
+const dailyGroups = computed(() => (dailyReview.value?.groups || []).filter(group => includeControls.value || !['unselected_control', 'opportunity_control'].includes(group.first_category)))
 const reviewSummaries = computed(() => [
   { label: '次日价格模式', ...reviewProgress(nextDayReviews.value) },
   { label: '交易模拟', ...reviewProgress(reviews.value) },
@@ -99,7 +101,7 @@ async function refresh() {
   stopQuoteUpdates()
   loading.value = true; error.value = ''
   try {
-    const args = [date.value.trim(), symbol.value.trim(), version.value.trim()]
+    const args = currentRecords.value ? [shanghaiDate(props.displayAsOf), '', ''] : [date.value.trim(), symbol.value.trim(), version.value.trim()]
     let result
     if (props.mode === 'reviews') {
       const [reviewResult, learningResult] = await Promise.allSettled([
@@ -111,7 +113,8 @@ async function refresh() {
       }
       if (reviewResult.status === 'rejected') throw reviewResult.reason
       result = reviewResult.value
-    } else result = await readRecord(props.mode === 'learning' ? GetStockKingLearningState() : GetStockKingRecommendationHistory(...args, includeControls.value))
+    } else if (currentRecords.value && !props.displayRunId) result = { items: [] }
+    else result = await readRecord(props.mode === 'learning' ? GetStockKingLearningState() : GetStockKingRecommendationHistory(...args, !currentRecords.value && includeControls.value, currentRecords.value ? props.displayRunId : ''))
     if (!disposed && current === requestId) { payload.value = result || { items: [] }; queriedAt.value = new Date().toISOString(); visibleGroupCount.value = 30 }
   } catch (failure) { if (!disposed && current === requestId) error.value = failure?.message || String(failure) }
   finally { if (!disposed && current === requestId) loading.value = false }
@@ -119,14 +122,21 @@ async function refresh() {
 }
 watch(() => props.active, active => {
   if (!active) { stopQuoteUpdates(); return }
-  if (!initialized) void refresh()
+  if (!initialized || currentRecords.value) void refresh()
   else void updateQuotes()
 }, { immediate: true })
 watch(includeControls, () => { if (props.mode === 'records' && initialized) void refresh(); else void refreshQuotes() })
+watch(recordsScope, () => { if (props.mode === 'records') void refresh() })
+watch(() => props.displayRunId, () => {
+  if (!currentRecords.value) return
+  // Invalidate old requests while a retained tab is hidden, too.
+  requestId++; stopQuoteUpdates(); payload.value = { items: [] }; loading.value = false; initialized = false
+  if (props.active) void refresh()
+})
 watch(() => props.refreshToken, () => {
   if (props.mode !== 'records') return
-  date.value = ''; symbol.value = ''; version.value = ''
-  void refresh()
+  if (recordsScope.value !== 'current') recordsScope.value = 'current'
+  else void refresh()
 })
 onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteLoader.dispose() })
 </script>
@@ -134,20 +144,22 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
 <template>
   <section class="ledger">
     <form class="ledger-filters" @submit.prevent="refresh">
-      <template v-if="mode !== 'learning'">
+      <label v-if="mode === 'records'">显示范围<select v-model="recordsScope" aria-label="记录显示范围"><option value="current">与精选同步 · 当前查看轮次</option><option value="history">历史全部记录</option></select></label>
+      <template v-if="mode !== 'learning' && !currentRecords">
         <label>信号日期<input v-model="date" type="date" aria-label="信号日期" /></label>
         <label>股票代码<n-input v-model:value="symbol" clearable placeholder="全部股票" style="width:145px" /></label>
         <label>算法版本<n-input v-model:value="version" clearable placeholder="全部版本" style="width:205px" /></label>
       </template>
       <n-button attr-type="submit" secondary :loading="loading">{{ mode === 'learning' ? '刷新学习状态' : '查询记录' }}</n-button>
       <n-button v-if="mode === 'records'" attr-type="button" secondary :loading="quotesLoading" :disabled="loading || !groups.length" @click="refreshQuotes">刷新报价</n-button>
-      <n-checkbox v-if="mode !== 'learning'" v-model:checked="includeControls">包括未入选对照样本</n-checkbox>
+      <n-checkbox v-if="mode !== 'learning' && !currentRecords" v-model:checked="includeControls">包括未入选对照样本</n-checkbox>
     </form>
     <n-alert v-if="error" type="error" :show-icon="false">读取失败：{{ error }}。请重试；当前内容未更新。</n-alert>
     <n-spin :show="loading">
       <template v-if="mode === 'records'">
-        <p class="ledger-note">默认显示已落盘的主推荐、失效记录与两类研究观察；按信号编号保留当时评分、目标日和队列。首次主推荐时间与参考价沿用已保存字段，不随刷新重置；研究观察不代表通过准入。</p>
-        <p class="ledger-note">记录、筛选和展开位置保留，点击“查询记录”或切换对照样本时读取名单。可见时每30秒更新报价；参考盈亏按标注行情时间比较，未计费用，不会重新选股。</p>
+        <p v-if="currentRecords" class="ledger-note">与本地精选使用同一轮已保存名单{{ displayHasOpportunities ? '，当前显示机会精选' : '' }}。生成 {{ time(displayAsOf) }} · 扫描编号 {{ displayRunId || '未取得' }}。新扫描完成后自动同步；选择“历史全部记录”可查看历次推荐与失效记录。</p>
+        <p v-else class="ledger-note">历史记录保留机会研究、模型候选、失效记录与研究观察；筛选和展开位置保留。点击“查询记录”或切换对照样本时重新读取。</p>
+        <p class="ledger-note">首次记录的时间与参考价沿用已保存字段。可见时每30秒更新报价；参考盈亏按标注行情时间比较，未计费用，不会重新选股。机会研究不代表模型已验证或实际成交。</p>
         <p v-if="quotesLoading" class="ledger-note" role="status">正在取得最新报价，已载入的历史记录可继续查看…</p>
         <n-alert v-if="quotesError" type="warning" :show-icon="false" class="quote-alert">报价提示：{{ quotesError }}</n-alert>
         <div v-if="groups.length" class="ledger-groups">
@@ -155,18 +167,19 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
             <header><div><b>{{ group.name }}</b><code>{{ group.code }}</code><span>{{ group.date }} · {{ group.signals.length }} 轮信号</span></div><n-button size="small" secondary @click="$emit('open-chart', group)">图表</n-button></header>
             <small>算法 {{ group.modelVersion || '原记录未保存' }}</small>
             <details v-for="signal in group.signals" :key="signalKey(signal)" :open="expandedSignals.has(signalKey(signal))" class="signal-row" @toggle="toggleSignal(signal, $event)">
-              <summary><span>{{ time(signal.decisionAt) }} · {{ signal.slot || '即时' }}</span><n-tag size="small" :type="signal.daily || signal.selected ? 'info' : signal.nextDay ? 'warning' : 'default'">{{ signalSelectionLabel(signal) }}</n-tag><n-tag v-if="signal.selected && signal.nextDay" size="small" type="warning">{{ nextDayQueueLabel(signal.nextDay) }}</n-tag><span>{{ signal.official ? '定时扫描' : '手动观察' }}</span><span>{{ statusLabel(signal.reviewStatus) }}</span><span v-if="signal.nextDay">目标 {{ signal.nextDay.targetSession || '未记录' }} · 冲板观察分 {{ researchScore(signal.nextDay.score) }}</span>
-                <span class="signal-price-change"><span>{{ signal.daily ? '日线参考' : signal.nextDay ? '观察参考' : signal.selected ? '精选参考' : '对照参考' }} ¥{{ ledgerPrice(signal.priceComparison.baseline) }} → 最新 ¥{{ ledgerPrice(signal.priceComparison.latest) }}</span><b v-if="signal.priceComparison.available" :class="signal.priceComparison.direction">参考盈亏 {{ ledgerSigned(signal.priceComparison.delta) }} 元/股（{{ ledgerSigned(signal.priceComparison.percent * 100) }}%）</b><span v-else class="comparison-unavailable">参考盈亏 — · {{ signal.priceComparison.reason }}</span><small>行情时间 {{ time(signal.priceComparison.sourceTime) }}<template v-if="signal.priceComparison.source"> · {{ signal.priceComparison.source }}</template></small></span>
+              <summary><span>{{ time(signal.decisionAt) }} · {{ signal.slot || '即时' }}</span><n-tag size="small" :type="signal.opportunity || signal.daily || signal.selected ? 'info' : signal.nextDay ? 'warning' : 'default'">{{ signalSelectionLabel(signal) }}</n-tag><n-tag v-if="signal.selected && signal.nextDay" size="small" type="warning">{{ nextDayQueueLabel(signal.nextDay) }}</n-tag><span>{{ signal.official ? '定时扫描' : '手动观察' }}</span><span>{{ signal.opportunity ? '机会研究记录 · 未验证成交收益' : statusLabel(signal.reviewStatus) }}</span><span v-if="signal.nextDay">目标 {{ signal.nextDay.targetSession || '未记录' }} · 冲板观察分 {{ researchScore(signal.nextDay.score) }}</span>
+                <span class="signal-price-change"><span>{{ signal.opportunity ? '机会参考' : signal.daily ? '日线参考' : signal.nextDay ? '观察参考' : signal.selected ? '精选参考' : '对照参考' }} ¥{{ ledgerPrice(signal.priceComparison.baseline) }} → 最新 ¥{{ ledgerPrice(signal.priceComparison.latest) }}</span><b v-if="signal.priceComparison.available" :class="signal.priceComparison.direction">参考盈亏 {{ ledgerSigned(signal.priceComparison.delta) }} 元/股（{{ ledgerSigned(signal.priceComparison.percent * 100) }}%）</b><span v-else class="comparison-unavailable">参考盈亏 — · {{ signal.priceComparison.reason }}</span><small>行情时间 {{ time(signal.priceComparison.sourceTime) }}<template v-if="signal.priceComparison.source"> · {{ signal.priceComparison.source }}</template></small></span>
               </summary>
               <template v-if="expandedSignals.has(signalKey(signal))">
-              <dl><dt>信号编号</dt><dd>{{ signal.signalId || signal.signal_id || '未记录' }}</dd><dt>信号行情时间</dt><dd>{{ time(signal.sourceTime) }}</dd><dt>信号参考价</dt><dd>{{ ledgerPrice(signal.signalPrice) }}</dd><dt>最新报价</dt><dd>{{ ledgerPrice(signal.priceComparison.latest) }} · 行情时间 {{ time(signal.priceComparison.sourceTime) }}</dd><dt>每股参考盈亏</dt><dd v-if="signal.priceComparison.available" :class="signal.priceComparison.direction">{{ ledgerSigned(signal.priceComparison.delta) }} 元/股 · {{ ledgerSigned(signal.priceComparison.percent * 100) }}%</dd><dd v-else>— · {{ signal.priceComparison.reason }}</dd><template v-if="!signal.daily"><dt>首次可成交价</dt><dd>{{ ledgerPrice(signal.firstTradablePrice) }}</dd></template>
-                <template v-if="signal.daily"><dt>日线推荐状态</dt><dd>{{ primaryRecommendationState(candidate(signal)) }}</dd><dt>首次日线推荐时间</dt><dd>{{ time(firstRecommendationEvidence(candidate(signal)).time) }}</dd><dt>首次日线参考价</dt><dd>{{ ledgerPrice(firstRecommendationEvidence(candidate(signal)).price) }}</dd><dt>日K基准</dt><dd>{{ candidate(signal).baselineAsOf || '未记录' }} · {{ candidate(signal).baselineSource || '来源未记录' }}</dd><dt>观察目标</dt><dd>下一交易日（T+1）</dd><dt>证据缺口</dt><dd>{{ text(candidate(signal).dataGaps) }}</dd></template>
+              <dl><dt>信号编号</dt><dd>{{ signal.signalId || signal.signal_id || '未记录' }}</dd><dt>信号行情时间</dt><dd>{{ time(signal.sourceTime) }}</dd><dt>信号参考价</dt><dd>{{ ledgerPrice(signal.signalPrice) }}</dd><dt>最新报价</dt><dd>{{ ledgerPrice(signal.priceComparison.latest) }} · 行情时间 {{ time(signal.priceComparison.sourceTime) }}</dd><dt>每股参考盈亏</dt><dd v-if="signal.priceComparison.available" :class="signal.priceComparison.direction">{{ ledgerSigned(signal.priceComparison.delta) }} 元/股 · {{ ledgerSigned(signal.priceComparison.percent * 100) }}%</dd><dd v-else>— · {{ signal.priceComparison.reason }}</dd><template v-if="!signal.daily && !signal.opportunity"><dt>首次可成交价</dt><dd>{{ ledgerPrice(signal.firstTradablePrice) }}</dd></template>
+                <template v-if="signal.opportunity"><dt>研究等级</dt><dd>{{ signal.opportunity.grade || '未记录' }}</dd><dt>首次发现时间</dt><dd>{{ time(signal.opportunity.firstDetectionAt) }}</dd><dt>首次发现参考价</dt><dd>{{ ledgerPrice(signal.opportunity.firstDetectionPrice) }}</dd><dt>支持依据</dt><dd>{{ text(signal.opportunity.supports) }}</dd><dt>反向证据</dt><dd>{{ text(signal.opportunity.counterEvidence) }}</dd><dt>待确认项</dt><dd>{{ text(signal.opportunity.missing) }}</dd><dt>失效条件</dt><dd>{{ text(signal.opportunity.invalidation) }}</dd></template>
+                <template v-else-if="signal.daily"><dt>日线推荐状态</dt><dd>{{ primaryRecommendationState(candidate(signal)) }}</dd><dt>首次日线推荐时间</dt><dd>{{ time(firstRecommendationEvidence(candidate(signal)).time) }}</dd><dt>首次日线参考价</dt><dd>{{ ledgerPrice(firstRecommendationEvidence(candidate(signal)).price) }}</dd><dt>日K基准</dt><dd>{{ candidate(signal).baselineAsOf || '未记录' }} · {{ candidate(signal).baselineSource || '来源未记录' }}</dd><dt>观察目标</dt><dd>下一交易日（T+1）</dd><dt>证据缺口</dt><dd>{{ text(candidate(signal).dataGaps) }}</dd></template>
                 <template v-else-if="candidate(signal).primaryAdmission || candidate(signal).currentSignalState"><dt>主推荐状态</dt><dd>{{ primaryRecommendationState(candidate(signal)) }}</dd><dt>首次主推荐时间</dt><dd>{{ time(firstRecommendationEvidence(candidate(signal)).time) }}</dd><dt>首次主推荐参考价</dt><dd>{{ ledgerPrice(firstRecommendationEvidence(candidate(signal)).price) }}</dd><dt>最新准入核验</dt><dd>{{ text(primaryAdmissionReasons([...(candidate(signal).primaryAdmission?.missingReasons || []), ...(candidate(signal).primaryAdmission?.reasons || [])])) }}</dd></template>
                 <template v-if="signal.nextDay"><dt>观察队列</dt><dd>{{ nextDayQueueLabel(signal.nextDay) }} · 扫描时{{ nextDayTouchLabel(signal.nextDay) }}</dd><dt>目标交易日</dt><dd>{{ signal.nextDay.targetSession || '未记录' }}</dd><dt>冲板观察分</dt><dd>{{ researchScore(signal.nextDay.score) }} · {{ signal.nextDay.scoreMeaning || '研究排序，不是涨停概率' }}</dd><dt>观察规则版本</dt><dd>{{ signal.nextDay.version || '未记录' }}</dd><dt>观察依据</dt><dd>{{ text(signal.nextDay.reasons) }}</dd><dt>待确认缺口</dt><dd>{{ text(signal.nextDay.gaps) }}</dd></template>
-                <template v-else><dt>当轮排序</dt><dd>{{ signal.rank ?? candidate(signal).rank ?? '未记录' }}</dd><dt>当轮排序版本</dt><dd>{{ (signal.daily ? candidate(signal).dailySignal?.version : candidate(signal).learningRankVersion) || '原记录未保存' }}</dd><dt>入选原因</dt><dd>{{ text(signal.reason || candidate(signal).selectionReasons) }}</dd></template>
+                <template v-else-if="!signal.opportunity"><dt>当轮排序</dt><dd>{{ signal.rank ?? candidate(signal).rank ?? '未记录' }}</dd><dt>当轮排序版本</dt><dd>{{ (signal.daily ? candidate(signal).dailySignal?.version : candidate(signal).learningRankVersion) || '原记录未保存' }}</dd><dt>入选原因</dt><dd>{{ text(signal.reason || candidate(signal).selectionReasons) }}</dd></template>
                 <dt>风险</dt><dd>{{ text(candidate(signal).riskReasons || candidate(signal).risks || signal.risks) }}</dd><dt>触发条件</dt><dd>{{ text(signal.nextDay?.trigger || candidate(signal).triggerConditions || candidate(signal).entryPlan?.trigger) }}</dd><dt>失效条件</dt><dd>{{ text(signal.nextDay?.invalidation || candidate(signal).invalidationConditions || candidate(signal).entryPlan?.invalidations) }}</dd></dl>
               <p v-if="candidate(signal).entryExecution" class="ledger-note">{{ entryExecutionSummary(candidate(signal).entryExecution).label }}。{{ entryExecutionSummary(candidate(signal).entryExecution).detail }} {{ entryExecutionSummary(candidate(signal).entryExecution).meaning }}</p>
-              <div v-if="!signal.daily && !signal.nextDay && Object.keys(factors(signal)).length" class="factor-list"><span v-for="(value, key) in factors(signal)" :key="key">{{ key }} <b>{{ value == null ? '未取得' : Number(value).toFixed(1) }}</b></span></div>
+              <div v-if="!signal.opportunity && !signal.daily && !signal.nextDay && Object.keys(factors(signal)).length" class="factor-list"><span v-for="(value, key) in factors(signal)" :key="key">{{ key }} <b>{{ value == null ? '未取得' : Number(value).toFixed(1) }}</b></span></div>
               </template>
             </details>
           </article>
@@ -224,5 +237,5 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
 <style scoped>
 .review-learning{margin-bottom:12px}.review-learning p{margin:6px 0 0}.review-progress{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.review-progress article{padding:12px 14px;border:1px solid var(--sk-border);border-radius:8px;background:var(--sk-surface);font-size:12px;line-height:1.8}.review-progress p{margin:5px 0 0;color:var(--sk-text-muted)}
 .quote-alert{margin-bottom:12px}.signal-price-change{display:flex;flex-basis:100%;align-items:baseline;gap:7px 18px;flex-wrap:wrap;padding:8px 10px;background:var(--sk-surface-2);border-radius:5px;font-variant-numeric:tabular-nums}.signal-price-change>b{font-weight:600}.signal-price-change>small{flex-basis:100%;font-size:10px}.comparison-unavailable{color:var(--sk-text-muted)}.signal-row .up{color:var(--sk-up,#d03050)}.signal-row .down{color:var(--sk-down,#18a058)}.signal-row .flat{color:var(--sk-text)}
-.ledger{padding-top:8px}.ledger-filters{display:flex;align-items:flex-end;flex-wrap:wrap;gap:12px;margin:0 0 16px}.ledger-filters label{display:flex;flex-direction:column;gap:6px;font-size:11px;color:var(--sk-text-muted)}.ledger-filters input[type=date]{box-sizing:border-box;height:34px;padding:5px 10px;border:1px solid var(--sk-border);border-radius:4px;background:var(--sk-surface);color:var(--sk-text);font:inherit;color-scheme:dark light}.ledger-note{font-size:12px;line-height:1.7;color:var(--sk-text-muted)}.ledger-groups{display:flex;flex-direction:column;gap:12px}.ledger-group{border:1px solid var(--sk-border);border-radius:9px;background:var(--sk-surface);padding:14px}.ledger-group header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}.ledger-group header>div{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}.ledger-group small,.ledger-group header span,.ledger-group code{font-size:11px;color:var(--sk-text-muted)}.signal-row{margin-top:12px;border-top:1px solid var(--sk-border);padding-top:12px;font-size:12px}.signal-row summary{cursor:pointer;display:flex;align-items:center;gap:12px;flex-wrap:wrap}.signal-row dl,.learning-gates{display:grid;grid-template-columns:110px 1fr;gap:7px 12px;line-height:1.7;overflow-wrap:anywhere}.signal-row dt,.learning-gates dt{color:var(--sk-text-muted)}dd{margin:0}.factor-list{display:flex;flex-wrap:wrap;gap:6px 14px;background:var(--sk-surface-2);padding:10px;border-radius:5px}.factor-list span{color:var(--sk-text-muted)}.factor-list b{color:var(--sk-text);font-variant-numeric:tabular-nums;font-weight:500}.review-table-wrap{overflow:auto}.review-table{border-collapse:collapse;width:100%;font-size:12px;line-height:1.7}.review-table th,.review-table td{padding:12px 10px;text-align:right;border-bottom:1px solid var(--sk-border);white-space:nowrap;font-variant-numeric:tabular-nums}.review-table th{font-size:11px;color:var(--sk-text-muted);font-weight:500}.review-table th:first-child,.review-table td:first-child,.review-table td:last-child{text-align:left}.review-table small{display:block;color:var(--sk-text-muted);font-size:10px}.review-table button{border:none;padding:0;background:transparent;color:var(--sk-accent);font:inherit;cursor:pointer}.review-table details{max-width:240px;white-space:normal;overflow-wrap:anywhere}.review-table details summary{cursor:pointer;color:var(--sk-accent)}.review-table code{font-size:10px}.learning-header{display:flex;justify-content:space-between;gap:22px;margin:20px 0}.learning-header>div{display:flex;flex-direction:column;gap:6px}.learning-header h3,.learning-header p{margin:0}.learning-header span,.learning-header small{font-size:11px;color:var(--sk-text-muted)}.learning-header p{font-size:12px}.learning-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:20px}.learning-metrics article{display:flex;flex-direction:column;gap:12px;padding:18px;background:var(--sk-surface);border:1px solid var(--sk-border);border-radius:9px}.learning-metrics span,.learning-metrics small{font-size:12px;color:var(--sk-text-muted);font-weight:400}.learning-metrics strong{font-size:28px;font-weight:500;font-variant-numeric:tabular-nums}.learning-gates{font-size:12px;grid-template-columns:minmax(150px,1fr) 2fr;border:1px solid var(--sk-border);padding:16px;border-radius:8px}.ledger .n-empty{padding:48px 0}@media(max-width:800px){.learning-metrics{grid-template-columns:1fr}.learning-header{flex-direction:column}.signal-row dl{grid-template-columns:90px 1fr}.ledger-filters{align-items:flex-start}.signal-row summary{gap:7px}}
+.ledger{padding-top:8px}.ledger-filters{display:flex;align-items:flex-end;flex-wrap:wrap;gap:12px;margin:0 0 16px}.ledger-filters label{display:flex;flex-direction:column;gap:6px;font-size:11px;color:var(--sk-text-muted)}.ledger-filters input[type=date],.ledger-filters select{box-sizing:border-box;height:34px;padding:5px 10px;border:1px solid var(--sk-border);border-radius:4px;background:var(--sk-surface);color:var(--sk-text);font:inherit;color-scheme:dark light}.ledger-note{font-size:12px;line-height:1.7;color:var(--sk-text-muted)}.ledger-groups{display:flex;flex-direction:column;gap:12px}.ledger-group{border:1px solid var(--sk-border);border-radius:9px;background:var(--sk-surface);padding:14px}.ledger-group header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}.ledger-group header>div{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}.ledger-group small,.ledger-group header span,.ledger-group code{font-size:11px;color:var(--sk-text-muted)}.signal-row{margin-top:12px;border-top:1px solid var(--sk-border);padding-top:12px;font-size:12px}.signal-row summary{cursor:pointer;display:flex;align-items:center;gap:12px;flex-wrap:wrap}.signal-row dl,.learning-gates{display:grid;grid-template-columns:110px 1fr;gap:7px 12px;line-height:1.7;overflow-wrap:anywhere}.signal-row dt,.learning-gates dt{color:var(--sk-text-muted)}dd{margin:0}.factor-list{display:flex;flex-wrap:wrap;gap:6px 14px;background:var(--sk-surface-2);padding:10px;border-radius:5px}.factor-list span{color:var(--sk-text-muted)}.factor-list b{color:var(--sk-text);font-variant-numeric:tabular-nums;font-weight:500}.review-table-wrap{overflow:auto}.review-table{border-collapse:collapse;width:100%;font-size:12px;line-height:1.7}.review-table th,.review-table td{padding:12px 10px;text-align:right;border-bottom:1px solid var(--sk-border);white-space:nowrap;font-variant-numeric:tabular-nums}.review-table th{font-size:11px;color:var(--sk-text-muted);font-weight:500}.review-table th:first-child,.review-table td:first-child,.review-table td:last-child{text-align:left}.review-table small{display:block;color:var(--sk-text-muted);font-size:10px}.review-table button{border:none;padding:0;background:transparent;color:var(--sk-accent);font:inherit;cursor:pointer}.review-table details{max-width:240px;white-space:normal;overflow-wrap:anywhere}.review-table details summary{cursor:pointer;color:var(--sk-accent)}.review-table code{font-size:10px}.learning-header{display:flex;justify-content:space-between;gap:22px;margin:20px 0}.learning-header>div{display:flex;flex-direction:column;gap:6px}.learning-header h3,.learning-header p{margin:0}.learning-header span,.learning-header small{font-size:11px;color:var(--sk-text-muted)}.learning-header p{font-size:12px}.learning-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:20px}.learning-metrics article{display:flex;flex-direction:column;gap:12px;padding:18px;background:var(--sk-surface);border:1px solid var(--sk-border);border-radius:9px}.learning-metrics span,.learning-metrics small{font-size:12px;color:var(--sk-text-muted);font-weight:400}.learning-metrics strong{font-size:28px;font-weight:500;font-variant-numeric:tabular-nums}.learning-gates{font-size:12px;grid-template-columns:minmax(150px,1fr) 2fr;border:1px solid var(--sk-border);padding:16px;border-radius:8px}.ledger .n-empty{padding:48px 0}@media(max-width:800px){.learning-metrics{grid-template-columns:1fr}.learning-header{flex-direction:column}.signal-row dl{grid-template-columns:90px 1fr}.ledger-filters{align-items:flex-start}.signal-row summary{gap:7px}}
 </style>

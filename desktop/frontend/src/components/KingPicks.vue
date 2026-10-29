@@ -13,6 +13,7 @@ import { createPicksRefreshController, readDisplayedPicks, saveDisplayedPicks, s
 import { withRecordReadTimeout } from '../utils/recordRead.mjs'
 import { nextDayQueueLabel, nextDayTouchLabel, savedRecommendationSummary, primaryRecommendationPicks, primaryRecommendationState, primaryAdmissionReasons, marketBreadthSummary, firstRecommendationEvidence, isDailyPrimaryRun, dailyObservationPicks } from '../utils/pickLedger.mjs'
 import { premarketDisplayState, premarketText, premarketQuoteState, premarketPlanLabel } from '../utils/premarket.mjs'
+import { opportunityDisplay, opportunityRecommendations } from '../utils/opportunityDisplay.mjs'
 
 const router = useRouter()
 const message = useMessage()
@@ -90,8 +91,16 @@ const tierData = computed(() => {
 const picks = computed(() => tierData.value?.[activeBoard.value] || [])
 const shortfall = computed(() => Number(tierData.value?.shortfall?.[activeBoard.value] || 0))
 const adaptive = computed(() => result.value?.adaptive || { candidates: [], changes: {}, calibration: {} })
+const recordsRunId = computed(() => adaptive.value.run_id || adaptive.value.runId || result.value.displayRunId || '')
 const premarketNow = ref(Date.now())
 let premarketTimer = null
+const opportunities = computed(() => opportunityDisplay(adaptive.value.opportunityChannels, premarketNow.value, viewingHistory.value))
+const showAllOpportunityObservations = ref(false)
+const visibleOpportunityObservations = computed(() => showAllOpportunityObservations.value
+  ? opportunities.value.observations : opportunities.value.observations.slice(0, 10))
+function toggleOpportunityObservations() { showAllOpportunityObservations.value = !showAllOpportunityObservations.value }
+watch(() => adaptive.value.run_id || adaptive.value.runId || adaptive.value.generatedAt || result.value.generatedAt,
+  () => { showAllOpportunityObservations.value = false })
 const premarketAssessment = computed(() => adaptive.value.premarketAssessment)
 const premarketView = computed(() => premarketDisplayState(premarketAssessment.value, premarketNow.value, viewingHistory.value))
 const premarketPicks = computed(() => Array.isArray(adaptive.value.premarketCandidates) ? adaptive.value.premarketCandidates : [])
@@ -112,9 +121,9 @@ function updatePremarketClock() {
   if (premarketTimer !== null) clearTimeout(premarketTimer)
   premarketTimer = null
   premarketNow.value = Date.now()
-  if (!disposed && pageActive.value && premarketView.value.current) premarketTimer = setTimeout(updatePremarketClock, 1000)
+  if (!disposed && pageActive.value && (premarketView.value.current || opportunities.value.cards.some(card => card.current))) premarketTimer = setTimeout(updatePremarketClock, 1000)
 }
-watch([premarketAssessment, viewingHistory], updatePremarketClock)
+watch([premarketAssessment, () => adaptive.value.opportunityChannels, viewingHistory], updatePremarketClock)
 const snapshotIsOld = computed(() => {
   const raw = adaptive.value.generatedAt || result.value.generatedAt
   const stamp = raw ? new Date(raw) : null
@@ -162,8 +171,8 @@ const dailyDisplayMessage = computed(() => precisionProfile.value === 'regular' 
 const primaryContractKnown = computed(() => isDailyPrimary.value || hasDailyObservation.value || Boolean(adaptive.value.recommendationPolicy))
 const primaryReadiness = computed(() => primaryReadinessSummary(viewingHistory.value ? adaptive.value.primaryReadiness : result.value.currentPrimaryReadiness || adaptive.value.currentPrimaryReadiness || adaptive.value.primaryReadiness, adaptive.value.coldStartResearch))
 const primaryPicksTitle = computed(() => isDailyPrimary.value ? `日线条件推荐 · ${adaptivePicks.value.length} 只`
-  : primaryReadiness.value?.modelPending && !adaptivePicks.value.length ? '主推荐 · 等待模型验证'
-  : primaryContractKnown.value ? `主推荐 · ${adaptivePicks.value.length} 只通过准入` : `旧版候选 · ${adaptivePicks.value.length} 只`)
+  : primaryReadiness.value?.modelPending && !adaptivePicks.value.length ? '模型验证精选 · 等待模型验证'
+  : primaryContractKnown.value ? `模型验证精选 · ${adaptivePicks.value.length} 只通过准入` : `旧版候选 · ${adaptivePicks.value.length} 只`)
 const primaryObjective = computed(() => isDailyPrimary.value
   ? '日线评估目标：基于已完成日K、当日报价及披露风险筛选，观察下一交易日（T+1）的价格结构与合法退出条件。'
   : hasDailyObservation.value
@@ -438,6 +447,7 @@ function returnToDisplayed() {
 
 function historyResult(item) { return item?.result || {} }
 function historyCandidates(item) { const run = historyResult(item); return isDailyPrimaryRun(run) ? primaryRecommendationPicks(run) : run?.candidates || [] }
+function historyOpportunities(item) { return opportunityRecommendations(historyResult(item).opportunityChannels) }
 function historyPremarketCandidates(item) { return historyResult(item)?.premarketCandidates || [] }
 function historyNextDayCandidates(item) { return historyResult(item)?.nextDayWatchlist || [] }
 function historyContinuationCandidates(item) { return historyResult(item)?.nextDayContinuationWatchlist || [] }
@@ -456,6 +466,7 @@ function historySlotLabel(item) {
 }
 function historyStatusLabel(item) {
   const status = historyResult(item).status || item?.status || ''
+  if (historyOpportunities(item).length && isRestorableSnapshot(historyResult(item))) return '机会研究已保存'
   if (historyResult(item).premarketAssessment && isRestorableSnapshot(historyResult(item))) return '条件预案已保存'
   return { unavailable: '扫描未完成', failed: '扫描失败', expired: '时段已过期', missed_slot: '已记录遗漏', not_due: '未到执行时点', already_claimed: '本轮已领取', cancelled: '已取消', retired_slot: '旧时点已停用', skipped_non_trading_day: '非交易日已跳过', completed_observations: '观察结果', no_candidates_with_coverage_limits: '未形成候选', audit_only: '已记录' }[status] || (String(status).startsWith('skipped') ? '已跳过' : status)
 }
@@ -513,7 +524,7 @@ function openKline(pick) {
   router.push({ name: 'klineAnalysis', query: { code: codeOf(pick), name: nameOf(pick) } })
 }
 function openRecommendationRecords() {
-  // This is an explicit query action; ordinary tab/route returns remain frozen.
+  // Explicitly return to the same persisted scan currently shown in picks.
   recordsRefreshToken.value++
   viewMode.value = 'records'
 }
@@ -604,7 +615,7 @@ onDeactivated(() => {
     <section v-if="viewMode === 'adaptive' && restoring && !viewingHistory" class="picks-loading" role="status" aria-live="polite"><n-spin size="small" /><span>正在读取最新已完成的推荐…</span></section>
     <section v-if="!restoring || viewingHistory" v-show="viewMode === 'adaptive'">
       <div v-if="result.adaptive" class="adaptive-summary scan-list-summary" aria-label="本轮名单概览">
-        <div><b>本轮名单</b><span v-if="premarketView.current">集合竞价 / 开盘预案 {{ premarketPicks.length }} 只</span><span v-else>{{ isDailyPrimary ? '日线条件推荐' : primaryContractKnown ? '主推荐' : '旧版候选' }} {{ adaptivePicks.length }} 只</span><span v-if="hasDailyObservation">日线观察 {{ dailyPicks.length }} 只</span><span>研究观察 {{ nextDayWatchlist.length + nextDayContinuationWatchlist.length }} 只（潜伏 {{ nextDayWatchlist.length }} / 延续 {{ nextDayContinuationWatchlist.length }}）</span></div>
+        <div><b>本轮名单</b><span v-if="opportunities.available">机会精选 {{ opportunities.cards.length }} 只</span><span v-if="premarketView.current">集合竞价 / 开盘预案 {{ premarketPicks.length }} 只</span><span v-else>{{ isDailyPrimary ? '日线条件推荐' : primaryContractKnown ? opportunities.available ? '模型验证精选' : '主推荐' : '旧版候选' }} {{ adaptivePicks.length }} 只</span><span v-if="hasDailyObservation">日线观察 {{ dailyPicks.length }} 只</span><span>研究观察 {{ nextDayWatchlist.length + nextDayContinuationWatchlist.length }} 只（潜伏 {{ nextDayWatchlist.length }} / 延续 {{ nextDayContinuationWatchlist.length }}）</span></div>
         <small>本轮生成 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small>
       </div>
       <section v-if="premarketView.available" class="premarket-plans" :class="{ 'premarket-historical': premarketView.historical }">
@@ -640,6 +651,36 @@ onDeactivated(() => {
         </div>
         <div v-else class="primary-empty" role="status"><p>{{ premarketAssessment.message || '本轮没有满足昨夜趋势、日线时效与风险条件的预案候选。' }}</p><p>本时段不要求当日分钟信号；候选为空时请查看日线覆盖与风险检查结果。</p></div>
         <p class="premarket-footnote">预案截止 09:35（北京时间）。A股 T+1 持有风险仍适用，支撑和压力不保证成交或收益。</p>
+      </section>
+      <section v-if="opportunities.available" class="opportunity-section" aria-label="机会精选">
+        <div class="adaptive-summary"><div><b>机会精选 · 早期启动 / 主升确认</b><n-tag size="small" type="info" :bordered="false">{{ opportunities.cards.length }} 只 · 独立研究推荐</n-tag><small>本轮 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small></div><n-button size="small" secondary @click="openRecommendationRecords">查看本轮推荐记录</n-button></div>
+        <p class="opportunity-intro">E 关注正在发生的状态跃迁；M 关注已经确认的主升或二波。VWAP、回踩与板块同步用于确认和升级，未确认项逐只保留。研究等级与排序分不是胜率。</p>
+        <div v-if="opportunities.cards.length" class="pick-grid opportunity-grid">
+          <n-card v-for="(card, index) in opportunities.cards" :key="`opportunity-${codeOf(card.pick)}`" size="small" :bordered="false" class="pick-card opportunity-card" :class="{ 'opportunity-historical': !card.current }">
+            <template #header><div class="pick-title"><b>{{ index + 1 }}</b><strong>{{ nameOf(card.pick) }}</strong><code>{{ codeOf(card.pick) }}</code><n-tag size="small" :bordered="false" :type="card.channel === 'E' ? 'info' : 'success'">{{ card.grade }} · {{ card.channelLabel }}</n-tag></div></template>
+            <div class="pick-body">
+              <div class="pick-quote"><strong>{{ card.price === null ? '未取得' : `¥${card.price.toFixed(2)}` }}</strong><span>扫描参考价</span></div>
+              <div class="quote-evidence"><b>{{ card.quoteLabel }}</b><br/>来源 {{ quoteSourceLabel(card.source) }} · 源时间 {{ formatTime(card.sourceTime) }}</div>
+              <p><span>状态跃迁</span>{{ card.supports.join('；') || '本轮未记录支持证据' }}</p>
+              <p><span>未确认项</span>{{ card.missing.join('；') || '本轮未列出额外缺口；不代表所有指标已确认' }}</p>
+              <p v-if="card.counterEvidence.length"><span>反向证据</span>{{ card.counterEvidence.join('；') }}</p>
+              <p><span>失效条件</span>{{ card.invalidation.join('；') || '具体失效条件未记录，需继续核验' }}</p>
+              <p><span>T+1风险</span>当日新买通常不能当日卖出；盘中失效条件不等于当日可执行止损，仍需承担隔夜风险。</p>
+              <details class="sk-help-details pick-details"><summary>首次发现、买窗与剩余空间</summary>
+                <p><span>首次发现</span>{{ formatTime(card.firstDetectionAt) }}<template v-if="card.firstDetectionPrice !== null"> · 参考 ¥{{ card.firstDetectionPrice.toFixed(2) }}</template></p>
+                <p><span>真实触发</span>{{ card.triggerAt ? formatTime(card.triggerAt) : '未核验，未将发现时间当成触发时间' }}</p>
+                <p><span>正常买窗</span>{{ card.buyWindow.status === 'observed' ? '扫描时观察到正常卖盘，不等于实际成交' : card.buyWindow.status === 'unavailable' ? '扫描时未发现正常买窗' : '未核验' }}<template v-if="card.buyWindow.askPrice != null"> · 卖盘参考 ¥{{ observationPrice(card.buyWindow.askPrice) }}</template></p>
+                <p><span>买窗源时间</span>{{ formatTime(card.buyWindow.sourceTime) }}</p>
+                <p><span>剩余空间</span>{{ card.spaceStatus === 'observed' && card.remainingSpacePct !== null ? `${card.remainingSpacePct.toFixed(2)}% · 已记录结构参考` : '未取得足够结构证据，不生成目标价' }}</p>
+                <p><span>排序含义</span>{{ card.rankScore === null ? '排序分未记录' : `本轮规则排序分 ${card.rankScore.toFixed(1)}` }}；不代表上涨概率或已验证收益。</p>
+              </details>
+            </div>
+            <template #footer><n-space justify="end"><n-button size="small" secondary @click="addWatch(card.pick)">自选</n-button><n-button size="small" type="primary" @click="openKline(card.pick)">图表</n-button></n-space></template>
+          </n-card>
+        </div>
+        <div v-else class="primary-empty" role="status"><p>{{ opportunities.message || '本轮尚未形成 E-A 或 M-A 机会，已记录线索保留在观察队列。' }}</p></div>
+        <details v-if="opportunities.observations.length" class="sk-help-details opportunity-observations"><summary>其他机会与待确认线索 · {{ opportunities.observations.length }} 只</summary><p v-if="opportunities.observations.length > 10" class="opportunity-observation-count">当前展示 {{ visibleOpportunityObservations.length }} / {{ opportunities.observations.length }} 只，按本轮保存顺序。</p><article v-for="card in visibleOpportunityObservations" :key="`opportunity-observation-${codeOf(card.pick)}`"><b>{{ nameOf(card.pick) }} {{ codeOf(card.pick) }} · {{ card.grade }}</b><p>{{ card.supports.join('；') || '支持证据未记录' }}</p><p>待确认：{{ card.missing.join('；') || '继续观察状态变化' }}</p><p v-if="card.counterEvidence.length">反向证据：{{ card.counterEvidence.join('；') }}</p></article><n-button v-if="opportunities.observations.length > 10" size="small" secondary @click="toggleOpportunityObservations">{{ showAllOpportunityObservations ? '收起至前10条' : `查看全部 ${opportunities.observations.length} 条` }}</n-button></details>
+        <p class="opportunity-footnote">机会精选独立于下方模型验证精选。价格随时间过期后保留为历史参考；刷新期间保留已保存名单，每轮原始依据可在扫描历史回看。</p>
       </section>
       <section v-if="nextDayQueues.length" class="research-observations" aria-label="研究观察">
       <h3>研究观察 · 不计入主推荐（潜伏 {{ nextDayWatchlist.length }} 只 / 延续 {{ nextDayContinuationWatchlist.length }} 只）</h3>
@@ -864,7 +905,7 @@ onDeactivated(() => {
       <section v-if="invalidatedPicks.length" class="invalidated-recommendations"><h3>原推荐状态更新</h3><p>失效后退出主推荐；首次信号和原始依据继续保存在推荐记录。</p><article v-for="pick in invalidatedPicks" :key="codeOf(pick)"><b>{{ nameOf(pick) }} {{ codeOf(pick) }} · {{ primaryRecommendationState(pick) }}</b><p>首次主推荐 {{ formatTime(firstRecommendationEvidence(pick).time) }} · 参考价 {{ firstRecommendationEvidence(pick).price ?? '未记录' }}</p><p>{{ primaryAdmissionReasons([...(pick.primaryAdmission?.missingReasons || []), ...(pick.primaryAdmission?.reasons || [])]).join('；') || pick.transition || '查看原推荐与最新核验记录' }}</p></article></section>
     </section>
 
-    <PicksLedger v-for="mode in visitedLedgerModes" v-show="viewMode === mode" :key="mode" :mode="mode" :active="pageActive && viewMode === mode" :refresh-token="mode === 'records' ? recordsRefreshToken : 0" @open-chart="openKline" />
+    <PicksLedger v-for="mode in visitedLedgerModes" v-show="viewMode === mode" :key="mode" :mode="mode" :active="pageActive && viewMode === mode" :refresh-token="mode === 'records' ? recordsRefreshToken : 0" :display-run-id="recordsRunId" :display-as-of="adaptive.generatedAt || result.generatedAt || ''" :display-has-opportunities="opportunities.available" @open-chart="openKline" />
 
     <section v-show="viewMode === 'classic'">
       <n-tabs v-model:value="activeTier" type="segment" animated class="tier-tabs"><n-tab-pane v-for="tier in tierOptions" :key="tier.key" :name="tier.key"><template #tab><span class="tier-tab" :title="tier.note"><b>{{ tier.label }}</b></span></template></n-tab-pane></n-tabs>
@@ -897,6 +938,7 @@ onDeactivated(() => {
     </section>
     <n-drawer v-model:show="methodVisible" :width="500" placement="right"><n-drawer-content title="精选 · 方法与使用" closable><div class="pick-explanation">
       <ol class="usage-steps"><li><b>刷新扫描</b> · 检查列表生成时间、行情源时间和覆盖范围。</li><li><b>为何入选</b> · 查看实际因子、价格结构与失效条件。</li><li><b>图表</b> · 使用共用行情核对当前结构。</li><li><b>延后复盘</b> · 查看T+1、T+3、T+5的观察变化与模拟成交。</li></ol>
+      <h3>机会精选 · E / M 双通道</h3><p>E 是早期启动，依据状态跃迁、个股或板块主动性、正常买窗与剩余空间研究；M 是主升确认或二波。VWAP、回踩及板块同步用于确认和升级，不要求早期机会全部满足。缺失证据明确保留，已知强反证仍须考虑。E-A、M-A 与 B、C 观察分开展示，每轮最多5只机会，不凑数。机会是独立规则研究，不等待下方模型完成训练，也不表示通过已验证模型或实际成交。</p>
       <template v-if="isDailyPrimary"><h3>日线条件推荐</h3><p>使用上一完整交易日及更早的日K、当日新鲜报价、涨跌停状态、财报、业绩预告与解禁证据独立筛选。三档分别执行价格距离、压力空间和事件风险条件，每档最多5只；证据缺失或风险不满足仍可为空。日线条件以下一交易日（T+1）为观察目标，未经概率校准。</p><p>日线卡片展示原始日K指标、来源日期、支撑压力和风险缺口；分钟历史与上午模型的准备进度另列，日线条件不作为分钟模型已通过的证据。</p></template>
       <h3>分钟增强 · 任务化学习与规则研究</h3><p>分钟分支筛选沪深主板非ST，每档每轮最多5只。突破和修复使用启动分，延续使用主升分，再计入风险与市场状态调节。每轮重新核验队列，候选及未入选对照一同记录；已保存的V1.1记录仍显示其原版本公式。</p>
       <h3>主推荐与研究观察</h3><p v-if="!isDailyPrimary">主推荐只展示本轮通过统一准入的候选，数据缺失或风险条件未满足时允许空榜。正式主推荐按T+1合法退出的扣费净收益排序与准入。上午方向观察独立考察参考价到当日收盘的价格变化与回撤，不改变正式推荐排序，也不把当天上涨当作当天可卖出的盈利。</p><p>潜伏和延续是两类独立研究观察，在本地精选中直接显示，并随后台已完成的扫描更新；类别与目标日独立标注，不计入主推荐。研究规则分不是上涨概率。旧版候选保留原版本与原始证据，不标记为通过新准入。</p><p v-if="!isDailyPrimary">重复扫描继续使用账本记录的首次主推荐时间和参考价；没有记录的字段显示未知。后续失效的股票退出主推荐，原始记录继续保留，可在推荐记录中查看。</p>
@@ -929,7 +971,7 @@ onDeactivated(() => {
     <n-drawer v-model:show="historyVisible" :width="520" placement="right"><n-drawer-content title="精选历史" closable><n-spin :show="historyLoading">
       <div v-if="historyItems.length" class="history-list">
         <article v-for="item in historyItems" :key="item.run_id" class="history-run">
-          <div class="history-head"><div><b>{{ formatTime(historyResult(item).generatedAt || item.as_of) }}</b><small>{{ historySlotLabel(item) }}<template v-if="!isReviewHistory(item)"><template v-if="historyResult(item).premarketAssessment"> · 集合竞价 / 开盘预案 {{ historyPremarketCandidates(item).length }} 只</template><template v-else-if="isDailyPrimaryRun(historyResult(item))"> · 日线条件推荐 {{ historyCandidates(item).length }} 只</template><template v-else-if="hasNextDayHistory(item)"> · {{ historySavedSummary(item).splitQueues ? '潜伏' : '次日观察' }} {{ historyNextDayCandidates(item).length }} 只 · 交易候选 {{ historyCandidates(item).length }} 只<template v-if="historySavedSummary(item).splitQueues"> · 延续 {{ historyContinuationCandidates(item).length }} 只</template></template><template v-else> · {{ historyCandidates(item).length }} 只</template></template> · {{ historyStatusLabel(item) }}</small></div><n-button v-if="isScanHistory(item)" size="small" secondary @click="restoreHistory(item)">查看</n-button></div>
+          <div class="history-head"><div><b>{{ formatTime(historyResult(item).generatedAt || item.as_of) }}</b><small>{{ historySlotLabel(item) }}<template v-if="!isReviewHistory(item)"><template v-if="historyResult(item).opportunityChannels"> · 机会精选 {{ historyOpportunities(item).length }} 只 · 模型验证精选 {{ historyCandidates(item).length }} 只</template><template v-else-if="historyResult(item).premarketAssessment"> · 集合竞价 / 开盘预案 {{ historyPremarketCandidates(item).length }} 只</template><template v-else-if="isDailyPrimaryRun(historyResult(item))"> · 日线条件推荐 {{ historyCandidates(item).length }} 只</template><template v-else-if="hasNextDayHistory(item)"> · {{ historySavedSummary(item).splitQueues ? '潜伏' : '次日观察' }} {{ historyNextDayCandidates(item).length }} 只 · 交易候选 {{ historyCandidates(item).length }} 只<template v-if="historySavedSummary(item).splitQueues"> · 延续 {{ historyContinuationCandidates(item).length }} 只</template></template><template v-else> · {{ historyCandidates(item).length }} 只</template></template> · {{ historyStatusLabel(item) }}</small></div><n-button v-if="isScanHistory(item)" size="small" secondary @click="restoreHistory(item)">查看</n-button></div>
           <details v-if="isReviewHistory(item)" class="sk-help-details history-review">
             <summary>查看{{ item.mode === 'king_review' ? '复盘' : '学习' }}摘要</summary>
             <p>{{ reviewSummary(item) }}</p>
@@ -947,7 +989,8 @@ onDeactivated(() => {
               </tbody></table>
             </template>
           </details>
-          <div v-else-if="historyPremarketCandidates(item).length || historyCandidates(item).length || historyNextDayCandidates(item).length || historyContinuationCandidates(item).length">
+          <div v-else-if="historyOpportunities(item).length || historyPremarketCandidates(item).length || historyCandidates(item).length || historyNextDayCandidates(item).length || historyContinuationCandidates(item).length">
+            <template v-if="historyOpportunities(item).length"><p class="history-channel">机会精选 · {{ historyOpportunities(item).length }} 只 · 保存时研究等级</p><div class="history-candidates"><n-tag v-for="(pick, index) in historyOpportunities(item)" :key="`${item.run_id}-opportunity-${codeOf(pick)}-${index}`" size="small" type="info" :bordered="false">#{{ index + 1 }} {{ nameOf(pick) }} · {{ pick.opportunity?.grade || '未分级' }}</n-tag></div></template>
             <template v-if="historyPremarketCandidates(item).length"><p class="history-channel">集合竞价 / 开盘条件预案 · {{ historyPremarketCandidates(item).length }} 只 · 昨夜基准 {{ historyResult(item).premarketAssessment?.baselineSession || historyResult(item).premarketAssessment?.baselineAsOf || '未记录' }}</p><div class="history-candidates"><n-tag v-for="(pick, index) in historyPremarketCandidates(item)" :key="`${item.run_id}-premarket-${codeOf(pick)}-${index}`" size="small" type="info" :bordered="false">#{{ index + 1 }} {{ nameOf(pick) }} · 历史条件预案</n-tag></div></template>
             <template v-if="historyNextDayCandidates(item).length"><p class="history-channel">{{ historySavedSummary(item).splitQueues ? '未触板潜伏' : '历史次日观察（未分队列）' }} · 分数用于研究排序，不是涨停概率</p><div class="history-candidates"><n-tag v-for="(pick, index) in historyNextDayCandidates(item)" :key="`${item.run_id}-next-day-${codeOf(pick)}-${index}`" size="small" type="warning" :bordered="false">#{{ pick.rank ?? index + 1 }} {{ nameOf(pick) }} · 观察分 {{ nextDayScore(pick) }} · 目标 {{ pick.nextDaySignal?.targetSession || '下一交易日' }}</n-tag></div></template>
             <template v-if="historyCandidates(item).length"><p v-if="hasNextDayHistory(item) || isDailyPrimaryRun(historyResult(item))" class="history-channel">{{ isDailyPrimaryRun(historyResult(item)) ? '日线条件推荐 · T+1' : '交易条件候选' }}</p><div class="history-candidates"><n-tag v-for="(pick, index) in historyCandidates(item)" :key="`${item.run_id}-entry-${codeOf(pick)}-${index}`" size="small" :bordered="false">#{{ pick.rank ?? index + 1 }} {{ nameOf(pick) }}<template v-if="!isDailyPrimaryRun(historyResult(item))"> · {{ pick.modelBranch || pick.model }} · {{ scoreOf(pick) }}</template><template v-else> · 日K {{ pick.baselineAsOf || '日期未记录' }}</template></n-tag></div></template>
@@ -960,6 +1003,7 @@ onDeactivated(() => {
 </template>
 
 <style scoped>
+.opportunity-section{margin:18px 0 22px;padding:16px;border:1px solid var(--sk-accent);border-radius:12px;background:color-mix(in srgb,var(--sk-surface-2) 35%,transparent)}.opportunity-section>.adaptive-summary{margin-top:0}.opportunity-intro{font-size:13px;line-height:1.7;margin:8px 0 14px;color:var(--sk-text-muted)}.opportunity-card{border-top:3px solid var(--sk-accent)!important}.opportunity-historical{border-top-color:var(--sk-border)!important}.opportunity-grid{grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr))}.opportunity-footnote{font-size:11px;line-height:1.7;color:var(--sk-text-muted);margin:14px 0 0}.opportunity-observations{margin-top:14px;font-size:12px;line-height:1.7}.opportunity-observations article{padding:10px 0;border-top:1px solid var(--sk-border)}.opportunity-observations article p{margin:5px 0;color:var(--sk-text-muted)}
 .primary-readiness{margin:14px 0;padding:14px;border:1px solid var(--sk-border);border-left:3px solid #d39b36;border-radius:10px;background:var(--sk-surface);font-size:13px;line-height:1.7}.primary-readiness p{margin:7px 0;color:var(--sk-text-muted)}
 .admission-diagnostics{margin:14px 0;padding:14px;border:1px solid var(--sk-border);border-radius:10px;background:var(--sk-surface);font-size:12px;line-height:1.65}.admission-diagnostics>summary{font-size:14px;font-weight:600;cursor:pointer}.admission-diagnostics[open]>summary{margin-bottom:10px}.admission-check-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.admission-check{display:flex;flex-direction:column;gap:4px;padding:10px;background:var(--sk-surface-2);border-radius:6px;border-left:3px solid #18a058}.admission-check.check-blocked{border-left-color:#d39b36}.admission-check small,.admission-diagnostics>small{color:var(--sk-text-muted)}.admission-check b{font-variant-numeric:tabular-nums}.pick-body .daily-selection-reason{display:block;font-size:13px}.daily-facts{margin:10px 0}
 .premarket-plans{margin-bottom:22px;padding:16px;border:1px solid var(--sk-accent);border-radius:12px;background:color-mix(in srgb,var(--sk-surface-2) 45%,transparent)}.premarket-historical{border-color:var(--sk-border);background:var(--sk-surface-2)}.premarket-summary{margin-top:0}.premarket-notice{font-size:13px;line-height:1.7;margin:8px 0 14px}.premarket-historical .premarket-notice{font-weight:600}.premarket-data-gap{padding:10px 12px;border-left:3px solid #d39b36;background:var(--sk-surface);font-size:12px;line-height:1.7;margin:10px 0 16px}.premarket-card{border-top:3px solid var(--sk-accent)!important}.premarket-historical .premarket-card{border-top-color:var(--sk-border)!important}.pick-body>p.premarket-reason{display:block;line-height:1.7;margin:0 0 10px}.premarket-levels{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px;background:var(--sk-surface-2);border-radius:6px;margin:10px 0;font-size:12px}.premarket-levels>div{display:flex;justify-content:space-between;gap:8px}.premarket-levels b{font-variant-numeric:tabular-nums}.premarket-footnote{font-size:11px;color:var(--sk-text-muted);line-height:1.6;margin:14px 0 0}.premarket-plans .pick-grid{grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr))}

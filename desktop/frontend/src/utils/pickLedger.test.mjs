@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { priceObservationPercent } from './pickLedger.mjs'
+import { priceObservationPercent, recordDisplayPayload, isOpportunitySelection } from './pickLedger.mjs'
 import { primaryRecommendationPicks, primaryRecommendationState, firstRecommendationEvidence, dailyObservationPicks, primaryAdmissionReasons, marketBreadthSummary } from './pickLedger.mjs'
 import { groupSignals, ledgerPercent, ledgerPrice, ledgerSigned, reviewStatusLabel, reviewReasonLabel, visibleReviews, reviewProgress, learningEffect, reviewReturn, shanghaiDate, learningProgress, recordQuoteCode, recordQuoteCodes, signalPriceComparison, createRecordQuoteLoader, nextDaySignalOf, isNextDaySelection, signalSelectionLabel, nextDayPatternValue, savedRecommendationSummary, nextDayQueueLabel, nextDayTouchLabel } from './pickLedger.mjs'
 
@@ -421,4 +421,30 @@ test('network errors retain previous quote timestamps and permit retry without m
   assert.deepEqual(states.at(-1).quotes['600001'], quote)
   await loader.load(['600001'])
   assert.equal(states.at(-1).error, '')
+})
+
+
+test('same-round records use display identity, retain opportunity research, and never substitute other queues', () => {
+  const opportunity = Object.freeze({ signalId: 'opp', code: '603517', selected: false, opportunitySelected: true,
+    trainingEligible: false, reviewEligible: false, snapshot: { opportunity: { channel: 'E', grade: 'E-A' } } })
+  const payload = { items: [
+    { runId: 'ledger-1', displayRunId: 'king-live-1', signals: [opportunity, { signalId: 'watch', code: '600001', nextDaySelected: true }] },
+    { runId: 'ledger-2', displayRunId: 'king-live-2', signals: [{ ...opportunity, signalId: 'new', code: '600002' }] },
+  ] }
+  const frozen = JSON.stringify(payload)
+  const current = recordDisplayPayload(payload, { scope: 'current', runId: 'king-live-1', opportunityOnly: true })
+  const signals = groupSignals(current).flatMap(group => group.signals)
+  assert.deepEqual(signals.map(signal => signal.code), ['603517'])
+  assert.equal(signals[0].runId, 'ledger-1')
+  assert.equal(signals[0].displayRunId, 'king-live-1')
+  assert.equal(signals[0].selected, false)
+  assert.equal(signals[0].trainingEligible, false)
+  assert.equal(isOpportunitySelection(signals[0]), true)
+  assert.equal(signalSelectionLabel(signals[0]), '早期启动 · 机会研究')
+  assert.equal(recordDisplayPayload(payload, { scope: 'history' }), payload)
+  assert.deepEqual(recordDisplayPayload(payload, { scope: 'current', runId: '', opportunityOnly: true }).items, [])
+  assert.deepEqual(recordDisplayPayload(payload, { scope: 'current', runId: 'missing', opportunityOnly: true }).items, [])
+  const empty = recordDisplayPayload({ items: [{ runId: 'empty', signals: [{ code: '600003', selected: true }] }] }, { scope: 'current', runId: 'empty', opportunityOnly: true })
+  assert.deepEqual(groupSignals(empty), [])
+  assert.equal(JSON.stringify(payload), frozen)
 })

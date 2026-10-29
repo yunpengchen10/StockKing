@@ -46,7 +46,7 @@ func TestSidecarRecommendationHistoryReadsBeyond16MiB(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(response)
 	})
-	result, err := app.GetStockKingRecommendationHistory("2026-09-30", "600000", "rules-v1", false)
+	result, err := app.GetStockKingRecommendationHistory("2026-09-30", "600000", "rules-v1", false, "")
 	if err != nil {
 		t.Fatalf("reading %d-byte history: %v", len(response), err)
 	}
@@ -69,7 +69,7 @@ func TestSidecarRecommendationHistoryRejectsTruncatedJSON(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"items":[{"signalId":"unfinished"`))
 	})
-	result, err := app.GetStockKingRecommendationHistory("", "", "", false)
+	result, err := app.GetStockKingRecommendationHistory("", "", "", false, "")
 	var syntaxError *json.SyntaxError
 	if err == nil || !errors.As(err, &syntaxError) {
 		t.Fatalf("expected a JSON syntax error for an incomplete response, got %v", err)
@@ -87,7 +87,7 @@ func TestSidecarErrorResponsePreservesStatusWithBoundedDetails(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(prefix + strings.Repeat("x", 2*detailLimit) + tail))
 	})
-	_, err := app.GetStockKingRecommendationHistory("", "", "", false)
+	_, err := app.GetStockKingRecommendationHistory("", "", "", false, "")
 	if err == nil {
 		t.Fatal("an unsuccessful HTTP response must return an error")
 	}
@@ -108,7 +108,7 @@ func TestSidecarEmptySuccessfulResponseRemainsAllowed(t *testing.T) {
 			app := newSidecarResponseTestApp(t, func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(status)
 			})
-			result, err := app.GetStockKingRecommendationHistory("", "", "", false)
+			result, err := app.GetStockKingRecommendationHistory("", "", "", false, "")
 			if err != nil || result != nil {
 				t.Fatalf("empty successful response changed behavior: result=%#v, error=%v", result, err)
 			}

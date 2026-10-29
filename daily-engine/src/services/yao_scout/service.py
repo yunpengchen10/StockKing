@@ -441,10 +441,14 @@ class YaoScoutService:
         sources = list(self.screening.snapshot_source_priority)
         return {
             "point_in_time_ok": point_in_time_ok,
-            "source": str(snapshot.attrs.get("snapshot_source") or "unknown"),
+            "source": str(snapshot.attrs.get("snapshot_source") or snapshot.attrs.get("source") or "unknown"),
             "source_errors": list(snapshot.attrs.get("source_errors") or []),
             "fallback_used": bool(snapshot.attrs.get("fallback_used", False)),
             "stale": bool(snapshot.attrs.get("stale", False)),
+            # Keep directory coverage separate from the original rank fields.
+            # Later quote enrichment never makes those old fields fresh.
+            "directory_complete": snapshot.attrs.get("directory_complete"),
+            "selection_fields_stale": snapshot.attrs.get("selection_fields_stale"),
             "stale_age_hours": snapshot.attrs.get("stale_age_hours"),
             "source_health": snapshot_source_health_snapshot(sources),
             "fetched_at": datetime.now(SHANGHAI_TZ).isoformat(),

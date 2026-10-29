@@ -160,7 +160,7 @@ def _explicit_market_limits(observation, row, previous, price, stamp, received, 
     return upper, lower
 
 
-def event_factor(context, cutoff, *, half_life_sessions=None, calendar_provider=None):
+def _forecast_event_factor(context, cutoff, *, half_life_sessions=None, calendar_provider=None):
     """Positive *net-profit forecasts* only; firstSeen gates knowledge, not hype.
 
 Decay starts at the announcement's conservative availability date, so finding
@@ -239,6 +239,131 @@ Known negative events are left to the independent precision risk gate.
             value = _number(financial.get(key))
             if value is not None:
                 out['features']['financial_' + key] = value
+    return out
+
+
+DISCLOSURE_CATEGORIES = {
+    'order': r'中标|签订|签署|合同|订单',
+    'industry': r'投产|量产|批准|认证|产品|技术|产业|投资|项目',
+    'policy': r'实施|发布|印发|通知|政策|补贴|补助',
+    'capital_action': r'回购|增持|重组|收购',
+}
+DISCLOSURE_NEGATIVE_TERMS = r'终止|取消|解除|未中标|风险提示|尚未签署|不存在|未签订|传闻|澄清'
+
+
+def event_factor(context, cutoff, *, half_life_sessions=None, calendar_provider=None):
+    """Use observed forecasts and explicitly linked, archived disclosures.
+
+    Optional ``context['disclosures']`` schema: code, eventId, category
+    (order/policy/industry/capital_action), impact (positive/negative/neutral),
+    source, sourceUrl, title/body, evidenceText (verbatim excerpt), publishedAt
+    (or publishedDate), firstSeenAt, availableAt, observedAt. coverage.disclosures
+    describes the connected archive; absent coverage remains unknown. A policy
+    needs the security association supplied by that archive, not an inferred
+    sector-wide benefit. No request, keyword-based news search or AI is used.
+
+    Category/impact labels are inspectable research hypotheses, not verified
+    economic benefit. Negative terms in the quoted content suppress a positive
+    catalyst and remain visible; they do not introduce a new trading veto.
+    """
+    context = context or {}
+    out = _forecast_event_factor(context, cutoff, half_life_sessions=half_life_sessions,
+                                 calendar_provider=calendar_provider)
+    now = _at(cutoff)
+    coverage = context.get('coverage') or {}
+    out['coverage'] = {'forecast': 'covered' if coverage.get('forecast') else 'unknown',
+                       'disclosures': 'covered' if coverage.get('disclosures') else 'unknown',
+                       'socialSentiment': 'unavailable'}
+    out['disclosureEvidence'] = []
+    if now is None or not coverage.get('disclosures'):
+        return out
+    policy = DEFAULT_PARAMETERS['researchFactors']['C']
+    half_life = _number(half_life_sessions if half_life_sessions is not None else policy['halfLifeSessions'])
+    if not half_life or half_life <= 0:
+        return out
+    strengths, ages, discovery_ages, seen, invalid = [], [], [], set(), 0
+    if (context.get('disclosureCoverage') or {}).get('complete') is False:
+        out['coverage']['disclosures'] = 'partial'
+    for event in context.get('disclosures') or []:
+        if not isinstance(event, dict):
+            invalid += 1
+            continue
+        code = str(event.get('code') or '')
+        text = '\n'.join(str(event.get(key) or '') for key in ('title', 'body'))
+        excerpt = str(event.get('evidenceText') or '').strip()
+        identity = str(event.get('eventId') or '')
+        observed, available, first = (_at(event.get(key)) for key in ('observedAt', 'availableAt', 'firstSeenAt'))
+        published = _at(event.get('publishedAt'))
+        if published is None and not event.get('publishedAt'):
+            try:
+                published_day = date.fromisoformat(str(event.get('publishedDate'))[:10])
+                # An archived public listing proves the title was knowable at
+                # firstSeenAt even if the vendor supplies only a calendar date.
+                # Midnight is an age anchor, never an invented publication time.
+                observed_listing = event.get('availabilityBasis') == 'observed_public_listing_date_only'
+                published = datetime.combine(published_day + timedelta(days=0 if observed_listing else 1), time(), TZ)
+            except ValueError:
+                pass
+        if (not re.fullmatch(r'\d{6}', code) or (context.get('code') and str(context['code']) != code)
+                or not identity or not event.get('source')
+                or not re.match(r'^https?://[^/\s]+(?:/|$)', str(event.get('sourceUrl') or ''))
+                or not excerpt or excerpt not in text or event.get('category') not in DISCLOSURE_CATEGORIES
+                or event.get('impact') not in {'positive', 'negative', 'neutral'}
+                or not all((observed, available, first, published))
+                or not first <= observed <= now or not max(published, first) <= available <= observed):
+            invalid += 1
+            continue
+        if identity in seen:
+            continue
+        seen.add(identity)
+        risk_terms = sorted(set(re.findall(DISCLOSURE_NEGATIVE_TERMS, text)))
+        positive = (event['impact'] == 'positive' and event.get('evidenceScope') != 'title_only' and not risk_terms
+                    and re.search(DISCLOSURE_CATEGORIES[event['category']], excerpt) is not None)
+        discovery = bool(event.get('researchCandidate') and not risk_terms
+                         and re.search(DISCLOSURE_CATEGORIES[event['category']], excerpt))
+        packet = {key: event.get(key) for key in ('code', 'eventId', 'category', 'impact', 'source',
+                  'sourceUrl', 'title', 'evidenceText', 'publishedAt', 'publishedDate',
+                  'firstSeenAt', 'availableAt', 'observedAt', 'availabilityBasis', 'evidenceScope')}
+        packet.update(positiveCatalyst=bool(positive), researchCandidate=discovery, disclosedRiskTerms=risk_terms,
+                      meaning='已披露文本与可知时间核验；类别标签不是收益保证')
+        out['disclosureEvidence'].append(packet)
+        if not positive and not discovery:
+            continue
+        days = sorted(set((calendar_provider or _sessions)(published.date(), now.date())))
+        if not days or days[-1] > now.date():
+            invalid += 1
+            packet['positiveCatalyst'] = False
+            packet['researchCandidate'] = False
+            packet['gap'] = 'exchange_calendar_unavailable'
+            continue
+        age = max(0, len(days) - 1)
+        if positive:
+            strengths.append(.5 ** (age / half_life))
+            ages.append(age)
+        if discovery:
+            discovery_ages.append(age)
+    out['features'].update(disclosure_event_count=len(seen), rejected_disclosure_count=invalid,
+                           positive_disclosure_count=len(strengths), discovery_event_count=len(discovery_ages))
+    if discovery_ages:
+        out['features']['youngest_discovery_age_sessions'] = min(discovery_ages)
+    if invalid:
+        out['coverage']['disclosures'] = 'partial'
+        out['gaps'].append('部分扩展公告缺来源、原文关联或可知时间，未用于催化')
+    base_score = out.get('score')
+    # A valid linked disclosure can supply a positive research catalyst even
+    # when forecast coverage is absent. Missing coverage remains explicit.
+    if strengths:
+        extended_score = _clamp(policy['neutralScore'] + policy['positiveScale'] * max(strengths))
+        out['score'] = round(max(base_score if base_score is not None else policy['neutralScore'], extended_score), 6)
+        out['status'] = 'observed'
+        out['features']['positive_event_count'] = out['features'].get('positive_event_count', 0) + len(strengths)
+        previous_age = out['features'].get('youngest_positive_age_sessions')
+        out['features']['youngest_positive_age_sessions'] = min(ages + ([previous_age] if previous_age is not None else []))
+        out['decayBasis'] = 'original_publication_availability; firstSeenAt limits knowledge'
+    elif base_score is None and not invalid and not coverage.get('forecast') and seen:
+        out.update(score=policy['neutralScore'], status='observed')
+        out['features'].setdefault('positive_event_count', 0)
+    out['eventIds'] = sorted(set(out.get('eventIds') or []) | seen)
     return out
 
 

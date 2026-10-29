@@ -505,7 +505,7 @@ def test_expanded_prescreen_researches_every_stock_in_a_small_universe(monkeypat
     assert result['dataQuality']['research_universe_count'] == 45
     assert result['dataQuality']['research_count'] == 45
     assert result['dataQuality']['research_limit'] == 45
-    assert result['dataQuality']['research_policy'] == 'mainboard_10pct_min300_v1'
+    assert result['dataQuality']['research_policy'] == 'mainboard_activity_and_transition_discovery_v2'
     assert result['dataQuality']['deep_research_count'] == 45
     budgets = result['dataQuality']['stageBudgetsSeconds']
     assert budgets['daily_history'] == 25

@@ -19,11 +19,12 @@ export function entryExecutionSummary(plan) {
 
 export function dailyObservationCategory(value) {
   return ({ observation_watchlist: '日线观察', attack_watchlist: '进攻观察', unselected_control: '未入选对照',
+    opportunity_recommendation: '机会精选', opportunity_control: '机会对照',
     selected: '历史入选', profile_selected: '分档观察' })[value] || '其他观察'
 }
 
 export function dailyObservationRows(review, includeControls = false) {
-  return (review?.items || []).filter(row => includeControls || row.first_category !== 'unselected_control')
+  return (review?.items || []).filter(row => includeControls || !['unselected_control', 'opportunity_control'].includes(row.first_category))
     .flatMap(row => (row.outcomes?.length ? row.outcomes : [{ status: 'not_reviewed', horizon: null }])
       .map(outcome => ({ ...outcome, code: row.code, name: row.name, tradingDay: row.trading_day,
         observationId: row.observation_id, category: dailyObservationCategory(row.first_category),

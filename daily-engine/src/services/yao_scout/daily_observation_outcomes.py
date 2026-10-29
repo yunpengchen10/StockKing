@@ -115,6 +115,25 @@ def _records(result):
         for rows in (result.get(field) or {}).values():
             for row in rows or []:
                 add(row, 'observation_watchlist' if row.get('observationOnly') else 'profile_selected')
+    channels = result.get('opportunityChannels') or {}
+    selected_opportunities = {row.get('code') for row in channels.get('recommendations') or []}
+    # An earlier observation is not a delivered recommendation. Separate tasks
+    # freeze each first reference so promotion cannot inherit a cheaper control
+    # price. Subsequent E->M changes do not reset the recommendation reference.
+    for field, category, task_id in (
+            ('researchCandidates', 'opportunity_control', 'opportunity_em_control'),
+            ('recommendations', 'opportunity_recommendation', 'opportunity_em_recommendation')):
+        for original in channels.get(field) or []:
+            if not isinstance(original, dict) or not channels.get('version'):
+                continue
+            if category == 'opportunity_control' and original.get('code') in selected_opportunities:
+                continue
+            row = {**original, 'taskId': task_id, 'version': channels['version'],
+                   'observationOnly': True, 'formalEligible': False}
+            # Preserve the opportunity's own task, never inherit a legacy daily
+            # or minute signal accidentally copied with its source evidence.
+            row.pop('dailySignal', None)
+            add(row, category, fallback=True)
     for value in records.values():
         categories = value['categories']
         # A selected/watchlist row is not simultaneously an unselected control.
@@ -132,7 +151,8 @@ def persist_scan(db, result, run_id, trading_day, published_at):
     """Only called inside the newly inserted run transaction; no historic backfill."""
     published_at = _at(published_at)
     saved = 0
-    priority = ('selected', 'profile_selected', 'observation_watchlist', 'attack_watchlist', 'unselected_control')
+    priority = ('opportunity_recommendation', 'opportunity_control', 'selected', 'profile_selected',
+                'observation_watchlist', 'attack_watchlist', 'unselected_control')
     for (code, task, version), record in _records(result).items():
         row, categories = record['row'], record['categories']
         quote = row.get('quote') or {}
@@ -162,7 +182,8 @@ def persist_scan(db, result, run_id, trading_day, published_at):
         observation_id = sha256(_json([code, trading_day, task, version]).encode()).hexdigest()[:32]
         first_category = next(category for category in priority if category in categories)
         snapshot = {key: row[key] for key in ('quote', 'dailySignal', 'dailyProfileDecision', 'dailyRankEvidence',
-                    'marketBreadth', 'eventAssessment', 'state', 'reasons', 'observationOnly', 'formalEligible') if key in row}
+                    'marketBreadth', 'eventAssessment', 'state', 'reasons', 'observationOnly', 'formalEligible',
+                    'opportunity', 'discoveryEvidence', 'ruleRecommendation', 'dataLineage') if key in row}
         cursor = db.execute('''INSERT OR IGNORE INTO daily_observation_signals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             (observation_id, code, str(row.get('name') or code), trading_day, task, version, run_id, first_category,
              price, decision.isoformat(), source_time, source, int(not gaps), _json(gaps), _json(snapshot), published_at.isoformat()))

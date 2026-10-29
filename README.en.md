@@ -26,7 +26,11 @@ A local desktop for stock quantitative research and China A-share research: quot
 
 AI tools can reuse the same quotes through the [read-only MCP quote service](quote-service/README.md). Python execution is supported on Windows and macOS; the ChatGPT cloud connection still requires remote authorization and end-to-end testing.
 
-## New in v2.7.0
+## New in v2.8.0
+
+The October 29 revision adds E (early movement) and M (confirmed continuation) opportunity picks. It rejects unconfirmed one-minute rebounds and broken price structures, and removes ranking rewards caused by negative comparison baselines. Recommendation records follow the same saved scan as the picks view and refresh when that scan changes. Historical evidence and recommendation prices remain unchanged. See the [rules, synchronization fixes and validation](docs/opportunity-em-2.8.0.md) (Chinese). Source updates do not replace existing Release installers, and passing tests does not establish improved returns.
+
+### v2.7.0 history
 
 - Verify minute-response identity and independent quotes, quarantine conflicting sessions, and track data dependencies.
 - Fit T+1 net-return and next-session price-event tasks separately using Ridge, Logistic and LightGBM, with chronological calibration, rolling evaluation and forward shadow gates.

@@ -2636,23 +2636,36 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 '$.dataQuality', '$.data_quality',
                 '$.premarketAssessment',
                 '$.primarySelectionMode', '$.primaryObjective', '$.dailyAssessment',
+                '$.opportunityChannels.version', '$.opportunityChannels.asOf',
+                '$.opportunityChannels.diagnostics', '$.opportunityChannels.policy.version',
             )
             rows = session.execute(select(
                 YaoRun.run_id, YaoRun.mode, header,
                 func.json_type(YaoRun.result_json, '$.candidates'),
+                func.json_array_length(YaoRun.result_json, '$.candidates'),
+                # Keep formal-list emptiness without loading candidate payloads.
+                text("(SELECT COUNT(*) FROM json_each(yao_runs.result_json, '$.profileCandidates') "
+                     "WHERE type <> 'array' OR json_array_length(value) <> 0)"),
                 func.json_array_length(YaoRun.result_json, '$.nextDayWatchlist'),
                 func.json_array_length(YaoRun.result_json, '$.nextDayContinuationWatchlist'),
+                func.json_array_length(YaoRun.result_json, '$.opportunityChannels.recommendations'),
+                func.json_array_length(YaoRun.result_json, '$.opportunityChannels.researchCandidates'),
             ).where(YaoRun.id.in_(ids))).all()
             result = []
-            for run_id, mode, encoded, candidate_type, next_day_count, continuation_count in rows:
+            for run_id, mode, encoded, candidate_type, candidate_count, nonempty_profiles, next_day_count, continuation_count, opportunity_count, opportunity_research_count in rows:
                 values = json.loads(encoded)
                 metadata = dict(zip(("generatedAt", "as_of", "cutoff_at", "scanSlot", "status",
                                      "dataQuality", "data_quality", "premarketAssessment",
-                                     "primarySelectionMode", "primaryObjective", "dailyAssessment"), values))
-                metadata.update(candidates=[] if candidate_type == "array" else None,
+                                     "primarySelectionMode", "primaryObjective", "dailyAssessment"), values[:11]))
+                opportunity_assessment = dict(zip(('version', 'asOf', 'diagnostics', 'policyVersion'), values[11:]))
+                opportunity_assessment['researchRowCount'] = opportunity_research_count or 0
+                metadata.update(candidates=([True] if candidate_count else []) if candidate_type == "array" else None,
+                                profileCandidates={"nonempty": [True]} if nonempty_profiles else {},
                                 nextDayWatchlist=[True] if next_day_count else [],
                                 nextDayContinuationWatchlist=[True] if continuation_count else [])
-                result.append({"run_id": run_id, "mode": mode, "result": metadata})
+                result.append({"run_id": run_id, "mode": mode, "result": metadata,
+                               'opportunity_recommendation_count': opportunity_count or 0,
+                               'opportunity_assessment': opportunity_assessment})
             return result
 
     def get_latest_yao_run(self, *, mode: Optional[str] = None) -> Optional[Dict[str, Any]]:
