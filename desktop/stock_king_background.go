@@ -151,10 +151,30 @@ func (a *App) SetStockKingBackgroundLearning(enabled bool) error {
 }
 
 func (a *App) GetStockKingBackgroundStatus() map[string]any {
-	payload := map[string]any{"status": "never_run", "enabled": backgroundLearningEnabled(a.paths)}
+	// The durable status can contain an entire completed scan in result. Vue
+	// consumes only these status fields; decoding into a map would allocate and
+	// transfer every archived quote and research row on each page poll.
+	var status struct {
+		Status    string `json:"status"`
+		UpdatedAt string `json:"updatedAt"`
+		Slot      string `json:"slot"`
+		TaskID    string `json:"taskId"`
+		Stage     string `json:"stage"`
+		Message   string `json:"message"`
+		Error     string `json:"error"`
+	}
+	payload := map[string]any{"status": "never_run"}
 	encoded, err := os.ReadFile(backgroundStatusPath(a.paths))
-	if err == nil {
-		_ = json.Unmarshal(encoded, &payload)
+	if err == nil && json.Unmarshal(encoded, &status) == nil {
+		for key, value := range map[string]string{
+			"status": status.Status, "updatedAt": status.UpdatedAt,
+			"slot": status.Slot, "taskId": status.TaskID, "stage": status.Stage,
+			"message": status.Message, "error": status.Error,
+		} {
+			if value != "" {
+				payload[key] = value
+			}
+		}
 	}
 	payload["enabled"] = backgroundLearningEnabled(a.paths)
 	payload["autoRecommendations"] = autoRecommendationsEnabled(a.paths)
