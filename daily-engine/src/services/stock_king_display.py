@@ -196,7 +196,7 @@ def _daily_refresh_error(run: dict[str, Any]) -> str:
 def _opportunity_versions(*, historical: bool = False) -> set[str]:
     """Known frozen contracts survive upgrades; fresh publications use current rules."""
     from src.services.yao_scout.opportunity_channels import VERSION
-    return {VERSION, 'opportunity-em-20261028-v1'} if historical else {VERSION}
+    return {VERSION, 'opportunity-em-20261028-v1', 'opportunity-em-20261029-v2'} if historical else {VERSION}
 
 
 def _opportunity_assessment_valid(run: dict[str, Any], *, historical: bool = False) -> bool:
@@ -208,6 +208,8 @@ def _opportunity_assessment_valid(run: dict[str, Any], *, historical: bool = Fal
     version = packet.get('version')
     if version not in _opportunity_versions(historical=historical) or not isinstance(rows, list) or len(rows) > 5:
         return False
+    accepted_grades = {'E-A', 'M-A'} if version in {
+        'opportunity-em-20261028-v1', 'opportunity-em-20261029-v2'} else {'F-A'}
     published = _generated_at(run).astimezone(_SHANGHAI_TZ)
     try:
         assessed = datetime.fromisoformat(packet.get('asOf') or '')
@@ -236,7 +238,7 @@ def _opportunity_assessment_valid(run: dict[str, Any], *, historical: bool = Fal
                 seen.add(row['code'])
                 opportunity = row.get('opportunity') or {}
                 if (opportunity.get('version') != version or row.get('ruleRecommendation') is not False
-                        or opportunity.get('grade') not in {'E-A', 'M-A', 'B', 'C'}
+                        or opportunity.get('grade') not in accepted_grades | {'B', 'C'}
                         or opportunity.get('detectedAt') != packet.get('asOf')):
                     return False
                 sources, metrics = opportunity.get('sourceEvidence') or {}, opportunity.get('metrics') or {}
@@ -247,14 +249,14 @@ def _opportunity_assessment_valid(run: dict[str, Any], *, historical: bool = Fal
                 except (TypeError, ValueError, OverflowError):
                     fresh_minute = False
                 has_change = any(type(metrics.get(key)) in (float, int) and math.isfinite(metrics[key])
-                                 for key in ('r1_pct', 'r3_pct', 'r5_pct', 'r15_pct'))
+                                 for key in ('r1_pct', 'r3_pct', 'r5_pct', 'r15_pct', 'netReturn30mPct', 'pathEfficiency30m'))
                 if (fresh_minute and sources.get('minuteSource') and has_change
                         and not quote_check(row.get('quote') or {}, row['code'], published)):
                     evidence_count += 1
             return evidence_count > 0
         return all(isinstance(row, dict) and row.get('ruleRecommendation') is True
             and (row.get('opportunity') or {}).get('version') == version
-            and (row.get('opportunity') or {}).get('grade') in {'E-A', 'M-A'}
+            and (row.get('opportunity') or {}).get('grade') in accepted_grades
             and not (row.get('opportunity') or {}).get('hardVetoes')
             and ((row.get('opportunity') or {}).get('buyWindow') or {}).get('status') == 'observed'
             and not quote_check(row.get('quote') or {}, row.get('code'), published) for row in rows)

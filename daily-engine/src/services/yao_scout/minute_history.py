@@ -863,6 +863,32 @@ def _robust_z(current, history, *, floor):
     return max(-MINUTE_PARAMS['zClip'], min(MINUTE_PARAMS['zClip'], (current-centre)/scale))
 
 
+def _flow_amount_windows(rows, end):
+    """Exact (start, end] cash turnover, with both price endpoints present.
+
+    This is a denominator for provider-classified fund flow, never a signed
+    volume proxy. Gaps, mixed sources and lunch crossings stay unavailable.
+    """
+    result = {}
+    for horizon in (15, 30, 60):
+        prices = window(rows, end, horizon + 1)
+        if not prices:
+            continue
+        amounts = prices[1:]
+        sources = {row.get('source') for row in prices}
+        if (len(sources) != 1 or not next(iter(sources))
+                or any(len(set(row.get('sources') or [row.get('source')])) != 1 for row in prices)
+                or any(row.get('amount_cny') is None or row['amount_cny'] < 0 for row in amounts)):
+            continue
+        result[str(horizon)] = {
+            'amountCny': sum(row['amount_cny'] for row in amounts),
+            'start': (end - timedelta(minutes=horizon)).isoformat(),
+            'end': end.isoformat(), 'barCount': horizon,
+            'expectedBarCount': horizon, 'source': prices[-1]['source'],
+        }
+    return result
+
+
 def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
     cutoff = _datetime(cutoff)
     rows = normalize_bars(rows, cutoff)
@@ -873,6 +899,7 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
               'baselineReady':False, 'baselineDates':[], 'missingHistoryDates':[],
               'baselineStatus':'current_minutes_unavailable', 'sessionWindow':None,
               'sourceTimePrecision':'bar_end', 'metricDefinitions':METRIC_DEFINITIONS.copy(),
+              'flowAmountWindows': {},
               'v11Inputs':{}, 'v11Coverage':{'status':'insufficient','days':0,'requiredDays':FORMAL_HISTORY_DAYS}}
     result['metricDefinitions'].update(amount_3m='截至该分钟结束时间的连续3根1分钟K线成交额之和（元）',
         local_high_5m='此前5根完整1分钟K线最高价，不含当前根（元）',
@@ -902,6 +929,7 @@ def compute_bar_evidence(rows, cutoff, *, expected_dates=None):
     if prior:
         metrics.update(local_high_5m=max(r['high'] for r in prior),local_low_5m=min(r['low'] for r in prior))
     current_features = _window_features(current, end)
+    result['flowAmountWindows'] = _flow_amount_windows(current, end)
     metrics['amount_3m'] = current_features['amount_3m']
     # Cumulative VWAP only when every elapsed regular-session bar is present.
     stamps = [end.replace(hour=9,minute=31)+timedelta(minutes=i) for i in range(330)]

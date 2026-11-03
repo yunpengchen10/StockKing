@@ -590,7 +590,8 @@ def prepare_sector_membership(codes, cutoff, cache_dir, *, getter=None, timeout=
 
 
 def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_fetcher=None,
-                       prepared=None, timeout=20, deadline=None, on_result=None):
+                       prepared=None, timeout=20, deadline=None, on_result=None, on_minutes=None,
+                       preferred_industry_order=None):
     """Collect shared peers and publish independently usable candidate packets.
 
     The caller may retain ``on_result(code, packet)`` snapshots if its own outer
@@ -599,6 +600,7 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
     industry's denominator or makes an incomplete window pass.
     """
     codes = list(dict.fromkeys(codes))
+    minute_count = 65 if on_minutes is not None else 20
     started = monotonic()
     deadline = min(deadline, started+max(0,timeout)) if deadline is not None else started+max(0,timeout)
     return_reserve = min(2., max(0, deadline-started)*.2)
@@ -633,11 +635,43 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
     # Stable industry order is only a local-read tie breaker. Network service
     # rotates by prior collection debt, concentrating on completion below.
     ordered_boards = sorted(selected_boards, key=lambda board: (len(selected_boards[board]), str(board)))
+    if on_minutes is not None:
+        # Match the funds collector's candidate-discovery order. Otherwise a
+        # tight budget can collect money for one industry and bars for another.
+        preferred = preferred_industry_order if preferred_industry_order is not None else [
+            membership.get(code, {}).get('code') for code in codes]
+        preferred = list(dict.fromkeys(str(board) for board in preferred if board is not None))
+        positions = {board: index for index, board in enumerate(preferred)}
+        ordered_boards.sort(key=lambda board: (positions.get(str(board), len(positions)), str(board)))
     all_codes = list(dict.fromkeys(peer for board in ordered_boards
                                   for peer in sorted(set(selected_boards[board]))))
     def has_required_windows(code, normalized):
         ends = requested_ends.get(code) or {_datetime(cutoff)}
-        return all(window(normalized, end, 6) for end in ends)
+        count = 31 if on_minutes is not None else 6
+        for end in ends:
+            part = window(normalized, end, count)
+            if not part:
+                return False
+            if on_minutes is not None and any(number(row.get('amount_cny')) is None for row in part[1:]):
+                return False
+        return True
+
+    def emit_minutes(code, bars):
+        if on_minutes is not None and bars:
+            from .minute_history import compute_bar_evidence
+            packet = compute_bar_evidence(bars, cutoff, expected_dates=[])
+            packet['code'] = code
+            packet['flowAmountWindowsByEnd'] = {}
+            for end in sorted(requested_ends.get(code) or {_datetime(cutoff)}):
+                historical = (packet if packet.get('asOf') == end.isoformat()
+                              else compute_bar_evidence(bars, end, expected_dates=[]))
+                if historical.get('asOf') != end.isoformat():
+                    continue
+                packet['flowAmountWindowsByEnd'][end.isoformat()] = {
+                    key: historical[key] for key in ('source', 'asOf', 'flowAmountWindows', 'dataLineage')
+                    if key in historical}
+                packet['flowAmountWindowsByEnd'][end.isoformat()]['code'] = code
+            on_minutes(code, packet)
     rows, normalized_rows = {}, {}
     if archive:
         cache_scope = str(Path(cache_dir).resolve())
@@ -653,7 +687,7 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
     memory_hits = len(rows)
     def cached_minutes(code):
         try:
-            return code, archive.read_recent(code, cutoff, minutes=20)
+            return code, archive.read_recent(code, cutoff, minutes=minute_count)
         except Exception:
             return code, []
     # Separate local reads from network calls, so a few slow providers cannot
@@ -661,11 +695,14 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
     # Candidate minutes have just been collected by this scan. Read these
     # shared industry constituents first, before the bounded local-read budget
     # is consumed by thousands of peers which may have no local session yet.
-    cache_order = list(dict.fromkeys([code for code in codes if code in requested_ends]+all_codes))
+    cache_order = (all_codes if on_minutes is not None else
+                   list(dict.fromkeys([code for code in codes if code in requested_ends]+all_codes)))
     cached, _ = bounded_fetch_map(cached_minutes, [code for code in cache_order if code not in rows] if archive else [], workers=8,
         timeout=min(2., max(0,collection_deadline-monotonic())*.25))
     rows.update(cached)
     normalized_rows.update({code:normalize_bars(bars, cutoff) for code,bars in cached})
+    for code, bars in rows.items():
+        emit_minutes(code, bars)
     missing = {code for code in all_codes if not has_required_windows(code, normalized_rows.get(code, {}))}
     errors = {}
     priorities = []
@@ -683,6 +720,9 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
         priorities.append((needed, len(absent), str(board), absent))
     fair_order, _, industry_order = sector_collection_plan(priorities, cache_dir)
     primary_by_board = {board:absent for _, _, board, absent in priorities}
+    if on_minutes is not None:
+        industry_order = [str(board) for board in ordered_boards]
+        fair_order = list(dict.fromkeys(peer for board in industry_order for peer in primary_by_board.get(board, [])))
 
     # A 170-stock scan can share thousands of constituents. Normalize each
     # accepted payload once and invalidate only the affected industry windows;
@@ -727,7 +767,7 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
                 fetchBudget={'seconds':timeout, 'returnReserveSeconds':return_reserve,
                     'priority':'completion_first_rotating_industries_exact_window_cache',
                     'industryOrder':industry_order,
-                    'maximumWorkers':8, 'maximumIndustryWorkers':4 if len(industry_order)>1 else 8,
+                    'maximumWorkers':8, 'maximumIndustryWorkers':8 if on_minutes is not None else 4 if len(industry_order)>1 else 8,
                     'memoryCacheUsablePeers':memory_hits,
                     'unfinishedPeers':unfinished_peers, 'failedPeers':len(failed_peers)})
             result['reasonCodes'] = []
@@ -760,23 +800,23 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
             if monotonic() >= collection_deadline:
                 raise TimeoutError('行业分钟采集达到时间预算')
             if bar_fetcher is not None:
-                bars = bar_fetcher(code,count=20)
+                bars = bar_fetcher(code,count=minute_count)
             else:
                 if supplement:
-                    bars = fetch_recent_bars(code,count=20,cutoff=cutoff,deadline=collection_deadline)
+                    bars = fetch_recent_bars(code,count=minute_count,cutoff=cutoff,deadline=collection_deadline)
                 else:
                     # A missing primary window must not make this worker wait
                     # through a slow secondary host before other constituents
                     # receive their first request. Preserve its actual partial
                     # bars, then supplement in the same bounded pool after the
                     # primary pass. The full peer denominator never changes.
-                    bars = fetch_software_bars(code, count=20,
+                    bars = fetch_software_bars(code, count=minute_count,
                         timeout=max(.1, min(4., collection_deadline-monotonic())))
             if bar_fetcher is None:
                 # Route fresh peers through the same quarantine rules as stock
                 # evidence. Unverified is observable; tainted sessions are not.
                 archive.save(code,bars,cutoff)
-                bars = archive.read_recent(code,cutoff,minutes=20)
+                bars = archive.read_recent(code,cutoff,minutes=minute_count)
                 with _recent_sector_lock:
                     if len(_recent_sector_bars) >= 6000:
                         _recent_sector_bars.clear()
@@ -795,7 +835,7 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
     pending = {}
     usable_codes = set(all_codes)-missing
     peers_by_board = {str(board):peers for board,peers in selected_boards.items()}
-    maximum_per_industry = 4 if len(industry_order)>1 else 8
+    maximum_per_industry = 8 if on_minutes is not None else 4 if len(industry_order)>1 else 8
 
     def has_capacity(board):
         return len(set(pending.values()).intersection(peers_by_board[board])) < maximum_per_industry
@@ -822,6 +862,7 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
             if bars:
                 rows[code] = bars
                 normalized_rows[code] = normalize_bars(bars, cutoff)
+                emit_minutes(code, bars)
                 changed_boards = peer_boards.get(code, set())
                 for key in [key for key in shared_windows if key[0] in changed_boards]:
                     shared_windows.pop(key, None)
@@ -898,15 +939,18 @@ def fetch_sector_batch(codes, intraday, cutoff, cache_dir, *, getter=None, bar_f
     return publish(unfinished, 'deadline_partial' if unfinished else 'complete')
 
 
-def compute_fund_evidence(code, data, cutoff):
+def compute_fund_evidence(code, data, cutoff, *, minute_packet=None):
     result = {'metrics':{},'source':'Eastmoney分钟资金流（供应商大单分类估算）','asOf':None,'gaps':[],
               'basis':'主力=大单+超大单；供应商买卖方向及订单大小分类，不等于机构账户真实流入',
-              'flowKind':'vendor_estimate'}
+               'flowKind':'vendor_estimate', 'code':code, 'provider':'eastmoney',
+               'measurementVersion':'eastmoney-main-large-extra-large-cumulative-v1',
+               'amountUnit':'CNY', 'normalizedTimeSemantics':'bar_end',
+               'cumulativeSeries':[], 'conflictingTimes':[], 'conflictingObservations':[]}
     if str(data.get('code')) != code:
         result['gaps'].append('分钟资金流代码不匹配')
         return result
     cutoff = _datetime(cutoff)
-    rows, conflicting = {}, set()
+    rows, conflicting, observations = {}, set(), []
     for raw in data.get('klines',[]):
         fields = raw.split(',')
         try:
@@ -917,6 +961,7 @@ def compute_fund_evidence(code, data, cutoff):
             # Field order: main, small, medium, large, extra-large; reject schema drift.
             if abs(values[0]-values[3]-values[4])>max(2,abs(values[0])*1e-5):
                 continue
+            observations.append((at, values))
             if at in rows and rows[at] != values:
                 conflicting.add(at)
             rows[at] = values
@@ -924,6 +969,13 @@ def compute_fund_evidence(code, data, cutoff):
             continue
     for at in conflicting:
         rows.pop(at,None)
+    result['conflictingTimes'] = sorted(at.isoformat() for at in conflicting)
+    result['cumulativeSeries'] = [{'end':at.isoformat(), **dict(zip(
+        ('main_net_flow','small_net_flow','medium_net_flow','large_net_flow','extra_large_net_flow'), values))}
+        for at, values in sorted(rows.items())]
+    result['conflictingObservations'] = [{'end':at.isoformat(), **dict(zip(
+        ('main_net_flow','small_net_flow','medium_net_flow','large_net_flow','extra_large_net_flow'), values))}
+        for at, values in observations if at in conflicting]
     if not rows or (cutoff-max(rows)).total_seconds()>=300:
         result['gaps'].append('未取得当日新鲜且口径一致的分钟资金流')
         return result
@@ -939,10 +991,11 @@ def compute_fund_evidence(code, data, cutoff):
         result['metrics']['main_net_positive_fraction_3m'] = sum(value > 0 for value in increments)/3
     else:
         result['gaps'].append('资金流缺连续3分钟累计观测，未用当日总量替代')
-    return result
+    from .fund_flow_evidence import annotate_fund_windows
+    return annotate_fund_windows(result, cutoff, minute_packet)
 
 
-def compute_tencent_fund_evidence(code, payload, cutoff):
+def compute_tencent_fund_evidence(code, payload, cutoff, *, minute_packet=None):
     """Keep one provider's cumulative series intact and validate its identities."""
     symbol = ('sh' if code.startswith('6') else 'sz')+code
     if not isinstance(payload, dict) or payload.get('code') != 0:
@@ -994,7 +1047,8 @@ def compute_tencent_fund_evidence(code, payload, cutoff):
         'flowKind':'vendor_estimate', 'rawTimeSemantics':'minute_start',
         'normalizedTimeSemantics':'bar_end', 'timeNormalization':'raw_start_plus_one_minute',
         'rawSourceAsOf':(_datetime(result['asOf'])-timedelta(minutes=1)).isoformat() if result['asOf'] else None})
-    return result
+    from .fund_flow_evidence import annotate_fund_windows
+    return annotate_fund_windows(result, cutoff, minute_packet)
 
 
 def _tencent_fund_evidence(code, cutoff, deadline):

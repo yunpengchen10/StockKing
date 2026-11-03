@@ -6,7 +6,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from src.services.yao_scout.opportunity_channels import VERSION, build_opportunity_channels
+# Versioned historical replay: the live strategy has separate flow-policy tests.
+from src.services.yao_scout.legacy_opportunity_channels_20261029 import VERSION, build_opportunity_channels
 
 NOW = datetime(2026, 10, 28, 9, 40, 15, tzinfo=ZoneInfo('Asia/Shanghai'))
 MINUTE = NOW.replace(second=0)-timedelta(minutes=1)
