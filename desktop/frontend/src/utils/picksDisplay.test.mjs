@@ -73,6 +73,22 @@ const earlyOpportunity = () => ({ code: '600001', name: '早期启动样本', re
     firstDetectionAt: '2026-10-28T10:29:00+08:00', firstDetectionPrice: 10, triggerAt: null,
     buyWindow: { status: 'observed', askPrice: 10.1, sourceTime: '2026-10-28T10:29:55+08:00' } } })
 
+const flowOpportunity = () => {
+  const pick = earlyOpportunity()
+  const common = { status: 'observed', horizonMinutes: 30, provider: 'eastmoney', source: 'eastmoney:fund-minute',
+    asOf: '2026-10-28T10:29:00+08:00', windowStart: '2026-10-28T09:59:00+08:00' }
+  pick.name = '资金趋势样本'
+  Object.assign(pick.opportunity, { version: 'opportunity-flow-20261103-v1', channel: 'F', grade: 'F-A',
+    rankScore: null, rankingComposite: .675, supports: ['完整30分钟资金与趋势已核验'], missing: [],
+    metrics: { entryRiskAtr: 1.25, structuralLow30m: 9.7, netReturn30mPct: 1.2, pathEfficiency30m: .65 },
+    flowEvidence: { stock: { ...common, metrics: { netFlowCny: 2500000, netFlowRatio: .05, positiveMinuteFraction: .8 } },
+      sector: { ...common, sector: { name: '测试行业' }, coverage: { totalPeers: 10, usablePeers: 8, fraction: .8, excludedSelf: true },
+        metrics: { netFlowCny: 6000000, netFlowRatio: .03, positiveMemberFraction: .75, top1PositiveContribution: .25 } } },
+    rankingComponents: { entryRiskAtr: { rawValue: 1.25, rankValue: 1.25, percentile: .6, weight: .2, direction: 'lower', peerUnit: 'stock', peerCount: 8 } },
+  })
+  return pick
+}
+
 test('early opportunity renders before the research lists and unready model with its unconfirmed evidence visible', async () => {
   const saved = researchSnapshot('2026-10-28T10:30:00+08:00', { continuation: [zhengyuObservation()] })
   saved.adaptive.opportunityChannels = { version: 'opportunity-v1', recommendations: [earlyOpportunity()], observations: [] }
@@ -82,8 +98,9 @@ test('early opportunity renders before the research lists and unready model with
   try {
     await flush()
     const text = mounted.visibleText()
-    assert.match(text, /机会精选 · 早期启动 \/ 主升确认/)
-    assert.match(text, /早期启动样本600001E-A · 早期启动/)
+    assert.match(text, /机会精选 · 历史 E \/ M 规则/)
+    assert.match(text, /早期启动样本600001E-A · 历史早期启动/)
+    assert.match(text, /旧版规则记录 · 未按当前资金策略核验/)
     assert.match(text, /价格方向突变，短时量能增加/)
     assert.match(text, /VWAP与板块同步尚未确认/)
     assert.match(text, /回落并持续无法收复开盘价/)
@@ -98,7 +115,7 @@ test('early opportunity renders before the research lists and unready model with
 
 test('expired opportunity quotes stay visible as historical evidence and failed refreshes preserve the cards', async () => {
   const saved = researchSnapshot('2026-10-28T10:30:00+08:00')
-  saved.adaptive.opportunityChannels = { recommendations: [earlyOpportunity()] }
+  saved.adaptive.opportunityChannels = { version: 'opportunity-flow-20261103-v1', recommendations: [flowOpportunity()] }
   const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved,
     StartKingPicksRefresh: async () => { throw new Error('报价服务暂不可用') },
   }, null, Date.parse('2026-10-28T10:30:00+08:00'))
@@ -107,13 +124,38 @@ test('expired opportunity quotes stay visible as historical evidence and failed 
     assert.match(mounted.visibleText(), /源时间在30秒内/)
     mounted.setNow(Date.parse('2026-10-28T10:30:26+08:00'))
     await mounted.runTimer(1000)
-    assert.match(mounted.visibleText(), /早期启动样本/)
+    assert.match(mounted.visibleText(), /资金趋势样本/)
     assert.match(mounted.visibleText(), /历史参考价 · 行情已过期/)
     assert.doesNotMatch(mounted.visibleText(), /源时间在30秒内/)
     await mounted.state().refresh(); await flush()
     assert.match(mounted.visibleText(), /报价服务暂不可用/)
-    assert.match(mounted.visibleText(), /早期启动样本/)
+    assert.match(mounted.visibleText(), /资金趋势样本/)
     assert.equal(refresh.readDisplayedPicks(mounted.storage).adaptive.opportunityChannels.recommendations.length, 1)
+  } finally { mounted.dispose() }
+})
+
+test('the complete page renders current flow amounts, real coverage, source windows and transparent ranking without rewriting evidence', async () => {
+  const saved = researchSnapshot('2026-10-28T10:30:00+08:00')
+  saved.adaptive.opportunityChannels = { version: 'opportunity-flow-20261103-v1', recommendations: [flowOpportunity()], observations: [] }
+  const before = JSON.stringify(saved)
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:00+08:00'))
+  try {
+    await flush()
+    const visible = mounted.visibleText(), all = mounted.text()
+    assert.match(visible, /机会精选 · 资金与持续趋势/)
+    assert.match(visible, /资金趋势样本600001F-A · 资金与持续趋势/)
+    assert.match(visible, /个股30分钟净额250\.00 万元 · 净额\/成交额 5\.00%/)
+    assert.match(visible, /板块30分钟净额测试行业 · 600\.00 万元 · 净额\/成交额 3\.00%/)
+    assert.match(visible, /板块资金覆盖8 \/ 10 只 · 80\.0%（剔除自身）/)
+    assert.match(visible, /净流入分钟占比 80\.0%/)
+    assert.match(visible, /距结构低点 1\.25 ATR/)
+    assert.match(all, /个股资金源时东方财富.*09:59:00.*10:29:00/s)
+    assert.match(all, /等权排序指标0\.675（0—1）/)
+    assert.match(all, /原值 1\.2500 · 越低排序越优 · 分位 0\.600 · 权重 20%/)
+    assert.doesNotMatch(visible, /早期启动 \/ 主升确认|E-A 或 M-A/)
+    assert.equal(mounted.state().opportunities.cards[0].current, true)
+    assert.equal(mounted.state().adaptivePicks.length, 0)
+    assert.equal(JSON.stringify(saved), before)
   } finally { mounted.dispose() }
 })
 

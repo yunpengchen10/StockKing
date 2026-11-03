@@ -13,6 +13,7 @@ from src.services.yao_scout.opportunity_channels import VERSION
 
 
 LEGACY = 'opportunity-em-20261028-v1'
+LEGACIES = [LEGACY, 'opportunity-em-20261029-v2']
 NOW = datetime(2026, 10, 29, 10, 30, 15, tzinfo=timezone(timedelta(hours=8)))
 
 
@@ -21,7 +22,7 @@ def frozen_run(version=VERSION, *, empty=False, now=NOW):
              'price': 10., 'pre_close': 10., 'open_price': 10., 'high': 10.2,
              'low': 9.8, 'change_pct': 0.}
     item = {'code': '600001', 'quote': quote, 'ruleRecommendation': not empty,
-            'opportunity': {'version': version, 'grade': 'B' if empty else 'E-A',
+            'opportunity': {'version': version, 'grade': 'B' if empty else 'E-A' if version in LEGACIES else 'F-A',
                             'detectedAt': now.isoformat(), 'hardVetoes': [],
                             'buyWindow': {'status': 'observed'},
                             'sourceEvidence': {'minuteSource': 'frozen_fixture',
@@ -40,9 +41,10 @@ def frozen_run(version=VERSION, *, empty=False, now=NOW):
 
 
 @pytest.mark.parametrize('empty', [False, True])
-def test_only_known_legacy_contract_can_be_read_but_not_newly_published(monkeypatch, tmp_path, empty):
+@pytest.mark.parametrize('legacy_version', LEGACIES)
+def test_only_known_legacy_contract_can_be_read_but_not_newly_published(monkeypatch, tmp_path, empty, legacy_version):
     monkeypatch.setenv('YAO_SCOUT_DATA_DIR', str(tmp_path))
-    legacy = frozen_run(LEGACY, empty=empty)
+    legacy = frozen_run(legacy_version, empty=empty)
     assert _opportunity_assessment_valid(legacy, historical=True)
     assert displayable_run(legacy, historical=True)
     assert not displayable_run(legacy)
@@ -52,7 +54,7 @@ def test_only_known_legacy_contract_can_be_read_but_not_newly_published(monkeypa
     store.save(legacy, source='history')
     before = store.path.read_bytes()
     restored = store.read()
-    assert restored['adaptive']['opportunityChannels']['version'] == LEGACY
+    assert restored['adaptive']['opportunityChannels']['version'] == legacy_version
     assert restored['opportunityRecommendationCount'] == (0 if empty else 1)
     assert store.path.read_bytes() == before
     current = frozen_run(now=NOW+timedelta(minutes=2), empty=empty)
@@ -60,14 +62,14 @@ def test_only_known_legacy_contract_can_be_read_but_not_newly_published(monkeypa
     assert store.save(current)['adaptive']['opportunityChannels']['version'] == VERSION
 
 
-@pytest.mark.parametrize('version', [LEGACY, 'opportunity-em-future'])
+@pytest.mark.parametrize('version', [*LEGACIES, 'opportunity-em-future'])
 def test_other_display_branch_cannot_publish_unsupported_opportunity_version(version):
     run = frozen_run(version)
     # The legacy generic branch would otherwise admit this as a completed run.
     run.pop('primarySelectionMode')
     run['dataQuality']['stale'] = False
     assert not displayable_run(run)
-    if version != LEGACY:
+    if version not in LEGACIES:
         assert not displayable_run(run, historical=True)
 
 
@@ -81,7 +83,7 @@ def test_unknown_and_mixed_versions_do_not_inherit_legacy_qualification(empty):
     assert not _opportunity_assessment_valid(run, historical=True)
 
 
-@pytest.mark.parametrize('version', [LEGACY, VERSION, 'opportunity-em-future'])
+@pytest.mark.parametrize('version', [*LEGACIES, VERSION, 'opportunity-em-future'])
 def test_header_versions_follow_explicit_history_policy(version):
     run = frozen_run(version, empty=True)
     packet = run['opportunityChannels']
@@ -89,7 +91,21 @@ def test_header_versions_follow_explicit_history_policy(version):
               'opportunity_assessment': {'version': version, 'policyVersion': version,
                   'asOf': packet['asOf'], 'diagnostics': packet['diagnostics'], 'researchRowCount': 1}}
     assert _opportunity_header_valid(header) is (version == VERSION)
-    assert _opportunity_header_valid(header, historical=True) is (version in {LEGACY, VERSION})
+    assert _opportunity_header_valid(header, historical=True) is (version in {*LEGACIES, VERSION})
+
+
+@pytest.mark.parametrize('version,bad_grade', [(VERSION, 'E-A'), (VERSION, 'M-A'), (LEGACY, 'F-A'), (LEGACIES[1], 'F-A')])
+def test_a_new_version_label_never_upgrades_an_incompatible_historical_grade(version, bad_grade):
+    run = frozen_run(version)
+    run['opportunityChannels']['recommendations'][0]['opportunity']['grade'] = bad_grade
+    assert not _opportunity_assessment_valid(run, historical=True)
+
+
+def test_current_empty_assessment_can_use_completed_thirty_minute_evidence():
+    run = frozen_run(empty=True)
+    for group in ['researchCandidates', 'observations']:
+        run['opportunityChannels'][group][0]['opportunity']['metrics'] = {'netReturn30mPct': -.2, 'pathEfficiency30m': .3}
+    assert _opportunity_assessment_valid(run)
 
 
 def test_sql_history_legacy_empty_round_replaces_previous_picks_after_upgrade(monkeypatch, tmp_path):

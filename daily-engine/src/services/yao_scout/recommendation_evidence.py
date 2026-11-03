@@ -73,13 +73,15 @@ def research_selection_row(row, now, *, source=None, source_time=None):
             'meaning': '每个初筛字段使用自身供应商源时；缺失指标不参与名次，未借新报价给旧快照续期'}}
 
 
-def research_queue(frame, limit=None, *, now=None, previous_frame=None, catalysts=None):
+def research_queue(frame, limit=None, *, now=None, previous_frame=None, catalysts=None, flow_discovery=None):
     """Allocate bounded research across activity and independent discovery lanes.
 
     previous_frame is a prior whole-universe observation with timezone-aware
     attrs['captured_at']; catalysts maps security codes to archived per-stock
     context packets (forecasts and optional structured disclosures). Neither
-    input triggers requests. No evidence here grants trading eligibility.
+    input triggers requests. flow_discovery contains same-provider stock/sector
+    packets from build_flow_discovery, reserving at most half this same budget.
+    No evidence here grants trading eligibility.
     """
     if limit is not None and limit < 0:
         raise ValueError('research limit must not be negative')
@@ -124,7 +126,11 @@ def research_queue(frame, limit=None, *, now=None, previous_frame=None, catalyst
                 for row in previous_frame.drop_duplicates('code').to_dict('records')]
     lanes, packets = discovery_lanes(ordered, now, previous_rows=previous_rows,
         previous_at=previous_at, catalysts=catalysts)
-    return allocate_discovery(ordered, limit, lanes, packets)
+    legacy = allocate_discovery(ordered, limit, lanes, packets)
+    if not flow_discovery:
+        return legacy
+    from .fund_flow_discovery import allocate_flow_discovery
+    return allocate_flow_discovery(ordered, legacy, limit, flow_discovery, now)
 
 
 def daily_evidence(frame, cutoff):

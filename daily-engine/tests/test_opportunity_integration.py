@@ -1,4 +1,4 @@
-"""E/M scans, immutable cohorts and durable display work without a T+1 model."""
+"""Current flow scans, immutable cohorts and durable display without a T+1 model."""
 from copy import deepcopy
 from datetime import datetime, timedelta
 import json
@@ -10,13 +10,23 @@ import pytest
 from src.services.stock_king_display import display_counts, displayable_run, LocalPicksDisplayStore
 from src.services.yao_scout.discovery_snapshot import DiscoverySnapshotStore
 from src.services.yao_scout.opportunity_channels import build_opportunity_channels, VERSION
-from tests.test_opportunity_channels import NOW, candidate, minute
+from tests.test_opportunity_channels import NOW as EARLY_NOW, candidate, minute
+from tests.test_flow_opportunity_policy import NOW, inputs as flow_inputs
+from src.services.yao_scout.legacy_opportunity_channels_20261029 import VERSION as LEGACY_VERSION
 from tests.test_local_quote_integration import make_service
 from tests.test_daily_observation_outcomes import service as learning_service, fixture_close, DAYS
 from src.services.yao_scout import daily_observation_outcomes as outcomes
 
 
-def cold_start(monkeypatch, tmp_path, now=NOW):
+@pytest.fixture(autouse=True)
+def forbid_live_http(monkeypatch):
+    import requests
+    def blocked(*args, **kwargs):
+        pytest.fail('Opportunity integration tests must use offline provider fixtures, never live HTTP')
+    monkeypatch.setattr(requests.sessions.Session, 'request', blocked)
+
+
+def cold_start(monkeypatch, tmp_path, now=EARLY_NOW):
     service, tick, _, saved = make_service(monkeypatch, now, tmp_path)
     service.selection_mode = 'auto'
     def quote(code):
@@ -34,28 +44,66 @@ def cold_start(monkeypatch, tmp_path, now=NOW):
     return service, tick, saved
 
 
-def test_default_cold_start_fetches_current_minutes_and_publishes_early_opportunity(monkeypatch, tmp_path):
+def complete_flow_service(monkeypatch, tmp_path, now=NOW):
+    """Real scan/flow aggregation with deterministic providers for four full peers."""
+    from src.services.yao_scout import sector_fund_evidence, fund_flow_discovery
+    from src.services.yao_scout.premarket import previous_session
+    service, tick, _, saved = make_service(monkeypatch, now, tmp_path)
+    service.selection_mode = 'auto'
+    codes = ['600001', '600002', '600003', '600004']
+    service.yao._fetch_snapshot = lambda: pd.DataFrame([
+        {'code': code, 'name': '测试股', 'price': 10.12} for code in codes])
+    history = pd.DataFrame({'date': pd.bdate_range(end=previous_session(now), periods=60),
+        'close': [10.]*60, 'high': [10.1]*60, 'low': [9.9]*60})
+    history.attrs.update(daily_source='fixture_daily', daily_adjustment='unadjusted')
+    service.yao.history_fetcher = lambda *a, **kw: history
+    service.quote_fetcher = lambda code: flow_inputs(code, now=tick[0])[0]['quote']
+    service.minute_fetcher = lambda code, *args: flow_inputs(code, now=tick[0])[1]
+    service.fund_fetcher = lambda code, *args: flow_inputs(code, now=tick[0])[0]['fundEvidence']
+    service.sector_fetcher = None
+    # This helper is also imported by other test modules. Keep this provider
+    # seam local to the helper rather than relying solely on this file's fixture.
+    monkeypatch.setattr(fund_flow_discovery, 'fetch_flow_snapshot', lambda *a, **kw: {
+        'status': 'unavailable', 'rows': [], 'source': 'offline_integration_fixture',
+        'coverage': {'complete': False}, 'reasonCodes': ['offline_discovery_fixture']})
+    members = {code: {'code': 'fixture-sector', 'name': '测试行业', 'provider': 'fixture_membership',
+        'membershipComplete': True, 'membershipCount': 4} for code in codes}
+    monkeypatch.setattr(sector_fund_evidence, 'prepare_sector_membership',
+        lambda *a, **kw: (members, {'fixture-sector': codes}))
+    monkeypatch.setattr(sector_fund_evidence, 'fetch_sector_batch', lambda *a, **kw: {})
+    service.context_provider = SimpleNamespace(collect=lambda now: {'tables': [], 'status': 'unavailable'})
+    return service, tick, saved
+
+
+def test_default_cold_start_fetches_minutes_but_missing_30m_funds_stays_observation(monkeypatch, tmp_path):
     service, _, saved = cold_start(monkeypatch, tmp_path)
     result = service.run('live')
     assert result.get('opportunityChannels'), result.get('message')
     picked = result['opportunityChannels']['recommendations']
-    assert len(picked) == 1, result['opportunityChannels']['diagnostics']
-    assert picked[0]['opportunity']['grade'] == 'E-A'
+    assert len(picked) == 0, result['opportunityChannels']['diagnostics']
+    assert result['opportunityChannels']['observations'][0]['opportunity']['grade'] == 'B'
     assert result['dataQuality']['stockRouting']['earlyMinuteResearchCount'] == 1
     assert result['dataQuality']['minute_coverage']['requested'] == 1
     assert result['candidates'] == []
     assert result['learningLedger']['selectedCount'] == 0
-    assert result['learningLedger']['opportunityRecommendationCount'] == 1
-    assert saved[-1]['opportunityChannels']['recommendations'][0]['code'] == '600001'
+    assert result['learningLedger']['opportunityRecommendationCount'] == 0
+    assert saved[-1]['opportunityChannels']['recommendations'] == []
     assert displayable_run(result)
-    assert display_counts(result)['opportunityRecommendationCount'] == 1
+    assert display_counts(result)['opportunityRecommendationCount'] == 0
     assert display_counts(result)['tradeCandidateCount'] == 0
 
 
-def test_new_opportunities_survive_history_reconciliation_without_daily_or_model_pass(monkeypatch, tmp_path):
-    service, _, _ = cold_start(monkeypatch, tmp_path/'engine')
-    result = service.run('live')
+def test_complete_30m_flow_pipeline_persists_then_reconciles_without_trained_model(monkeypatch, tmp_path):
+    service, _, saved = complete_flow_service(monkeypatch, tmp_path/'engine')
+    result = service.run('live', top_n=1)
     assert result['opportunityChannels']['recommendations']
+    picked = result['opportunityChannels']['recommendations'][0]
+    assert picked['opportunity']['grade'] == 'F-A'
+    assert picked['opportunity']['flowEvidence']['sector']['coverage']['excludedSelf'] is True
+    assert picked['opportunity']['flowEvidence']['sector']['coverage']['totalPeers'] == 3
+    assert saved[-1]['opportunityChannels']['recommendations'][0]['code'] == picked['code']
+    assert result['learningLedger']['opportunityRecommendationCount'] == 1
+    assert result['learningLedger']['selectedCount'] == 0
     monkeypatch.setenv('YAO_SCOUT_DATA_DIR', str(tmp_path/'display'))
     # Lightweight DB headers contain no full research/quote payload.
     header = {'run_id': result['run_id'], 'mode': 'king_live', 'opportunity_recommendation_count': 1,
@@ -83,7 +131,7 @@ def test_expired_publication_cannot_gain_display_from_opportunity_label(monkeypa
 
 def test_discovery_cache_keeps_source_times_and_never_reuses_future_or_prior_day(tmp_path):
     store = DiscoverySnapshotStore(tmp_path)
-    frame = pd.DataFrame([{'code': '600001', 'market_quote': candidate()['quote']}])
+    frame = pd.DataFrame([{'code': '600001', 'market_quote': flow_inputs()[0]['quote']}])
     frame.attrs['source'] = 'test'
     assert store.save(frame, NOW)
     assert store.read(NOW-timedelta(seconds=1)) is None
@@ -102,7 +150,7 @@ def test_opportunity_reference_starts_at_recommendation_not_earlier_control(tmp_
     row = candidate()
     row.update(decision_at=NOW.isoformat(), observationOnly=True, formalEligible=False)
     row['opportunity'] = {'channel': 'E', 'grade': 'B', 'firstDetectionAt': NOW.isoformat()}
-    packet = {'version': VERSION, 'recommendations': [], 'researchCandidates': [row]}
+    packet = {'version': LEGACY_VERSION, 'recommendations': [], 'researchCandidates': [row]}
     scan = {'run_id': 'first-control', 'status': 'completed_observations', 'candidates': [],
             'opportunityChannels': packet}
     first = svc.persist_scan(scan, 'live', NOW, False)
@@ -113,7 +161,7 @@ def test_opportunity_reference_starts_at_recommendation_not_earlier_control(tmp_
     promoted['quote'].update(price=10.5, source_time=later.isoformat())
     promoted['opportunity']['grade'] = 'E-A'
     second = {**scan, 'run_id': 'promoted', 'opportunityChannels': {
-        'version': VERSION, 'recommendations': [promoted], 'researchCandidates': [promoted]}}
+        'version': LEGACY_VERSION, 'recommendations': [promoted], 'researchCandidates': [promoted]}}
     svc.persist_scan(second, 'live', later, False)
     promoted['referencePrice'] = 9.
     promoted['quote'].update(price=9., source_time=(later+timedelta(minutes=2)).isoformat())
@@ -143,7 +191,7 @@ def test_opportunity_future_outcomes_are_gross_reference_observations_only(tmp_p
     row['quote'].update(source_time=START.isoformat())
     row['opportunity'] = {'channel': 'M', 'grade': 'M-A'}
     scan = {'run_id': 'em', 'status': 'completed_observations', 'candidates': [],
-            'opportunityChannels': {'version': VERSION, 'recommendations': [row], 'researchCandidates': [row]}}
+            'opportunityChannels': {'version': LEGACY_VERSION, 'recommendations': [row], 'researchCandidates': [row]}}
     svc.persist_scan(scan, 'live', START, False)
     reviewed = START.replace(hour=17)+timedelta(days=7)
     for index in (1, 3, 5):
@@ -156,15 +204,9 @@ def test_opportunity_future_outcomes_are_gross_reference_observations_only(tmp_p
 
 
 def opportunity_run(now, *, empty=False, no_offers=False, outage=False):
-    row, packet = candidate(), minute()
-    row['quote']['source_time'] = now.isoformat()
-    row['quote']['active_flow_as_of'] = now.isoformat()
-    row['quote']['order_book']['source_time'] = now.isoformat()
-    packet['asOf'] = (now.replace(second=0)-timedelta(minutes=1)).isoformat()
+    row, packet, daily, sector = flow_inputs(now=now)
     if empty:
-        packet['v11Inputs'].update(r1_pct=-.3, r3_pct=-.8, r5_pct=-1., r15_pct=-1.5,
-                                  a1_pct_per_min=-.1, a3_pct_per_min=-.16)
-        packet['currentPrice'] = 9.9
+        packet['trendEvidence']['metrics'].update(net_return_30m_pct=-.1, signed_log_efficiency_30m=-.2)
     if no_offers:
         row['quote']['order_book']['asks'] = []
     if outage:
@@ -173,7 +215,8 @@ def opportunity_run(now, *, empty=False, no_offers=False, outage=False):
     return {'run_id': 'opportunity-'+now.isoformat(), 'status': 'completed_observations',
         'generatedAt': now.isoformat(), 'scanSlot': 'live', 'candidates': [], 'profileCandidates': {},
         'primarySelectionMode': 'daily_observation',
-        'opportunityChannels': build_opportunity_channels([row], now, minute_packets={'600001': packet}),
+        'opportunityChannels': build_opportunity_channels([row], now, minute_packets={'600001': packet},
+            daily_packets={'600001': daily}, sector_flow_packets={'600001': sector}),
         # Old directory and daily/model gates must not own this independent lane.
         'dataQuality': {'snapshot_count': 1, 'stale': True,
             'quote_coverage': {'requested': 1, 'fresh': 0 if outage else 1},
@@ -273,7 +316,7 @@ def test_sql_headers_restore_zero_opportunity_assessment_and_verify_full_payload
 
 
 @pytest.mark.parametrize('slot,official,start,end,status', [
-    ('0940', True, NOW.replace(second=30, minute=41), NOW.replace(second=0, minute=42), 'missed_slot'),
+    ('0940', True, NOW.replace(hour=9, second=30, minute=41), NOW.replace(hour=9, second=0, minute=42), 'missed_slot'),
     ('1455', True, NOW.replace(hour=14, minute=56, second=30), NOW.replace(hour=14, minute=57, second=0), 'expired'),
     ('1455', False, NOW.replace(hour=14, minute=56, second=30), NOW.replace(hour=14, minute=57, second=0), 'expired'),
 ])
@@ -300,10 +343,10 @@ def test_tail_readiness_work_cannot_publish_after_original_slot_window(monkeypat
 
 
 def test_manual_1458_opportunity_is_independent_of_legacy_formal_expiry(monkeypatch, tmp_path):
-    service, _, _ = cold_start(monkeypatch, tmp_path, NOW.replace(hour=14, minute=58))
+    service, _, _ = complete_flow_service(monkeypatch, tmp_path, NOW.replace(hour=14, minute=58))
     result = service.run('live', official=False)
     assert result['opportunityChannels']['recommendations'], result.get('message')
-    assert result['opportunityChannels']['recommendations'][0]['opportunity']['grade'] == 'E-A'
+    assert result['opportunityChannels']['recommendations'][0]['opportunity']['grade'] == 'F-A'
     assert result['legacySelectionStatus'] == 'expired'
     assert result['dataQuality']['opportunityPublication']['permitted'] is True
     assert result['candidates'] == []

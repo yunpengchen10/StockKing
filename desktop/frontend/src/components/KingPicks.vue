@@ -653,32 +653,46 @@ onDeactivated(() => {
         <p class="premarket-footnote">预案截止 09:35（北京时间）。A股 T+1 持有风险仍适用，支撑和压力不保证成交或收益。</p>
       </section>
       <section v-if="opportunities.available" class="opportunity-section" aria-label="机会精选">
-        <div class="adaptive-summary"><div><b>机会精选 · 早期启动 / 主升确认</b><n-tag size="small" type="info" :bordered="false">{{ opportunities.cards.length }} 只 · 独立研究推荐</n-tag><small>本轮 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small></div><n-button size="small" secondary @click="openRecommendationRecords">查看本轮推荐记录</n-button></div>
-        <p class="opportunity-intro">E 关注正在发生的状态跃迁；M 关注已经确认的主升或二波。VWAP、回踩与板块同步用于确认和升级，未确认项逐只保留。研究等级与排序分不是胜率。</p>
+        <div class="adaptive-summary"><div><b>{{ opportunities.title }}</b><n-tag size="small" type="info" :bordered="false">{{ opportunities.cards.length }} 只 · 独立研究推荐</n-tag><small>本轮 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small></div><n-button size="small" secondary @click="openRecommendationRecords">查看本轮推荐记录</n-button></div>
+        <p class="opportunity-intro">{{ opportunities.introduction }}</p>
         <div v-if="opportunities.cards.length" class="pick-grid opportunity-grid">
           <n-card v-for="(card, index) in opportunities.cards" :key="`opportunity-${codeOf(card.pick)}`" size="small" :bordered="false" class="pick-card opportunity-card" :class="{ 'opportunity-historical': !card.current }">
             <template #header><div class="pick-title"><b>{{ index + 1 }}</b><strong>{{ nameOf(card.pick) }}</strong><code>{{ codeOf(card.pick) }}</code><n-tag size="small" :bordered="false" :type="card.channel === 'E' ? 'info' : 'success'">{{ card.grade }} · {{ card.channelLabel }}</n-tag></div></template>
             <div class="pick-body">
               <div class="pick-quote"><strong>{{ card.price === null ? '未取得' : `¥${card.price.toFixed(2)}` }}</strong><span>扫描参考价</span></div>
               <div class="quote-evidence"><b>{{ card.quoteLabel }}</b><br/>来源 {{ quoteSourceLabel(card.source) }} · 源时间 {{ formatTime(card.sourceTime) }}</div>
-              <p><span>状态跃迁</span>{{ card.supports.join('；') || '本轮未记录支持证据' }}</p>
+              <div v-if="card.isFlowStrategy" class="opportunity-flow-metrics">
+                <p><span>个股30分钟净额</span>{{ card.funding.stock.netFlowCny === null ? '未取得' : `${dailyValue(card.funding.stock.netFlowCny / 10000)} 万元` }} · 净额/成交额 {{ card.funding.stock.netFlowRatio === null ? '未取得' : `${dailyValue(card.funding.stock.netFlowRatio * 100)}%` }}</p>
+                <p><span>板块30分钟净额</span>{{ card.funding.sector.sectorName || '板块待核验' }} · {{ card.funding.sector.netFlowCny === null ? '未取得' : `${dailyValue(card.funding.sector.netFlowCny / 10000)} 万元` }} · 净额/成交额 {{ card.funding.sector.netFlowRatio === null ? '未取得' : `${dailyValue(card.funding.sector.netFlowRatio * 100)}%` }}</p>
+                <p><span>板块资金覆盖</span>{{ card.funding.sector.usablePeers ?? '未知' }} / {{ card.funding.sector.totalPeers ?? '未知' }} 只 · {{ card.funding.sector.coverageFraction === null ? '比例未知' : `${dailyValue(card.funding.sector.coverageFraction * 100, 1)}%` }}<template v-if="card.funding.sector.excludedSelf">（剔除自身）</template></p>
+                <p><span>30分钟持续性</span>净流入分钟占比 {{ card.funding.stock.positiveMinuteFraction === null ? '未取得' : `${dailyValue(card.funding.stock.positiveMinuteFraction * 100, 1)}%` }} · 路径效率 {{ dailyValue(card.pathEfficiency30m) }} · 区间涨跌 {{ card.netReturn30mPct === null ? '未取得' : `${dailyValue(card.netReturn30mPct)}%` }}</p>
+                <p><span>入场位置</span>距结构低点 {{ card.entryRiskAtr === null ? '未取得' : `${dailyValue(card.entryRiskAtr)} ATR` }}<template v-if="card.structuralLow30m !== null"> · 结构低点 ¥{{ card.structuralLow30m.toFixed(2) }}</template></p>
+              </div>
+              <p><span>{{ card.isFlowStrategy ? '资金与趋势依据' : '保存时依据' }}</span>{{ card.supports.join('；') || '本轮未记录支持证据' }}</p>
               <p><span>未确认项</span>{{ card.missing.join('；') || '本轮未列出额外缺口；不代表所有指标已确认' }}</p>
               <p v-if="card.counterEvidence.length"><span>反向证据</span>{{ card.counterEvidence.join('；') }}</p>
               <p><span>失效条件</span>{{ card.invalidation.join('；') || '具体失效条件未记录，需继续核验' }}</p>
               <p><span>T+1风险</span>当日新买通常不能当日卖出；盘中失效条件不等于当日可执行止损，仍需承担隔夜风险。</p>
-              <details class="sk-help-details pick-details"><summary>首次发现、买窗与剩余空间</summary>
+              <details class="sk-help-details pick-details"><summary>{{ card.isFlowStrategy ? '资金源时、排序与买窗' : '首次发现、买窗与剩余空间' }}</summary>
                 <p><span>首次发现</span>{{ formatTime(card.firstDetectionAt) }}<template v-if="card.firstDetectionPrice !== null"> · 参考 ¥{{ card.firstDetectionPrice.toFixed(2) }}</template></p>
                 <p><span>真实触发</span>{{ card.triggerAt ? formatTime(card.triggerAt) : '未核验，未将发现时间当成触发时间' }}</p>
                 <p><span>正常买窗</span>{{ card.buyWindow.status === 'observed' ? '扫描时观察到正常卖盘，不等于实际成交' : card.buyWindow.status === 'unavailable' ? '扫描时未发现正常买窗' : '未核验' }}<template v-if="card.buyWindow.askPrice != null"> · 卖盘参考 ¥{{ observationPrice(card.buyWindow.askPrice) }}</template></p>
                 <p><span>买窗源时间</span>{{ formatTime(card.buyWindow.sourceTime) }}</p>
                 <p><span>剩余空间</span>{{ card.spaceStatus === 'observed' && card.remainingSpacePct !== null ? `${card.remainingSpacePct.toFixed(2)}% · 已记录结构参考` : '未取得足够结构证据，不生成目标价' }}</p>
-                <p><span>排序含义</span>{{ card.rankScore === null ? '排序分未记录' : `本轮规则排序分 ${card.rankScore.toFixed(1)}` }}；不代表上涨概率或已验证收益。</p>
+                <template v-if="card.isFlowStrategy">
+                  <p><span>个股资金源时</span>{{ quoteSourceLabel(card.funding.stock.source) }} · {{ formatTime(card.funding.stock.windowStart) }} 至 {{ formatTime(card.funding.stock.sourceTime) }} · {{ card.funding.stock.observed ? '完整30分钟窗口' : '窗口未核验' }}</p>
+                  <p><span>板块资金源时</span>{{ quoteSourceLabel(card.funding.sector.source) }} · {{ formatTime(card.funding.sector.windowStart) }} 至 {{ formatTime(card.funding.sector.sourceTime) }} · {{ card.funding.sector.observed ? '完整30分钟窗口' : '窗口未核验' }}</p>
+                  <p><span>板块资金广度</span>正净流入成分占比 {{ card.funding.sector.positiveMemberFraction === null ? '未取得' : `${dailyValue(card.funding.sector.positiveMemberFraction * 100, 1)}%` }} · 最大单股正净流入贡献 {{ card.funding.sector.topPositiveFraction === null ? '未取得' : `${dailyValue(card.funding.sector.topPositiveFraction * 100, 1)}%` }}</p>
+                  <p><span>等权排序指标</span>{{ card.rankingComposite === null ? '未记录' : card.rankingComposite.toFixed(3) }}（0—1）；只表示本轮合格池内的相对排序，不代表上涨概率或已验证收益。</p>
+                  <p v-for="component in card.rankingComponents" :key="component.key"><span>{{ component.label }}</span>原值 {{ dailyValue(component.rawValue, 4) }}<template v-if="component.peerUnit === 'unique_sector'"> · 板块中位值 {{ dailyValue(component.rankValue, 4) }}</template> · {{ component.direction === 'lower' ? '越低排序越优' : '越高排序越优' }} · 分位 {{ dailyValue(component.percentile, 3) }} · 权重 {{ component.weight === null ? '未记录' : `${dailyValue(component.weight * 100, 0)}%` }} · {{ component.peerUnit === 'unique_sector' ? '板块数' : '股票数' }} {{ component.peerCount ?? '未知' }}</p>
+                </template>
+                <p v-else><span>历史排序含义</span>{{ card.rankScore === null ? '排序分未记录' : `保存时规则排序分 ${card.rankScore.toFixed(1)}` }}；不代表上涨概率或已验证收益。</p>
               </details>
             </div>
             <template #footer><n-space justify="end"><n-button size="small" secondary @click="addWatch(card.pick)">自选</n-button><n-button size="small" type="primary" @click="openKline(card.pick)">图表</n-button></n-space></template>
           </n-card>
         </div>
-        <div v-else class="primary-empty" role="status"><p>{{ opportunities.message || '本轮尚未形成 E-A 或 M-A 机会，已记录线索保留在观察队列。' }}</p></div>
+        <div v-else class="primary-empty" role="status"><p>{{ opportunities.message || '本轮没有通过资金、30分钟持续趋势与入场位置检查的机会，已记录线索保留在观察队列。' }}</p></div>
         <details v-if="opportunities.observations.length" class="sk-help-details opportunity-observations"><summary>其他机会与待确认线索 · {{ opportunities.observations.length }} 只</summary><p v-if="opportunities.observations.length > 10" class="opportunity-observation-count">当前展示 {{ visibleOpportunityObservations.length }} / {{ opportunities.observations.length }} 只，按本轮保存顺序。</p><article v-for="card in visibleOpportunityObservations" :key="`opportunity-observation-${codeOf(card.pick)}`"><b>{{ nameOf(card.pick) }} {{ codeOf(card.pick) }} · {{ card.grade }}</b><p>{{ card.supports.join('；') || '支持证据未记录' }}</p><p>待确认：{{ card.missing.join('；') || '继续观察状态变化' }}</p><p v-if="card.counterEvidence.length">反向证据：{{ card.counterEvidence.join('；') }}</p></article><n-button v-if="opportunities.observations.length > 10" size="small" secondary @click="toggleOpportunityObservations">{{ showAllOpportunityObservations ? '收起至前10条' : `查看全部 ${opportunities.observations.length} 条` }}</n-button></details>
         <p class="opportunity-footnote">机会精选独立于下方模型验证精选。价格随时间过期后保留为历史参考；刷新期间保留已保存名单，每轮原始依据可在扫描历史回看。</p>
       </section>
@@ -938,7 +952,7 @@ onDeactivated(() => {
     </section>
     <n-drawer v-model:show="methodVisible" :width="500" placement="right"><n-drawer-content title="精选 · 方法与使用" closable><div class="pick-explanation">
       <ol class="usage-steps"><li><b>刷新扫描</b> · 检查列表生成时间、行情源时间和覆盖范围。</li><li><b>为何入选</b> · 查看实际因子、价格结构与失效条件。</li><li><b>图表</b> · 使用共用行情核对当前结构。</li><li><b>延后复盘</b> · 查看T+1、T+3、T+5的观察变化与模拟成交。</li></ol>
-      <h3>机会精选 · E / M 双通道</h3><p>E 是早期启动，依据状态跃迁、个股或板块主动性、正常买窗与剩余空间研究；M 是主升确认或二波。VWAP、回踩及板块同步用于确认和升级，不要求早期机会全部满足。缺失证据明确保留，已知强反证仍须考虑。E-A、M-A 与 B、C 观察分开展示，每轮最多5只机会，不凑数。机会是独立规则研究，不等待下方模型完成训练，也不表示通过已验证模型或实际成交。</p>
+      <h3>机会精选 · 资金、持续趋势与入场位置</h3><p>全市场当日累计资金快照用于发现资金流向的板块和个股；随后核验同源30分钟资金净额、完整行业成分覆盖与持续价格结构，最后检查当前价格距结构低点的ATR距离。必需证据缺失时保留观察，不赋予 F-A 资格。每轮最多5只，不凑数；板块强度、个股强度、资金持续性、路径效率和入场距离的相对分位等权排序，展示原值、分位和权重。资金是供应商分类估算，排序不代表胜率或已成交收益。旧 E / M 名单保留原始版本，仅供历史复核。</p>
       <template v-if="isDailyPrimary"><h3>日线条件推荐</h3><p>使用上一完整交易日及更早的日K、当日新鲜报价、涨跌停状态、财报、业绩预告与解禁证据独立筛选。三档分别执行价格距离、压力空间和事件风险条件，每档最多5只；证据缺失或风险不满足仍可为空。日线条件以下一交易日（T+1）为观察目标，未经概率校准。</p><p>日线卡片展示原始日K指标、来源日期、支撑压力和风险缺口；分钟历史与上午模型的准备进度另列，日线条件不作为分钟模型已通过的证据。</p></template>
       <h3>分钟增强 · 任务化学习与规则研究</h3><p>分钟分支筛选沪深主板非ST，每档每轮最多5只。突破和修复使用启动分，延续使用主升分，再计入风险与市场状态调节。每轮重新核验队列，候选及未入选对照一同记录；已保存的V1.1记录仍显示其原版本公式。</p>
       <h3>主推荐与研究观察</h3><p v-if="!isDailyPrimary">主推荐只展示本轮通过统一准入的候选，数据缺失或风险条件未满足时允许空榜。正式主推荐按T+1合法退出的扣费净收益排序与准入。上午方向观察独立考察参考价到当日收盘的价格变化与回撤，不改变正式推荐排序，也不把当天上涨当作当天可卖出的盈利。</p><p>潜伏和延续是两类独立研究观察，在本地精选中直接显示，并随后台已完成的扫描更新；类别与目标日独立标注，不计入主推荐。研究规则分不是上涨概率。旧版候选保留原版本与原始证据，不标记为通过新准入。</p><p v-if="!isDailyPrimary">重复扫描继续使用账本记录的首次主推荐时间和参考价；没有记录的字段显示未知。后续失效的股票退出主推荐，原始记录继续保留，可在推荐记录中查看。</p>
