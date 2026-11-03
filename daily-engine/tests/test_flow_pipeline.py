@@ -125,3 +125,179 @@ def test_failed_archive_read_does_not_bypass_known_revision_quarantine(monkeypat
     result = service.run('live', top_n=5)
     assert result['opportunityChannels']['recommendations'] == []
     assert result['dataQuality']['fundFlowArchive']['status'] == 'unavailable'
+    assert result['dataQuality']['fundFlowArchive']['verifiedPacketCount'] == 0
+    assert result['dataQuality']['fundFlowArchive']['failedPacketCount'] == 4
+    assert result['dataQuality']['fundCollection']['candidate30mObserved'] == 0
+
+
+def test_last_packet_archive_timeout_keeps_earlier_verified_funds(monkeypatch, tmp_path):
+    from src.services.yao_scout.fund_flow_archive import archive_fund_packets
+    from time import monotonic
+    packets = {code: inputs(code)[0]['fundEvidence'] for code in ('600001', '600002')}
+    original = FundFlowArchive.read
+    def read(archive, code, *args, **kwargs):
+        if code == '600002':
+            raise TimeoutError('last packet exceeded its archive allowance')
+        return original(archive, code, *args, **kwargs)
+    monkeypatch.setattr(FundFlowArchive, 'read', read)
+    verified, report = archive_fund_packets(packets, NOW.replace(second=0), tmp_path,
+        clock=lambda: NOW, deadline=monotonic()+10)
+    assert report['status'] == 'partial'
+    assert report['verifiedPacketCount'] == report['failedPacketCount'] == report['timeoutPacketCount'] == 1
+    assert report['savedPacketCount'] == 2
+    assert verified['600001']['archiveStatus'] == 'verified'
+    assert compute_stock_flow(verified['600001'], inputs()[1], NOW)['status'] == 'observed'
+    assert verified['600002']['cumulativeSeries'] == []
+
+
+def test_expired_archive_budget_marks_remaining_packets_without_erasing_first(monkeypatch, tmp_path):
+    from src.services.yao_scout import fund_flow_archive as module
+    seconds = [0.]
+    monkeypatch.setattr(module, 'monotonic', lambda: seconds[0])
+    original = FundFlowArchive.read
+    def read(archive, *args, **kwargs):
+        frozen = original(archive, *args, **kwargs)
+        seconds[0] = 6.
+        return frozen
+    monkeypatch.setattr(FundFlowArchive, 'read', read)
+    packets = {code: inputs(code)[0]['fundEvidence'] for code in ('600001', '600002', '600003')}
+    packets['600004'] = None
+    verified, report = module.archive_fund_packets(packets, NOW.replace(second=0), tmp_path,
+        clock=lambda: NOW, deadline=6.)
+    assert report['verifiedPacketCount'] == report['attemptedPacketCount'] == 1
+    assert report['timeoutPacketCount'] == report['remainingPacketCount'] == 3
+    assert verified['600001']['cumulativeSeries']
+    assert not verified['600002']['cumulativeSeries'] and not verified['600003']['cumulativeSeries']
+
+
+def test_bad_archive_packet_does_not_block_later_independent_packets(monkeypatch, tmp_path):
+    from src.services.yao_scout.fund_flow_archive import archive_fund_packets
+    from time import monotonic
+    original = FundFlowArchive.save
+    def save(archive, packet, *args, **kwargs):
+        if packet['code'] == '600002':
+            raise ValueError('malformed single packet')
+        return original(archive, packet, *args, **kwargs)
+    monkeypatch.setattr(FundFlowArchive, 'save', save)
+    packets = {code: inputs(code)[0]['fundEvidence'] for code in ('600001', '600002', '600003')}
+    verified, report = archive_fund_packets(packets, NOW.replace(second=0), tmp_path,
+        clock=lambda: NOW, deadline=monotonic()+10)
+    assert report['status'] == 'partial' and report['verifiedPacketCount'] == 2
+    assert report['failedPacketCount'] == 1 and report['timeoutPacketCount'] == 0
+    assert verified['600001']['cumulativeSeries'] and verified['600003']['cumulativeSeries']
+
+
+def test_provider_budget_exhaustion_preserves_six_seconds_archive_and_fifteen_seconds_quotes(monkeypatch, tmp_path):
+    from src.services.yao_scout import local_opportunities as local, fund_flow_archive, sector_fund_evidence
+    service, tick, _ = complete_flow_service(monkeypatch, tmp_path)
+    seconds, deadlines = [0.], []
+    monkeypatch.setattr(local, 'monotonic', lambda: seconds[0])
+    monkeypatch.setattr(fund_flow_archive, 'monotonic', lambda: seconds[0])
+    def progress(value, message):
+        if value == 72:
+            seconds[0] = 80.
+            tick[0] = NOW+timedelta(seconds=80)
+    service._progress = progress
+    service.fund_fetcher = None
+    def fund(code, cutoff, **kwargs):
+        deadlines.append(kwargs['deadline'])
+        return inputs(code)[0]['fundEvidence']
+    monkeypatch.setattr(sector_fund_evidence, 'fetch_fund_evidence', fund)
+    original = local.bounded_fetch_map
+    def exhaust(fetch, items, **kwargs):
+        result = original(fetch, items, **kwargs)
+        if fetch.__name__ == 'funds_for':
+            seconds[0] = deadlines[0]
+            tick[0] = NOW+timedelta(seconds=seconds[0])
+        return result
+    monkeypatch.setattr(local, 'bounded_fetch_map', exhaust)
+    result = service.run('live', top_n=1)
+    quality = result['dataQuality']
+    assert set(deadlines) == {99.}
+    assert quality['stageBudgetsSeconds']['fund_flow_archive'] == pytest.approx(6.)
+    assert quality['stageBudgetsSeconds']['final_quotes'] == pytest.approx(15.)
+    assert quality['fundFlowArchive']['verifiedPacketCount'] == 4
+    assert quality['fundCollection']['candidate30mObserved'] == 4
+    assert quality['parallelEvidenceCollection']['archiveReserveSeconds'] == 6
+
+
+def test_three_minute_source_fields_are_not_reported_as_complete_thirty_minute_windows(monkeypatch, tmp_path):
+    service, _, _ = complete_flow_service(monkeypatch, tmp_path)
+    def partial(code, *args):
+        packet = inputs(code)[0]['fundEvidence']
+        packet['metrics'] = {'main_net_flow_3m': 3000.}
+        packet['cumulativeSeries'] = packet['cumulativeSeries'][-4:]
+        return packet
+    service.fund_fetcher = partial
+    result = service.run('live', top_n=5)
+    assert result['dataQuality']['fundCollection']['legacy3mUsable'] == 4
+    assert result['dataQuality']['fundCollection']['aligned30mObserved'] == 0
+    assert result['dataQuality']['fundCollection']['candidate30mObserved'] == 0
+    assert result['opportunityChannels']['recommendations'] == []
+
+
+def test_funds_and_sector_minutes_share_ready_candidate_order_without_reordering_research(monkeypatch, tmp_path):
+    from src.services.yao_scout import sector_fund_evidence
+    service, _, _ = complete_flow_service(monkeypatch, tmp_path)
+    original = service.minute_fetcher
+    def minute(code, *args):
+        return {'code': code, 'metrics': {}} if code == '600001' else original(code, *args)
+    service.minute_fetcher = minute
+    sector_calls = []
+    def sector(codes, *args, **kwargs):
+        sector_calls.append(list(codes))
+        return {}
+    monkeypatch.setattr(sector_fund_evidence, 'fetch_sector_batch', sector)
+    result = service.run('live', top_n=5)
+    priority = ['600002', '600003', '600004', '600001']
+    order = result['dataQuality']['fundCollectionOrder']
+    assert order['priorityCandidateOrder'] == priority
+    assert sector_calls == [priority]
+    assert order['requestedCodes'][0] == '600002'
+    assert set(order['requestedCodes']) == set(priority)  # Every real constituent remains requested.
+    assert result['historyPreparationCodes'] == ['600001', '600002', '600003', '600004']
+
+
+def test_archive_never_relabels_a_packet_from_another_security(monkeypatch, tmp_path):
+    from src.services.yao_scout.fund_flow_archive import archive_fund_packets
+    from time import monotonic
+    packets = {'600001': inputs('600002')[0]['fundEvidence']}
+    verified, report = archive_fund_packets(packets, NOW.replace(second=0), tmp_path,
+        clock=lambda: NOW, deadline=monotonic()+10)
+    assert report['failedPacketCount'] == 1 and report['verifiedPacketCount'] == 0
+    assert verified['600001']['code'] == '600002'
+    assert verified['600001']['cumulativeSeries'] == []
+
+
+def test_candidate_without_own_minutes_can_supply_verified_peer_funds_without_becoming_eligible(monkeypatch, tmp_path):
+    from src.services.yao_scout import sector_fund_evidence
+    service, _, _ = complete_flow_service(monkeypatch, tmp_path)
+    original = service.minute_fetcher
+    service.minute_fetcher = lambda code, *args: (
+        {'code': code, 'metrics': {}} if code == '600001' else original(code, *args))
+    calls = []
+    def funds(code, cutoff):
+        calls.append((code, cutoff))
+        return inputs(code)[0]['fundEvidence']
+    service.fund_fetcher = funds
+    def sectors(codes, intraday, cutoff, directory, **kwargs):
+        # The peer collector independently obtains the completed amount window.
+        # Its callback must not fill the candidate's original missing price path.
+        peer = inputs('600001')[1]
+        peer['flowAmountWindowsByEnd'] = {peer['asOf']: deepcopy(peer)}
+        kwargs['on_minutes']('600001', peer)
+        return {}
+    monkeypatch.setattr(sector_fund_evidence, 'fetch_sector_batch', sectors)
+    result = service.run('live', top_n=5)
+    assert ('600001', NOW.replace(second=0).isoformat()) in calls
+    rows = {row['code']: row for row in result['opportunityChannels']['researchCandidates']}
+    assert rows['600001']['ruleRecommendation'] is False
+    assert rows['600001']['opportunity']['grade'] in {'B', 'C'}
+    assert rows['600001']['opportunity']['flowEvidence']['stock']['status'] == 'unavailable'
+    for code in ('600002', '600003', '600004'):
+        sector = rows[code]['opportunity']['flowEvidence']['sector']
+        assert sector['status'] == 'observed'
+        assert sector['coverage']['usablePeers'] == sector['coverage']['totalPeers'] == 3
+        assert '600001' in sector['observedPeerCodes']
+    selected = {row['code'] for row in result['opportunityChannels']['recommendations']}
+    assert selected and '600001' not in selected

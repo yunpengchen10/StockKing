@@ -510,7 +510,7 @@ def test_expanded_prescreen_researches_every_stock_in_a_small_universe(monkeypat
     budgets = result['dataQuality']['stageBudgetsSeconds']
     assert budgets['daily_history'] == 25
     assert budgets['minute_evidence'] == 30
-    assert budgets['fund_evidence'] == 40
+    assert 39 <= budgets['fund_evidence'] <= 40  # Both workers share one deadline; dispatch consumes a small part.
     assert result['dataQuality']['minute_coverage'] == {'requested': 45, 'usable': 45, 'missing': 0}
     assert result['learningLedger']['researchCount'] == 45
     assert all(len(rows) <= 5 for rows in result['profileCandidates'].values())
@@ -621,7 +621,7 @@ def test_official_expanded_stage_budgets_stay_inside_delivery_deadline(monkeypat
     assert observed_budgets and all(0 <= budget <= remaining for budget, remaining in observed_budgets)
     budgets = result['dataQuality']['stageBudgetsSeconds']
     assert budgets['daily_history'] == 25
-    assert budgets['minute_evidence'] == 30
+    assert budgets['minute_evidence'] == 24  # 45 seconds remain, reserving 6 for archive and 15 for quotes.
     # Funds can start alongside sectors before the latter advances the clock.
     # Their budget remains bounded and never consumes the final quote reserve.
     assert 0 <= budgets['fund_evidence'] <= 40

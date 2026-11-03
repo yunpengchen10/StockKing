@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { opportunityText, opportunityCard, opportunityDisplay } from './opportunityDisplay.mjs'
+import { opportunityText, opportunityCard, opportunityDisplay, opportunityFundingStatus } from './opportunityDisplay.mjs'
 
 const now = Date.parse('2026-10-28T10:30:00+08:00')
 const sample = () => ({ code: '600001', referencePrice: 10.1, quote: { price: 10.1, source: 'tencent', source_time: '2026-10-28T10:29:45+08:00' },
@@ -114,4 +114,58 @@ test('text compatibility preserves supplied evidence without stringifying unknow
   assert.deepEqual(opportunityText(['局部突破', { message: '量能增加' }, { missing: true }, { label: '板块待确认' }, '局部突破']), ['局部突破', '量能增加', '板块待确认'])
   assert.deepEqual(opportunityDisplay({ recommendations: null, observations: {} }, now).cards, [])
   assert.equal(opportunityDisplay(undefined, now).available, false)
+})
+
+test('all missing 30-minute fund windows are an unavailable screen, not a completed zero selection', () => {
+  const channels = { version: 'opportunity-flow-20261103-v1', recommendations: [],
+    diagnostics: { researchedCount: 306, failedConditionCounts: { stock_flow_unavailable: 306, sector_flow_unavailable: 306 } } }
+  const quality = { fundFlowArchive: { status: 'unavailable', reason: 'TimeoutError' },
+    fundCollection: { requested: 4792, returned: 533, usable: 521, unfinished: 4259 },
+    stageMissingReasons: { fund_evidence: 'provider_failed_or_stage_deadline_exhausted' } }
+  const before = JSON.stringify({ channels, quality })
+  const shown = opportunityDisplay(channels, now, false, quality)
+  assert.equal(shown.cards.length, 0)
+  assert.equal(shown.fundingStatus.state, 'unavailable')
+  assert.equal(shown.fundingStatus.researched, 306)
+  assert.equal(shown.fundingStatus.stockWindows, 0)
+  assert.equal(shown.fundingStatus.sectorWindows, 0)
+  assert.match(shown.fundingStatus.message, /无法完成资金筛选/)
+  assert.ok(shown.fundingStatus.reasons.some(reason => /归档超时/.test(reason)))
+  assert.ok(shown.fundingStatus.reasons.some(reason => /4259.*未完成/.test(reason)))
+  assert.match(shown.fundingStatus.shortWindow, /3分钟.*521.*不代表30分钟/)
+  assert.equal(JSON.stringify({ channels, quality }), before)
+})
+
+test('verified fund windows with adverse flow remain a real zero-result assessment', () => {
+  const channels = { version: 'opportunity-flow-20261103-v1', recommendations: [],
+    diagnostics: { researchedCount: 10, failedConditionCounts: { '个股_net_flow_not_positive': 10, 'entry_risk_above_constraint': 3 } } }
+  const shown = opportunityFundingStatus(channels, { fundCollection: { requested: 100, returned: 30, unfinished: 70 } })
+  assert.equal(shown.state, 'verified')
+  assert.equal(shown.stockWindows, 10)
+  assert.equal(shown.sectorWindows, 10)
+  assert.match(shown.message, /没有同时满足/)
+  assert.doesNotMatch(shown.message, /无法完成/)
+})
+
+test('partial archive and fund evidence retain separate packet, candidate and short-window meanings', () => {
+  const shown = opportunityFundingStatus({ version: 'opportunity-flow-20261103-v1',
+    diagnostics: { researchedCount: 10, failedConditionCounts: { stock_flow_unavailable: 3, sector_flow_unavailable: 7 } } },
+  { fundFlowArchive: { status: 'partial', reason: 'TimeoutError', packetCount: 20,
+      verifiedPacketCount: 6, failedPacketCount: 1, remainingPacketCount: 13 },
+    fundCollection: { legacy3mUsable: 15, candidate30mObserved: 7, aligned30mObserved: 12 } })
+  assert.equal(shown.state, 'partial')
+  assert.equal(shown.stockWindows, 7)
+  assert.equal(shown.sectorWindows, 3)
+  assert.ok(shown.reasons.some(reason => /6 \/ 20 个采集包.*13 个尚未处理/.test(reason)))
+  assert.match(shown.shortWindow, /3分钟.*15/)
+})
+
+test('missing new diagnostics stay unknown and legacy history is not reinterpreted as a fund outage', () => {
+  const unknown = opportunityFundingStatus({ version: 'opportunity-flow-20261103-v1', diagnostics: { researchedCount: 5 } })
+  assert.equal(unknown.state, 'unknown')
+  assert.equal(unknown.stockWindows, null)
+  assert.equal(opportunityFundingStatus({ version: 'opportunity-em-20261029-v2', diagnostics: { researchedCount: 5 } }), null)
+  const unverifiedMetrics = opportunityFundingStatus({ version: 'opportunity-flow-20261103-v1',
+    diagnostics: { researchedCount: 5, failedConditionCounts: { '个股_flow_metrics_unverified': 5 } } })
+  assert.equal(unverifiedMetrics.state, 'partial')
 })

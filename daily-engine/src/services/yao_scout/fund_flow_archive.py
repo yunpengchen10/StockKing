@@ -6,6 +6,7 @@ are retained separately and quarantine their timestamp after first observation.
 from __future__ import annotations
 
 from contextlib import closing
+from collections import Counter
 from datetime import datetime
 import hashlib
 import json
@@ -138,3 +139,78 @@ class FundFlowArchive:
             else:
                 packet['reasons'].append('no_observed_unconflicted_history_for_requested_source')
             return packet
+
+
+def archive_fund_packets(packets, cutoff, directory, *, clock, deadline, timeout=1):
+    """Verify packets independently; a late failure cannot erase earlier checks.
+
+    A packet is usable only after its own archive read has applied all known
+    revision tombstones. Failed or unattempted packets stay unavailable.
+    """
+    started = monotonic()
+    malformed = {code for code, packet in packets.items() if not isinstance(packet, dict)}
+    output = {code: dict(packet) if isinstance(packet, dict) else {'metrics': {}}
+              for code, packet in packets.items()}
+    eligible = [code for code, packet in output.items() if packet.get('cumulativeSeries') or code in malformed]
+    summary = {'status': 'not_required', 'packetCount': len(eligible),
+        'savedPacketCount': 0, 'verifiedPacketCount': 0, 'failedPacketCount': 0,
+        'timeoutPacketCount': 0, 'remainingPacketCount': 0, 'unverifiedPacketCount': len(eligible),
+        'attemptedPacketCount': 0, 'noSeriesPacketCount': len(output)-len(eligible),
+        'savedRows': 0, 'conflicts': 0, 'reasonCounts': {},
+        'meaning': '逐包保存并读取已知冲突隔离；已核验部分保留，未核验部分不能参与资金窗口'}
+    reasons = Counter()
+
+    def reject(code, error, *, attempted):
+        timed_out = isinstance(error, TimeoutError) or monotonic() >= deadline
+        reason = 'fund_archive_deadline_exhausted' if timed_out else 'fund_archive_packet_unverified'
+        packet = output[code]
+        output[code] = {**packet, 'cumulativeSeries': [], 'archiveStatus': 'unavailable',
+            'reasonCodes': list(dict.fromkeys([*(packet.get('reasonCodes') or []), reason]))}
+        summary['failedPacketCount'] += 1
+        summary['timeoutPacketCount'] += int(timed_out)
+        summary['remainingPacketCount'] += int(not attempted and timed_out)
+        reasons[type(error).__name__] += 1
+
+    archive = None
+    if eligible:
+        try:
+            archive = FundFlowArchive(directory, timeout=timeout, deadline=deadline)
+        except (OSError, ValueError, TypeError, sqlite3.Error) as error:
+            for code in eligible:
+                reject(code, error, attempted=False)
+    if archive is not None:
+        for code in eligible:
+            if code in malformed:
+                reject(code, TypeError('fund packet must be a dictionary'), attempted=False)
+                continue
+            if monotonic() >= deadline:
+                reject(code, TimeoutError('fund archive deadline exhausted'), attempted=False)
+                continue
+            summary['attemptedPacketCount'] += 1
+            packet = dict(output[code])
+            try:
+                if str(packet.get('code') or '') != str(code):
+                    raise ValueError('fund packet identity does not match requested security')
+                observed_at = clock()
+                saved = archive.save(packet, cutoff, observed_at=observed_at)
+                if saved.get('status') != 'saved':
+                    raise ValueError('fund archive identity or time basis unverified')
+                summary['savedPacketCount'] += 1
+                summary['savedRows'] += saved.get('saved', 0)
+                summary['conflicts'] += saved.get('conflicts', 0)
+                frozen = archive.read(code, timestamp(cutoff).date().isoformat(), packet.get('provider'),
+                    packet.get('measurementVersion'), as_of=observed_at, source=packet.get('source'))
+                output[code] = {**packet, 'cumulativeSeries': frozen['cumulativeSeries'],
+                    'conflictingTimes': frozen['conflictingTimes'], 'archiveStatus': 'verified'}
+                summary['verifiedPacketCount'] += 1
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as error:
+                reject(code, error, attempted=True)
+    summary['unverifiedPacketCount'] = len(eligible)-summary['verifiedPacketCount']
+    if eligible:
+        summary['status'] = ('saved' if not summary['failedPacketCount'] else
+                             'partial' if summary['verifiedPacketCount'] else 'unavailable')
+    summary['reasonCounts'] = dict(reasons)
+    if reasons:
+        summary['reason'] = next(iter(reasons))
+    summary['elapsedMs'] = round((monotonic()-started)*1000)
+    return output, summary

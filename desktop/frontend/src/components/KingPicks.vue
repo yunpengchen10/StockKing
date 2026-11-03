@@ -98,7 +98,8 @@ const adaptive = computed(() => result.value?.adaptive || { candidates: [], chan
 const recordsRunId = computed(() => adaptive.value.run_id || adaptive.value.runId || result.value.displayRunId || '')
 const premarketNow = ref(Date.now())
 let premarketTimer = null
-const opportunities = computed(() => opportunityDisplay(adaptive.value.opportunityChannels, premarketNow.value, viewingHistory.value))
+const opportunities = computed(() => opportunityDisplay(adaptive.value.opportunityChannels, premarketNow.value, viewingHistory.value,
+  adaptive.value.dataQuality || adaptive.value.data_quality || {}))
 const showAllOpportunityObservations = ref(false)
 const visibleOpportunityObservations = computed(() => showAllOpportunityObservations.value
   ? opportunities.value.observations : opportunities.value.observations.slice(0, 10))
@@ -700,7 +701,16 @@ onDeactivated(() => {
             <template #footer><n-space justify="end"><n-button size="small" secondary @click="addWatch(card.pick)">自选</n-button><n-button size="small" type="primary" @click="openKline(card.pick)">图表</n-button></n-space></template>
           </n-card>
         </div>
-        <div v-else class="primary-empty" role="status"><p>{{ opportunities.message || '本轮没有通过资金、30分钟持续趋势与入场位置检查的机会，已记录线索保留在观察队列。' }}</p></div>
+        <div v-else class="primary-empty" role="status">
+          <template v-if="opportunities.fundingStatus">
+            <p><b>{{ opportunities.fundingStatus.title }}</b> · {{ opportunities.fundingStatus.message }}</p>
+            <p>已研究 {{ opportunities.fundingStatus.researched ?? '未知' }} 只 · 30分钟个股资金窗口可核验 {{ opportunities.fundingStatus.stockWindows ?? '未知' }} / {{ opportunities.fundingStatus.researched ?? '未知' }} 只 · 同窗板块资金窗口可核验 {{ opportunities.fundingStatus.sectorWindows ?? '未知' }} / {{ opportunities.fundingStatus.researched ?? '未知' }} 只（按研究个股计）</p>
+            <p v-for="reason in opportunities.fundingStatus.reasons" :key="reason">{{ reason }}</p>
+            <p v-if="opportunities.fundingStatus.collection">{{ opportunities.fundingStatus.collection }}</p>
+            <p v-if="opportunities.fundingStatus.shortWindow">{{ opportunities.fundingStatus.shortWindow }}</p>
+          </template>
+          <p v-else>{{ opportunities.message || '本轮没有通过资金、30分钟持续趋势与入场位置检查的机会，已记录线索保留在观察队列。' }}</p>
+        </div>
         <details v-if="opportunities.observations.length" class="sk-help-details opportunity-observations"><summary>其他机会与待确认线索 · {{ opportunities.observations.length }} 只</summary><p v-if="opportunities.observations.length > 10" class="opportunity-observation-count">当前展示 {{ visibleOpportunityObservations.length }} / {{ opportunities.observations.length }} 只，按本轮保存顺序。</p><article v-for="card in visibleOpportunityObservations" :key="`opportunity-observation-${codeOf(card.pick)}`"><b>{{ nameOf(card.pick) }} {{ codeOf(card.pick) }} · {{ card.grade }}</b><p>{{ card.supports.join('；') || '支持证据未记录' }}</p><p>待确认：{{ card.missing.join('；') || '继续观察状态变化' }}</p><p v-if="card.counterEvidence.length">反向证据：{{ card.counterEvidence.join('；') }}</p></article><n-button v-if="opportunities.observations.length > 10" size="small" secondary @click="toggleOpportunityObservations">{{ showAllOpportunityObservations ? '收起至前10条' : `查看全部 ${opportunities.observations.length} 条` }}</n-button></details>
         <p class="opportunity-footnote">机会精选独立于下方模型验证精选。价格随时间过期后保留为历史参考；刷新期间保留已保存名单，每轮原始依据可在扫描历史回看。</p>
       </section>
