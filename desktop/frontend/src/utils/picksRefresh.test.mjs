@@ -57,9 +57,10 @@ test('manual caches cannot pin the display over newer scheduled scans or roll it
 
 test('persisted display excludes active task metadata and ignores malformed snapshots', () => {
   const storage = memoryStorage()
-  saveDisplayedPicks(storage, { ...snapshot(), refreshTask: { task_id: 'active' }, displaySyncError: 'temporary history failure' })
+  saveDisplayedPicks(storage, { ...snapshot(), refreshTask: { task_id: 'active' }, displaySyncError: 'temporary history failure', displayRecovery: { status: 'recovering_history' } })
   assert.equal(readDisplayedPicks(storage).refreshTask, undefined)
   assert.equal(readDisplayedPicks(storage).displaySyncError, undefined)
+  assert.equal(readDisplayedPicks(storage).displayRecovery, undefined)
   assert.deepEqual(selectDisplayedPicks(snapshot(), {}), snapshot())
   saveDisplayedPicks(storage, { adaptive: { status: 'failed', candidates: [] } })
   assert.deepEqual(readDisplayedPicks(storage), snapshot())
@@ -190,5 +191,141 @@ test('expired wait can recover a completed result, while nonexistent task ids ar
   assert.match(missing.getState().error, /已失效/)
   assert.equal(storage.getItem(REFRESH_TASK_KEY), null)
   assert.equal(missing.resume(), false)
+  assert.equal(clock.pending, 0)
+})
+
+test('completed receipt fetches the persisted display once and preserves its source', async () => {
+  const storage = memoryStorage(), clock = fakeClock(), results = []
+  const fresh = { ...snapshot([], '2026-11-03T10:30:00+08:00'), displayRunId: 'saved-new', displaySource: 'history' }
+  let reads = 0
+  const controller = createPicksRefreshController({ ...clock, storage,
+    startTask: async () => ({ task_id: 'receipt', status: 'pending' }),
+    getTask: async () => ({ status: 'completed', progress: 100, result: null, resultPersisted: true,
+      displayRunId: fresh.displayRunId, displayGeneratedAt: fresh.generatedAt }),
+    getDisplay: async () => { reads++; return fresh }, onResult: value => results.push(value),
+  })
+  await controller.start(5); await flush()
+  assert.equal(reads, 1)
+  assert.deepEqual(results[0].adaptive.candidates, [])
+  assert.equal(results[0].displaySource, 'history')
+  assert.equal(controller.getState().loading, false)
+  assert.equal(storage.getItem(REFRESH_TASK_KEY), null)
+  assert.equal(clock.pending, 0)
+})
+
+test('receipt never labels an older display as complete, but accepts a later scheduled scan', async () => {
+  for (const newer of [false, true]) {
+    const storage = memoryStorage(), clock = fakeClock(), results = []
+    const shown = { ...snapshot([], newer ? '2026-11-03T14:55:00+08:00' : '2026-11-02T14:55:00+08:00'), displayRunId: 'another-run' }
+    const controller = createPicksRefreshController({ ...clock, storage,
+      startTask: async () => ({ task_id: 'receipt', status: 'pending' }),
+      getTask: async () => ({ status: 'completed', resultPersisted: true, displayRunId: 'expected', displayGeneratedAt: '2026-11-03T10:30:00+08:00' }),
+      getDisplay: async () => shown, onResult: value => results.push(value),
+    })
+    await controller.start(5); await flush()
+    assert.equal(results.length, newer ? 1 : 0)
+    assert.equal(controller.getState().loading, false)
+    if (!newer) {
+      assert.match(controller.getState().error, /展示版本尚未同步/)
+      assert.equal(JSON.parse(storage.getItem(REFRESH_TASK_KEY)).task_id, 'receipt')
+    }
+    controller.dispose()
+  }
+})
+
+test('Go deadline failure resumes the same task without submitting a second scan', async () => {
+  const storage = memoryStorage(), clock = fakeClock(), results = []
+  let starts = 0, polls = 0
+  const controller = createPicksRefreshController({ ...clock, storage,
+    startTask: async () => ({ task_id: `scan-${++starts}`, status: 'pending' }),
+    getTask: async id => {
+      assert.equal(id, 'scan-1')
+      if (++polls === 1) throw new Error('Get localhost:57653/api/v1/stock-king/picks/refresh/tasks/scan-1: context deadline exceeded')
+      return { status: 'completed', result: snapshot() }
+    }, onResult: value => results.push(value),
+  })
+  await controller.start(5); await flush()
+  assert.equal(controller.getState().loading, true)
+  assert.match(controller.getState().message, /后台任务继续运行/)
+  assert.equal(await controller.start(5), false)
+  await clock.advance(2000)
+  assert.equal(starts, 1)
+  assert.equal(results.length, 1)
+  assert.equal(controller.getState().error, '')
+  assert.equal(clock.pending, 0)
+})
+
+test('hung status request is retried, ignores its late reply, and keeps one server task', async () => {
+  const storage = memoryStorage(), clock = fakeClock(), results = []
+  let late, polls = 0
+  const controller = createPicksRefreshController({ ...clock, storage, requestTimeoutMs: 100, pollMs: 100,
+    startTask: async () => ({ task_id: 'same', status: 'pending' }),
+    getTask: () => ++polls === 1 ? new Promise(resolve => { late = resolve }) : Promise.resolve({ status: 'completed', result: snapshot() }),
+    onResult: value => results.push(value),
+  })
+  await controller.start(5); await clock.advance(100)
+  assert.equal(controller.getState().loading, true)
+  await clock.advance(200)
+  assert.equal(results.length, 1)
+  late({ status: 'completed', result: snapshot([{ code: 'wrong-late-result' }]) }); await flush()
+  assert.equal(results.length, 1)
+  assert.equal(clock.pending, 0)
+})
+
+test('repeated connection failures stop at the total limit and only explicit refresh probes again', async () => {
+  const storage = memoryStorage(), clock = fakeClock(), results = []
+  let starts = 0, complete = false
+  const controller = createPicksRefreshController({ ...clock, storage, timeoutMs: 3000, pollMs: 100,
+    startTask: async () => { starts++; return { task_id: 'bounded', status: 'pending' } },
+    getTask: async () => { if (!complete) throw new Error('context deadline exceeded'); return { status: 'completed', result: snapshot() } },
+    onResult: value => results.push(value),
+  })
+  await controller.start(5); await clock.advance(3000)
+  assert.equal(controller.getState().loading, false)
+  assert.match(controller.getState().error, /已停止等待.*后台任务不会因此取消/)
+  assert.equal(JSON.parse(storage.getItem(REFRESH_TASK_KEY)).task_id, 'bounded')
+  assert.equal(controller.resume({ task_id: 'bounded', status: 'processing' }), false)
+  assert.equal(clock.pending, 0)
+  complete = true
+  await controller.start(5); await flush()
+  assert.equal(starts, 1)
+  assert.equal(results.length, 1)
+  assert.equal(clock.pending, 0)
+})
+
+test('completed display read timeout retries the receipt while preserving the previous view', async () => {
+  const storage = memoryStorage(), clock = fakeClock(), results = []
+  let reads = 0, starts = 0
+  const fresh = { ...snapshot(), displayRunId: 'persisted' }
+  const controller = createPicksRefreshController({ ...clock, storage,
+    startTask: async () => { starts++; return { task_id: 'persisted-job', status: 'pending' } },
+    getTask: async () => ({ status: 'completed', resultPersisted: true, displayRunId: 'persisted' }),
+    getDisplay: async () => { if (++reads === 1) throw new Error('context deadline exceeded'); return fresh },
+    onResult: value => results.push(value),
+  })
+  await controller.start(5); await flush()
+  assert.equal(results.length, 0)
+  assert.equal(controller.getState().loading, true)
+  await clock.advance(2000)
+  assert.equal(starts, 1)
+  assert.equal(reads, 2)
+  assert.equal(results.length, 1)
+  assert.equal(storage.getItem(REFRESH_TASK_KEY), null)
+})
+
+test('an expired task recovery allows its completed receipt display read to finish', async () => {
+  const storage = memoryStorage(), clock = fakeClock(), results = []
+  storage.setItem(REFRESH_TASK_KEY, JSON.stringify({ task_id: 'old-completed', startedAt: 0 }))
+  let completeRead
+  const controller = createPicksRefreshController({ ...clock, storage, timeoutMs: 1000,
+    getTask: async () => ({ status: 'completed', resultPersisted: true, displayRunId: 'saved' }),
+    getDisplay: () => new Promise(resolve => { completeRead = resolve }), onResult: value => results.push(value),
+  })
+  assert.equal(controller.resume(), true)
+  await clock.advance(2000)
+  assert.equal(controller.getState().loading, true)
+  completeRead({ ...snapshot(), displayRunId: 'saved' }); await flush()
+  assert.equal(results.length, 1)
+  assert.equal(controller.getState().loading, false)
   assert.equal(clock.pending, 0)
 })

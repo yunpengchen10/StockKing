@@ -609,6 +609,72 @@ test('a completed manual refresh replaces the displayed background research list
   } finally { scan.resolve(null); mounted.dispose() }
 })
 
+test('completed task receipt loads its saved display and the manual read button never launches another scan', async () => {
+  const fresh = { ...latestSnapshot(), displayRunId: 'receipt-view', displayEvidenceMode: 'summary' }
+  let reads = 0, scans = 0
+  const mounted = mountPicks({
+    GetDisplayedKingPicks: async () => ++reads === 1 ? oldSnapshot() : fresh,
+    StartKingPicksRefresh: async () => { scans++; return { task_id: 'receipt-task', status: 'pending' } },
+    GetKingPicksRefreshTask: async () => ({ task_id: 'receipt-task', status: 'completed', result: null,
+      resultPersisted: true, displayRunId: fresh.displayRunId, displayGeneratedAt: fresh.generatedAt }),
+  })
+  try {
+    await flush()
+    await mounted.state().refresh(); await flush()
+    assert.equal(scans, 1)
+    assert.equal(reads, 2)
+    assert.equal(mounted.state().result.displayRunId, 'receipt-view')
+    assert.match(mounted.visibleText(), /读取已保存结果/)
+    assert.match(mounted.visibleText(), /当前展示证据摘要；完整研究证据保留在原始扫描记录中/)
+    assert.equal(mounted.state().loading, false)
+    await mounted.state().restoreDisplayed(); await flush()
+    assert.equal(reads, 3)
+    assert.equal(scans, 1)
+  } finally { mounted.dispose() }
+})
+
+test('partial historical recovery is visible until the next completed reconciliation and is not cached', async () => {
+  let recovering = true
+  const saved = latestSnapshot()
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => recovering ? { ...saved,
+    displayRecovery: { status: 'recovering_history', remainingHeaders: 6, message: '正在分批核对历史完成记录，当前已保存结果继续展示。' } } : saved })
+  try {
+    await flush()
+    assert.match(mounted.visibleText(), /尚未确认是否为最新结果；还有 6 条历史记录待核对/)
+    assert.equal(refresh.readDisplayedPicks(mounted.storage).displayRecovery, undefined)
+    recovering = false
+    await mounted.state().restoreDisplayed(); await flush()
+    assert.doesNotMatch(mounted.visibleText(), /历史记录待核对/)
+    assert.equal(mounted.state().result.generatedAt, saved.generatedAt)
+  } finally { mounted.dispose() }
+})
+
+test('summary explanation distinguishes omitted evidence from missing original records', async () => {
+  const saved = latestSnapshot()
+  const summary = { code: '600001', name: '摘要样本', displayEvidenceMode: 'summary', scoreVersion: 'stockking-v1.2',
+    selectionReasons: ['历史线索'], riskReasons: ['本轮准入未满足'],
+    primaryAdmission: { eligible: false, missingReasons: ['资金方向尚未确认'] } }
+  saved.displayEvidenceMode = 'summary'
+  saved.adaptive.evidenceInsufficient = [summary]
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved })
+  try {
+    await flush()
+    mounted.state().showWhy(summary, true); await flush()
+    const text = mounted.visibleText()
+    assert.match(text, /当前为准入摘要/)
+    assert.match(text, /指标明细未随本页摘要加载/)
+    assert.match(text, /来源附件未随本页摘要加载/)
+    assert.match(text, /行情来源 摘要未提供来源字段/)
+    assert.doesNotMatch(text, /该快照未保留来源|未取得指标记录|行情来源 未取得/)
+    assert.doesNotMatch(text, /Early|DistributionRisk/)
+    mounted.state().showWhy({ code: '600002', name: '简要摘要', displayEvidenceMode: 'summary' }, true)
+    await flush()
+    assert.match(mounted.visibleText(), /摘要未提供逻辑版本/)
+    assert.match(mounted.visibleText(), /摘要未列出具体线索/)
+    assert.doesNotMatch(mounted.visibleText(), /旧记录未保存结构化证据链|旧记录未保存具体入选理由/)
+  } finally { mounted.dispose() }
+})
+
 test('a late background read cannot restore research observations removed by a manual refresh with the same timestamp', async () => {
   const generatedAt = '2026-10-23T10:00:00+08:00'
   const delayedRead = deferred()

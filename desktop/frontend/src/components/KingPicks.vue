@@ -20,9 +20,11 @@ const message = useMessage()
 const darkTheme = inject('appDarkTheme', ref(true))
 const loading = ref(false), refreshError = ref(''), viewingHistory = ref(false), methodVisible = ref(false), selectedPick = ref(null), explanationVisible = ref(false)
 const restoring = ref(true), restoreError = ref('')
+const displayRecovery = ref(null)
 const refreshProgress = ref(0), refreshStage = ref(''), refreshElapsed = ref(0)
 const isV11 = computed(() => isEvidenceRuleVersion(adaptive.value.scoreVersion || adaptive.value.modelVersion) || adaptivePicks.value.some(pick => isV11Pick(pick)))
 const explanation = computed(() => explainPick(selectedPick.value || {}))
+const selectedEvidenceSummary = computed(() => selectedPick.value?.displayEvidenceMode === 'summary')
 function showWhy(pick, insufficient = false) { selectedPick.value = pick; selectedIsInsufficient.value = insufficient; explanationVisible.value = true }
 const engine = ref({ state: 'starting', ready: false })
 const maxPerBoard = ref(5)
@@ -53,6 +55,7 @@ try { snapshotStorage = window.localStorage } catch (_) { /* Server persistence 
 const refreshController = createPicksRefreshController({
   startTask: StartKingPicksRefresh,
   getTask: GetKingPicksRefreshTask,
+  getDisplay: GetDisplayedKingPicks,
   storage: snapshotStorage,
   onState(state) {
     loading.value = state.loading
@@ -62,6 +65,7 @@ const refreshController = createPicksRefreshController({
     refreshError.value = state.error
   },
   onResult(fresh) {
+    displayRecovery.value = fresh?.displayRecovery || null
     displayRevision++
     const saved = selectDisplayedPicks(displayedResult.value, fresh)
     displayedResult.value = saved
@@ -424,6 +428,7 @@ async function restoreDisplayed() {
     }
     const payload = await displayReadPromise
     if (disposed || revision !== displayRevision) return
+    displayRecovery.value = payload?.displayRecovery || null
     restoreError.value = payload?.displaySyncError || ''
     const saved = selectDisplayedPicks(displayedResult.value, payload)
     if (saved) {
@@ -603,12 +608,14 @@ onDeactivated(() => {
       <div class="background-switch"><n-switch :value="recommendationsEnabled" @update:value="toggleRecommendations" /><span title="北京时间交易日定时扫描；手动刷新不重复计入训练">自动推荐</span></div>
       <div class="background-switch"><n-switch :value="backgroundEnabled" @update:value="toggleBackground" /><span title="控制每周本地训练与模型晋升检查">自动学习</span></div>
       <n-button secondary @click="openHistory">扫描历史</n-button>
+      <n-button v-if="viewMode !== 'classic'" secondary @click="restoreDisplayed">读取已保存结果</n-button>
       <n-button type="primary" :loading="loading" :disabled="restoring" title="重新获取行情并在本地计算，成功保存后显示" @click="refresh">刷新扫描</n-button>
     </header>
-    <n-alert v-if="refreshError" type="warning" :show-icon="false" class="sync-alert">更新未完成：{{ refreshError }}<br/>已保存的推荐仍保留，可点击“刷新扫描”重试。</n-alert>
+    <n-alert v-if="refreshError" type="warning" :show-icon="false" class="sync-alert">更新未完成：{{ refreshError }}</n-alert>
     <n-alert v-if="viewingHistory || (!engine.ready && !loading)" type="warning" :show-icon="false" class="sync-alert"><span>{{ viewingHistory ? '正在浏览历史快照' : (engine.message || '引擎正在启动，已保存推荐可以继续查看。') }}</span><n-button v-if="viewingHistory" size="tiny" text @click="returnToDisplayed">返回当前</n-button></n-alert>
     <div v-if="loading" class="refresh-progress" role="status" aria-live="polite"><div><b>{{ refreshStage || '正在扫描' }}</b><span>已用 {{ refreshElapsed }} 秒 · {{ refreshProgress }}%</span></div><n-progress type="line" :percentage="refreshProgress" :show-indicator="false" /><small>完成并保存后更新列表；切换页面后可继续查看进度。</small></div>
     <n-alert v-if="restoreError" type="warning" :show-icon="false" class="sync-alert">最新推荐读取失败：{{ restoreError }}<br/>{{ displayedResult ? '当前显示上次保存的推荐，尚未确认是否最新。' : '暂未取得推荐。' }}<n-button size="tiny" text @click="restoring=true; restoreDisplayed()">重试读取</n-button></n-alert>
+    <n-alert v-if="displayRecovery?.status === 'recovering_history' && !viewingHistory" type="info" :show-icon="false" class="sync-alert">{{ displayRecovery.message }} 尚未确认是否为最新结果；还有 {{ displayRecovery.remainingHeaders }} 条历史记录待核对。</n-alert>
     <div v-if="!restoring || viewingHistory" class="picks-meta"><span>{{ pageResult.asOfDate || pageResult.as_of_date || pageResult.generatedAt?.slice(0, 10) || '待生成' }}</span><details class="sk-help-details"><summary>扫描信息</summary><p>生成 {{ pageResult.generatedAt || pageResult.generated_at || '—' }} · 版本 {{ viewMode === 'adaptive' && isDailyPrimary ? dailyAssessment.version || '日线条件规则' : pageResult.methodologyVersion || '兼容旧榜' }}</p><p>后台学习 {{ backgroundEnabled ? '开启' : '暂停' }} · {{ backgroundStatus.status || '未运行' }} {{ backgroundStatus.updatedAt }}</p><p>每轮扫描保留当时证据，可在历史中回看。</p></details></div>
     <n-tabs v-model:value="viewMode" type="line" animated class="view-tabs"><n-tab-pane name="adaptive" tab="本地精选" /><n-tab-pane name="records" tab="推荐记录" /><n-tab-pane name="reviews" tab="延后复盘" /><n-tab-pane name="learning" tab="学习状态" /><n-tab-pane name="classic" tab="策略分组" /></n-tabs>
 
@@ -618,6 +625,7 @@ onDeactivated(() => {
         <div><b>本轮名单</b><span v-if="opportunities.available">机会精选 {{ opportunities.cards.length }} 只</span><span v-if="premarketView.current">集合竞价 / 开盘预案 {{ premarketPicks.length }} 只</span><span v-else>{{ isDailyPrimary ? '日线条件推荐' : primaryContractKnown ? opportunities.available ? '模型验证精选' : '主推荐' : '旧版候选' }} {{ adaptivePicks.length }} 只</span><span v-if="hasDailyObservation">日线观察 {{ dailyPicks.length }} 只</span><span>研究观察 {{ nextDayWatchlist.length + nextDayContinuationWatchlist.length }} 只（潜伏 {{ nextDayWatchlist.length }} / 延续 {{ nextDayContinuationWatchlist.length }}）</span></div>
         <small>本轮生成 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small>
       </div>
+      <p v-if="result.displayEvidenceMode === 'summary'" class="opportunity-intro">当前展示证据摘要；完整研究证据保留在原始扫描记录中。</p>
       <section v-if="premarketView.available" class="premarket-plans" :class="{ 'premarket-historical': premarketView.historical }">
         <div class="adaptive-summary premarket-summary"><div><b>{{ premarketView.current ? '集合竞价 / 开盘预案' : '历史集合竞价 / 开盘预案' }} · {{ premarketPicks.length }} 只</b><n-tag size="small" :type="premarketView.current ? 'info' : 'warning'" :bordered="false">{{ premarketView.phaseLabel }}</n-tag><small>昨夜基准 {{ premarketAssessment.baselineSession || premarketAssessment.baselineAsOf || '未记录' }} · 目标交易日 {{ premarketView.session || '未记录' }}</small></div></div>
         <p v-if="premarketView.historical" class="premarket-notice" role="status">此预案已结束或正在历史回看，不是当前交易指示。09:35 起以新一轮盘中核验结果为准；以下价格和条件只保留当时记录。</p>
@@ -963,9 +971,10 @@ onDeactivated(() => {
       <details><summary>定时扫描与学习</summary><p>北京时间09:20盘前观察；09:40、09:55、10:30、14:55独立扫描；15:30归档与到期复盘；周五15:45本地训练。自动推荐和自动学习分别控制。错过时点保留遗漏记录，手动刷新不计入正式训练。</p><p>默认至少120个成熟交易日、1000条有效样本，并满足训练和校准分段要求后才检验模型。独立留出段至少60个信号日、50笔完成交易；训练与验证按实际标签结束时间隔离，至少留5个交易日间隔。扣费收益与相对优势的置信下界须为正，回撤不恶化，再从模型实际创建后开展至少20个交易日且至少50笔完成观察的前瞻影子验证。失败标签日与空仓日保留，未达要求继续使用规则。</p><p>本地精选读取后台最新完成并保存的扫描，页面可见时每30秒自动同步，返回页面时重新读取。主推荐、日线观察、潜伏与延续观察随同一快照更新。“刷新扫描”成功后以新结果覆盖当前列表，失败时保留已保存的结果；新一轮无合格候选时明确显示空结果。查看扫描历史时保留所选快照，点击“返回当前”恢复最新结果。模拟成交使用下一完整分钟入场，满足T+1后尝试期限收盘退出；遇跌停、停牌或容量不足则继续持仓，逐日标价并等待首个有完整证据的可卖分钟。缺路径不跳过，未成交独立记录；价格观察与模拟收益均不是用户真实交易。</p></details>
     </div></n-drawer-content></n-drawer>
     <n-drawer v-model:show="explanationVisible" :width="520" placement="right"><n-drawer-content :title="`${nameOf(selectedPick)} · ${selectedIsInsufficient ? '交易条件未满足' : '为什么入选'}`" closable><div class="pick-explanation">
-      <h3>{{ explanation.title }}</h3><small>快照 {{ formatTime(adaptive.generatedAt || result.generatedAt) }} · 行情来源 {{ explanation.source }}<br/>推荐逻辑 {{ explanation.logicVersion }}</small>
-      <h3>{{ selectedIsInsufficient ? '已记录线索（非交易候选）' : '为什么入选' }}</h3><ul v-if="explanation.reasons.length" class="explanation-reasons"><li v-for="reason in explanation.reasons" :key="reason">{{ reason }}</li></ul><p v-else>{{ explanation.reason }}</p>
-      <p v-if="explanation.legacyNotice" class="legacy-notice">{{ explanation.legacyNotice }}</p>
+      <h3>{{ explanation.title }}</h3><small>快照 {{ formatTime(adaptive.generatedAt || result.generatedAt) }} · 行情来源 {{ selectedEvidenceSummary && explanation.source === '未取得' ? '摘要未提供来源字段' : explanation.source }}<br/>推荐逻辑 {{ selectedEvidenceSummary && explanation.logicVersion === '旧记录未保存' ? '摘要未提供逻辑版本' : explanation.logicVersion }}</small>
+      <p v-if="selectedEvidenceSummary" class="legacy-notice">当前为准入摘要。指标明细、研究分与来源附件未在此展开，完整证据保留在原始扫描记录中。</p>
+      <h3>{{ selectedIsInsufficient ? '已记录线索（非交易候选）' : '为什么入选' }}</h3><ul v-if="explanation.reasons.length" class="explanation-reasons"><li v-for="reason in explanation.reasons" :key="reason">{{ reason }}</li></ul><p v-else>{{ selectedEvidenceSummary ? '摘要未列出具体线索，请查看原始扫描记录。' : explanation.reason }}</p>
+      <p v-if="explanation.legacyNotice && !selectedEvidenceSummary" class="legacy-notice">{{ explanation.legacyNotice }}</p>
       <details v-if="explanation.savedExplanation"><summary>原记录说明（不作为补写的入选依据）</summary><p>{{ explanation.savedExplanation }}</p></details>
       <h3>风险与反证</h3><ul v-if="explanation.risks.length" class="explanation-reasons"><li v-for="risk in explanation.risks" :key="risk">{{ risk }}</li></ul><p v-else>未取得具体风险说明，需进一步核验。</p>
       <section v-if="explanation.evidenceChecks.length" class="evidence-checks">
@@ -975,11 +984,11 @@ onDeactivated(() => {
         <p v-if="explanation.missingHistoryDates.length">待补齐日期：{{ explanation.missingHistoryDates.join('、') }}</p>
         <p>{{ isV11Pick(selectedPick) ? '缺失可选因子保留为空，不重新分配权重；报价与交易状态仍须通过检查。' : '此处保留历史快照当时的核验口径。' }}资金指标为供应商分类估算。</p>
       </section>
-      <h3>推荐指标 · 当时的数值与判断</h3><PickIndicatorEvidence :indicators="explanation.indicators" />
-      <details><summary>{{ explanation.scoreLabel }} · {{ scoreOf(selectedPick) }}（不是胜率）</summary><p>{{ explanation.scoreMeaning }}</p><p>{{ explanation.formula }}</p><div v-for="row in explanation.modelScores" :key="row.key" class="score-row"><span>{{ row.key }} · {{ row.label }}</span><b>{{ row.value }}</b></div></details>
-      <h3>证据与来源</h3><p v-if="!explanation.evidence.length">该快照未保留来源；刷新全部后再核对。</p><article v-for="(item,index) in explanation.evidence" :key="index" class="evidence-item"><b>{{ item.title || item.type || '来源' }}</b><p>{{ item.summary || '无摘要' }}</p><small>提取于 {{ formatTime(item.fetched_at) }}（非原始发布时间）</small><a v-if="item.url" :href="item.url" target="_blank" rel="noopener noreferrer">查看来源 ↗</a></article>
+      <h3>推荐指标 · 当时的数值与判断</h3><p v-if="selectedEvidenceSummary && !Array.isArray(selectedPick.indicatorEvidence)">指标明细未随本页摘要加载，请查看原始扫描记录。</p><PickIndicatorEvidence v-else :indicators="explanation.indicators" />
+      <details v-if="!selectedEvidenceSummary"><summary>{{ explanation.scoreLabel }} · {{ scoreOf(selectedPick) }}（不是胜率）</summary><p>{{ explanation.scoreMeaning }}</p><p>{{ explanation.formula }}</p><div v-for="row in explanation.modelScores" :key="row.key" class="score-row"><span>{{ row.key }} · {{ row.label }}</span><b>{{ row.value }}</b></div></details>
+      <h3>证据与来源</h3><p v-if="selectedEvidenceSummary && !Array.isArray(selectedPick.evidence)">来源附件未随本页摘要加载，请查看原始扫描记录。</p><p v-else-if="!explanation.evidence.length">该快照未保留来源；刷新全部后再核对。</p><article v-for="(item,index) in explanation.evidence" :key="index" class="evidence-item"><b>{{ item.title || item.type || '来源' }}</b><p>{{ item.summary || '无摘要' }}</p><small>提取于 {{ formatTime(item.fetched_at) }}（非原始发布时间）</small><a v-if="item.url" :href="item.url" target="_blank" rel="noopener noreferrer">查看来源 ↗</a></article>
       <h3>触发与退出条件</h3><p>观察周期：{{ explanation.entryPlan.holdingWindow }}</p><p>触发：{{ explanation.entryPlan.trigger }}</p><p>失效：{{ explanation.entryPlan.invalidations }}</p><p>不追：{{ explanation.entryPlan.noChase }}</p>
-      <details><summary>数据缺口</summary><p>{{ (explanation.quality.gaps || []).join('；') || '旧记录未保存数据缺口检查' }}</p><p>60日历史：{{ explanation.quality.history60d === true ? '有' : '不足 / 未取得' }}；尾盘分钟数据：{{ explanation.quality.minuteTail === true ? '有' : '未取得' }}。文本摘要需回原文核验。</p></details>
+      <details><summary>数据缺口</summary><p>{{ (explanation.quality.gaps || []).join('；') || (selectedEvidenceSummary ? '摘要未列出数据缺口检查' : '旧记录未保存数据缺口检查') }}</p><p>60日历史：{{ explanation.quality.history60d === true ? '有' : '不足 / 未取得' }}；尾盘分钟数据：{{ explanation.quality.minuteTail === true ? '有' : '未取得' }}。文本摘要需回原文核验。</p></details>
       <n-space style="margin-top:18px"><n-button type="primary" @click="openKline(selectedPick)">图表</n-button></n-space>
     </div></n-drawer-content></n-drawer>
     <n-drawer v-model:show="historyVisible" :width="520" placement="right"><n-drawer-content title="精选历史" closable><n-spin :show="historyLoading">

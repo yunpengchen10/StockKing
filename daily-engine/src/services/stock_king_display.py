@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import os
 import tempfile
 import threading
+from collections import OrderedDict
+from copy import deepcopy
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,11 @@ from src.services.stock_king_service import (
 )
 
 _display_lock = threading.RLock()
+# Cache only the UI projection, never a second in-memory copy of a full scan.
+# Each entry is invalidated by the immutable snapshot file's stat identity.
+_display_cache: OrderedDict[str, tuple[tuple[int, ...], dict[str, Any]]] = OrderedDict()
+_history_checked: dict[tuple[str, str], dict[tuple[Any, ...], datetime | None]] = {}
+_MAX_HISTORY_READS = 2
 logger = logging.getLogger(__name__)
 _SCAN_MODES = tuple(f"king_{slot}" for slot in ("live", "0920", "0922", "0940", "0955", "1030", "1455"))
 _SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -67,28 +75,95 @@ def display_counts(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_IDENTITY_FIELDS = ("code", "name", "symbol", "stock_code", "symbol_code", "stock_name", "ts_code")
+_QUOTE_FIELDS = frozenset("""code name price pre_close previous_close open open_price high low
+    change_pct amount volume turnover_rate volume_ratio source source_time provider_timestamp
+    as_of fetched_at status fresh is_fresh stale suspended limit_up limit_down bid ask bid1 ask1
+    bid_price ask_price quote_status market trading_status""".split())
+_RAW_FIELDS = frozenset("""rawMinuteEvidence rawMinuteEvidenceSeries rawMinuteData rawEvidence
+    cumulativeSeries minuteSeries dailyHistory minuteHistory history bars raw providerPayload
+    rawResponse rawPayload verification_sources market_quote flowAmountWindows""".split())
+_OPPORTUNITY_ROW_FIELDS = frozenset(_IDENTITY_FIELDS) | frozenset("""price referencePrice currentChange
+    source sourceTime source_time quote ruleRecommendation formalEligible trainingEligible
+    training_eligible executable rank opportunity status""".split())
+_INSUFFICIENT_FIELDS = frozenset(_IDENTITY_FIELDS) | frozenset("""price referencePrice currentChange
+    quote source sourceTime status stateLabel strategyBranch modelBranch model scoreVersion
+    recommendationLogicVersion selectionReasons riskReasons risks evidenceGaps evidenceChecks
+    historicalCoverageDays baselineHistoryDays baselineEvidence entryPlan triggers invalidations
+    noChase horizon data_quality thesis tierReasons tier_reasons scoreMeaning primaryAdmission
+    triggerConditions upgradeConditions invalidationConditions expectedHoldingRange""".split())
+
+
+def _without_raw(value: Any) -> Any:
+    """Remove transport/archive material while retaining saved display facts."""
+    if isinstance(value, dict):
+        return {key: _without_raw(item) for key, item in value.items() if key not in _RAW_FIELDS}
+    if isinstance(value, list):
+        return [_without_raw(item) for item in value]
+    return value
+
+
+def _display_pick(pick: Any, *, opportunity: bool = False, summary: bool = False) -> Any:
+    if not isinstance(pick, dict):
+        return pick
+    allowed = _OPPORTUNITY_ROW_FIELDS if opportunity else _INSUFFICIENT_FIELDS if summary else None
+    shown = {key: _without_raw(value) for key, value in pick.items()
+             if (allowed is None or key in allowed) and key not in _RAW_FIELDS}
+    if isinstance(pick.get("quote"), dict):
+        shown["quote"] = {key: value for key, value in pick["quote"].items()
+                          if key in _QUOTE_FIELDS and not isinstance(value, (dict, list))}
+        public = pick['quote'].get('public_quote_metadata')
+        if isinstance(public, dict) and 'status' in public:
+            shown['quote']['public_quote_metadata'] = {'status': public['status']}
+    if summary:
+        shown["displayEvidenceMode"] = "summary"
+        if isinstance(pick.get('primaryAdmission'), dict):
+            shown['primaryAdmission'] = {key: pick['primaryAdmission'][key]
+                for key in ('eligible', 'reasons', 'missingReasons') if key in pick['primaryAdmission']}
+        baseline = pick.get("baselineEvidence")
+        if isinstance(baseline, dict):
+            shown["baselineEvidence"] = {key: baseline[key] for key in
+                ("historyDays", "missingHistoryDates", "baselineSource") if key in baseline}
+    return shown
+
+
 def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
-    """Keep full scans on disk, but omit unused duplicate research from the UI."""
+    """Project display facts; the complete frozen evidence stays in the archive."""
     run = payload.get("adaptive")
     if not isinstance(run, dict):
         return payload
-    shown = {key: value for key, value in run.items() if key not in {"controls", "windvanes", "morningResearch", "dailyObservationResearch"}}
+    omitted = {"controls", "windvanes", "morningResearch", "dailyObservationResearch", "dailyObservationQuotes"}
+    shown = {key: value for key, value in run.items() if key not in omitted}
     if isinstance(run.get('opportunityChannels'), dict):
-        shown['opportunityChannels'] = {key: value for key, value in run['opportunityChannels'].items()
-                                        if key != 'researchCandidates'}
+        channels = run['opportunityChannels']
+        shown['opportunityChannels'] = {key: _without_raw(value) for key, value in channels.items()
+                                        if key not in {'researchCandidates', 'recommendations', 'observations'}}
+        for key in ('recommendations', 'observations'):
+            if isinstance(channels.get(key), list):
+                shown['opportunityChannels'][key] = [_display_pick(row, opportunity=True) for row in channels[key]]
+    if isinstance(run.get('evidenceInsufficient'), list):
+        shown['evidenceInsufficient'] = [_display_pick(row, summary=True) for row in run['evidenceInsufficient']]
+    for key in ('candidates', 'dailyCandidates', 'dailyAttackWatchlist', 'premarketCandidates',
+                'nextDayWatchlist', 'nextDayContinuationWatchlist', 'invalidatedCandidates'):
+        if isinstance(run.get(key), list):
+            shown[key] = [_display_pick(row) for row in run[key]]
+    for key in ('profileCandidates', 'dailyProfileCandidates'):
+        if isinstance(run.get(key), dict):
+            shown[key] = {profile: [_display_pick(row) for row in picks] if isinstance(picks, list) else picks
+                          for profile, picks in run[key].items()}
     if isinstance(run.get("precisionWatchlist"), list):
         shown["precisionWatchlist"] = []
         for pick in run["precisionWatchlist"]:
             if not isinstance(pick, dict):
                 continue
-            item = {key: pick[key] for key in ("code", "name", "symbol", "stock_code", "symbol_code", "stock_name", "ts_code") if key in pick}
+            item = {key: pick[key] for key in _IDENTITY_FIELDS if key in pick}
             profiles = (pick.get("precisionDecision") or {}).get("profiles") or {}
             item["precisionDecision"] = {"profiles": {
                 profile: {key: value[key] for key in ("entryEligible", "reasons") if key in value}
                 for profile, value in profiles.items() if isinstance(value, dict)
             }}
             shown["precisionWatchlist"].append(item)
-    return {**payload, "adaptive": shown}
+    return {**payload, "adaptive": shown, "displayEvidenceMode": "summary"}
 
 
 def _daily_assessment_valid(run: dict[str, Any], *, historical: bool = False) -> bool:
@@ -367,16 +442,103 @@ class LocalPicksDisplayStore:
         return str(self.path)
 
     def _read_saved(self) -> dict[str, Any]:
-        """Read under _display_lock; compatibility summaries never rewrite a run."""
+        """Read under _display_lock; decode each file generation only once."""
         try:
+            stamp = self._file_stamp()
+            cached = _display_cache.get(self.storage_key)
+            if cached and cached[0] == stamp:
+                _display_cache.move_to_end(self.storage_key)
+                return deepcopy(cached[1])
             value = json.loads(self.path.read_text(encoding="utf-8"))
             if (isinstance(value, dict) and value.get("displaySnapshotVersion") == 1
                     and value.get("schemaVersion") == STOCK_KING_SCHEMA_VERSION
                     and displayable_run(value.get("adaptive"), historical=True)):
-                return {**value, **display_counts(value["adaptive"])}
+                shown = _display_response({**value, **display_counts(value["adaptive"])})
+                self._cache_saved(stamp, shown)
+                return deepcopy(shown)
         except (OSError, ValueError, TypeError):
             pass
+        _display_cache.pop(self.storage_key, None)
         return {}
+
+    def _file_stamp(self, path: Path | None = None) -> tuple[int, ...]:
+        info = (path or self.path).stat()
+        return info.st_mtime_ns, info.st_size, info.st_ctime_ns, info.st_dev, info.st_ino
+
+    def _cache_saved(self, stamp: tuple[int, ...], shown: dict[str, Any]) -> None:
+        _display_cache[self.storage_key] = (stamp, shown)
+        _display_cache.move_to_end(self.storage_key)
+        while len(_display_cache) > 8:
+            _display_cache.popitem(last=False)
+
+    def _history_identity(self) -> str:
+        """Bind the small reconciliation checkpoint to this database, not IDs alone."""
+        identity = getattr(self.db, 'display_history_identity', None)
+        if not isinstance(identity, str):
+            engine = getattr(self.db, '_engine', None)
+            if engine is None:
+                engine = getattr(getattr(self.db, '_SessionLocal', None), 'kw', {}).get('bind')
+            url = getattr(engine, 'url', None) or getattr(getattr(engine, 'engine', None), 'url', None)
+            if url is not None:
+                identity = url.render_as_string(hide_password=True)
+                if url.get_backend_name() == 'sqlite' and url.database not in (None, '', ':memory:'):
+                    path = Path(url.database).resolve()
+                    stat = path.stat()
+                    identity += f'|{path}|{stat.st_dev}|{stat.st_ino}'
+                else:
+                    identity += f'|{id(engine)}'
+            else:
+                # Unknown adapters cannot reuse checkpoints across processes.
+                identity = f'process:{os.getpid()}:{id(self.db)}'
+        return hashlib.sha256(identity.encode('utf-8')).hexdigest()
+
+    @property
+    def _history_path(self) -> Path:
+        return self.path.with_name('local-picks-display-history-v1.json')
+
+    def _load_history_checked(self, identity: str) -> dict[tuple[Any, ...], datetime | None]:
+        key = (self.storage_key, identity)
+        if key not in _history_checked:
+            checked = {}
+            try:
+                state = json.loads(self._history_path.read_text(encoding='utf-8'))
+                if state.get('version') == 1 and state.get('databaseIdentity') == identity:
+                    for item in state.get('checked', [])[:100]:
+                        marker = item.get('marker')
+                        if not isinstance(marker, list) or len(marker) != 4:
+                            continue
+                        completed = item.get('generatedAt')
+                        parsed = datetime.fromisoformat(completed) if completed is not None else None
+                        if parsed is not None and parsed.tzinfo is None:
+                            continue
+                        checked[tuple(marker)] = parsed
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+            _history_checked[key] = checked
+        return dict(_history_checked[key])
+
+    def _save_history_checked(self, identity: str, checked: dict[tuple[Any, ...], datetime | None]) -> None:
+        """A failed checkpoint only causes revalidation; it cannot block display."""
+        _history_checked[(self.storage_key, identity)] = dict(checked)
+        temporary = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            state = {'version': 1, 'databaseIdentity': identity,
+                'checked': [{'marker': list(marker), 'generatedAt': at.isoformat() if at is not None else None}
+                            for marker, at in checked.items()]}
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self.path.parent,
+                    prefix='.local-picks-history-', suffix='.tmp', delete=False) as handle:
+                temporary = Path(handle.name)
+                json.dump(state, handle, ensure_ascii=False, allow_nan=False)
+            os.replace(temporary, self._history_path)
+        except (OSError, ValueError, TypeError):
+            logger.warning('Unable to persist display history checkpoint; future reads may revalidate history')
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def with_current_primary_readiness(self, payload: dict[str, Any], *, now=None) -> dict[str, Any]:
         """Enrich only the API response; frozen scans never become live evidence.
@@ -404,42 +566,100 @@ class LocalPicksDisplayStore:
         return {**payload, 'currentPrimaryReadiness': current}
 
     def read(self) -> dict[str, Any]:
-        # Reading history never starts a live scan. Filter at the database so
-        # unrelated/review runs cannot consume its bounded history window.
+        # Reading history never starts a live scan. The normal polling path
+        # touches metadata columns and a cached projection, not historical JSON.
         chosen = None
         sync_error = False
+        recovery = None
+        with _display_lock:
+            saved = self._read_saved()
         if self.db is not None:
             try:
-                rows = self.db.list_yao_display_runs(limit=100, modes=_SCAN_MODES,
-                                                    statuses=tuple(sorted(_VALID_STATUSES)))
-                valid = [row for row in rows if row.get("mode") in _SCAN_MODES
-                         and (displayable_run(row.get("result"), historical=True)
-                              or row.get('opportunity_recommendation_count', 0) > 0
-                              or _opportunity_header_valid(row, historical=True))]
-                newest = max(valid, key=lambda row: _generated_at(row["result"]), default=None)
-                with _display_lock:
-                    saved = self._read_saved()
-                if newest and (not saved or _generated_at(newest["result"]) > _generated_at(saved["adaptive"])):
-                    row = self.db.get_yao_run(newest["run_id"])
-                    result = (row or {}).get("result")
-                    if displayable_run(result, historical=True):
-                        chosen = result
-                    else:
+                if callable(getattr(self.db, 'list_yao_run_headers', None)):
+                    rows = self.db.list_yao_run_headers(limit=100, modes=_SCAN_MODES,
+                                                       statuses=tuple(sorted(_VALID_STATUSES)))
+                    identity = self._history_identity()
+                    markers = {(row.get('id'), row.get('run_id'), row.get('status'), row.get('as_of')) for row in rows}
+                    with _display_lock:
+                        checked = {marker: at for marker, at in self._load_history_checked(identity).items()
+                                   if marker in markers}
+                    inspected = {}
+                    count = 0
+                    invalid_history = False
+                    for header in rows:
+                        if header.get('mode') not in _SCAN_MODES or header.get('status') not in _VALID_STATUSES:
+                            continue
+                        marker = (header.get('id'), header.get('run_id'), header.get('status'), header.get('as_of'))
+                        # IDs and as_of are not completion timestamps. Never
+                        # prune uninspected older IDs after a partial recovery.
+                        already_checked = marker in checked and (checked[marker] is None or
+                            (saved and checked[marker] <= _generated_at(saved['adaptive'])))
+                        if header.get('run_id') == saved.get('displayRunId'):
+                            inspected[marker] = _generated_at(saved['adaptive'])
+                            continue
+                        if already_checked:
+                            continue
+                        if count >= _MAX_HISTORY_READS:
+                            continue
+                        row = self.db.get_yao_run(header['run_id'])
+                        result = (row or {}).get('result')
+                        count += 1
+                        if displayable_run(result, historical=True):
+                            inspected[marker] = _generated_at(result)
+                            if chosen is None or _generated_at(result) > _generated_at(chosen):
+                                chosen = result
+                        else:
+                            invalid_history = True
+                            inspected[marker] = None
+                    with _display_lock:
+                        combined = self._load_history_checked(identity)
+                        combined.update(inspected)
+                        combined = {marker: at for marker, at in combined.items() if marker in markers}
+                        if combined != self._load_history_checked(identity):
+                            self._save_history_checked(identity, combined)
+                    pending = sum(marker not in combined for marker in markers)
+                    if pending:
+                        recovery = {'status': 'recovering_history', 'remainingHeaders': pending,
+                            'inspectedThisRead': count,
+                            'message': '正在分批核对历史完成记录，当前已保存结果继续展示。'}
+                    if invalid_history and (chosen is None or
+                            (saved and _generated_at(chosen) <= _generated_at(saved['adaptive']))):
                         sync_error = True
+                else:
+                    # Compatibility for older adapters. DatabaseManager always
+                    # implements the metadata-only path above.
+                    rows = self.db.list_yao_display_runs(limit=100, modes=_SCAN_MODES,
+                                                        statuses=tuple(sorted(_VALID_STATUSES)))
+                    valid = [row for row in rows if row.get("mode") in _SCAN_MODES
+                             and (displayable_run(row.get("result"), historical=True)
+                                  or row.get('opportunity_recommendation_count', 0) > 0
+                                  or _opportunity_header_valid(row, historical=True))]
+                    newest = max(valid, key=lambda row: _generated_at(row["result"]), default=None)
+                    with _display_lock:
+                        saved = self._read_saved()
+                    if newest and (not saved or _generated_at(newest["result"]) > _generated_at(saved["adaptive"])):
+                        row = self.db.get_yao_run(newest["run_id"])
+                        result = (row or {}).get("result")
+                        if displayable_run(result, historical=True):
+                            chosen = result
+                        else:
+                            sync_error = True
             except Exception:
                 sync_error = True
                 logger.warning("Unable to reconcile local picks with scan history; retaining saved display", exc_info=True)
 
         with _display_lock:
             # A manual refresh may have finished while the database was read.
-            # Re-read inside the write lock so it cannot be replaced by an older
-            # history result. Equal timestamps retain the existing snapshot.
+            # Recheck the stat/cache under the lock: a concurrent manual save
+            # wins over older history without decoding the same file twice.
             saved = self._read_saved()
             if sync_error:
-                return _display_response({**saved, "displaySyncError": "最新推荐暂时读取失败，当前保留上次已保存结果"})
+                response = {**saved, "displaySyncError": "最新推荐暂时读取失败，当前保留上次已保存结果"}
+                return {**response, 'displayRecovery': recovery} if recovery else response
             if chosen is None or (saved and _generated_at(chosen) <= _generated_at(saved["adaptive"])):
-                return _display_response(saved)
-            return self.save(chosen, source="history" if saved else "migration")
+                return {**saved, 'displayRecovery': recovery} if recovery else saved
+            response = self.save(chosen, source="history" if saved else "migration")
+            return {**response, 'displayRecovery': recovery} if recovery else response
 
     def save(self, run: dict[str, Any], *, source: str = "manual") -> dict[str, Any]:
         if not displayable_run(run, historical=source in {"history", "migration"}):
@@ -480,10 +700,11 @@ class LocalPicksDisplayStore:
             "cacheHit": False,
         }
         encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        shown = _display_response(payload)
         with _display_lock:
             saved = self._read_saved()
             if saved and _generated_at(saved["adaptive"]) > _generated_at(run):
-                return _display_response(saved)
+                return saved
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = None
             try:
@@ -493,8 +714,16 @@ class LocalPicksDisplayStore:
                     handle.write(encoded)
                     handle.flush()
                     os.fsync(handle.fileno())
+                written_stamp = self._file_stamp(temporary)
                 os.replace(temporary, self.path)
+                if self._file_stamp() == written_stamp:
+                    self._cache_saved(written_stamp, deepcopy(shown))
+                else:
+                    # Another process may publish between replace and stat.
+                    # Never associate our payload with that process's file ID.
+                    _display_cache.pop(self.storage_key, None)
+                    shown = self._read_saved()
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
-        return _display_response(payload)
+        return shown

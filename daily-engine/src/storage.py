@@ -2622,6 +2622,26 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             ).scalar_one_or_none()
             return self._yao_run_to_dict(row, include_result=True) if row else None
 
+    def list_yao_run_headers(
+        self, *, modes: Sequence[str], statuses: Sequence[str], limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Inspect completion metadata without reading or parsing result_json.
+
+        Display refreshes use these immutable row identifiers as a change
+        detector. Only genuinely new rows need their full frozen evidence read.
+        Do not select created_at here: on existing SQLite tables it follows
+        result_json physically, so reading it traverses large overflow pages.
+        """
+        with self.get_session() as session:
+            rows = session.execute(select(
+                YaoRun.id, YaoRun.run_id, YaoRun.mode, YaoRun.status,
+                YaoRun.as_of_at,
+            ).where(YaoRun.mode.in_(modes), YaoRun.status.in_(statuses))
+                .order_by(desc(YaoRun.id)).limit(max(1, min(int(limit), 100)))).all()
+            return [{"id": row.id, "run_id": row.run_id, "mode": row.mode,
+                     "status": row.status, "as_of": row.as_of_at.isoformat()}
+                    for row in rows]
+
     def list_yao_display_runs(
         self, *, modes: Sequence[str], statuses: Sequence[str], limit: int = 100,
     ) -> List[Dict[str, Any]]:
