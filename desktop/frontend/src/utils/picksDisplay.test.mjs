@@ -89,6 +89,46 @@ const flowOpportunity = () => {
   return pick
 }
 
+test('zero opportunities explain total fund evidence failure and do not promote three-minute collection counts', async () => {
+  const saved = researchSnapshot('2026-11-03T14:55:00+08:00')
+  saved.adaptive.opportunityChannels = { version: 'opportunity-flow-20261103-v1', recommendations: [], observations: [],
+    diagnostics: { researchedCount: 306, recommendationCount: 0,
+      failedConditionCounts: { stock_flow_unavailable: 306, sector_flow_unavailable: 306 } } }
+  saved.adaptive.dataQuality = { fundFlowArchive: { status: 'unavailable', reason: 'TimeoutError' },
+    fundCollection: { requested: 4792, returned: 533, usable: 521, unfinished: 4259 },
+    stageMissingReasons: { fund_evidence: 'provider_failed_or_stage_deadline_exhausted' } }
+  const before = JSON.stringify(saved)
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    const text = mounted.visibleText()
+    assert.match(text, /资金证据不可用.*本轮无法完成资金筛选/s)
+    assert.match(text, /已研究 306 只.*个股资金窗口可核验 0 \/ 306.*板块资金窗口可核验 0 \/ 306/s)
+    assert.match(text, /资金归档失败：归档超时/)
+    assert.match(text, /资金采集尚有 4259 只未完成/)
+    assert.match(text, /资金采集返回 533 \/ 4792/)
+    assert.match(text, /3分钟基础资金指标可用 521 只，不代表30分钟完整证据/)
+    assert.doesNotMatch(text, /本轮没有通过资金、30分钟持续趋势与入场位置检查/)
+    assert.equal(mounted.state().opportunities.cards.length, 0)
+    assert.equal(JSON.stringify(saved), before)
+  } finally { mounted.dispose() }
+})
+
+test('zero opportunities with fully verified fund windows retain the genuine unmet-conditions explanation', async () => {
+  const saved = researchSnapshot('2026-11-03T14:55:00+08:00')
+  saved.adaptive.opportunityChannels = { version: 'opportunity-flow-20261103-v1', recommendations: [], observations: [],
+    diagnostics: { researchedCount: 20, recommendationCount: 0, failedConditionCounts: { '个股_net_flow_not_positive': 20 } } }
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    const text = mounted.visibleText()
+    assert.match(text, /资金证据检查已完成.*本轮没有同时满足资金方向、持续趋势与入场位置条件/s)
+    assert.match(text, /个股资金窗口可核验 20 \/ 20/)
+    assert.doesNotMatch(text, /资金证据不可用|本轮无法完成资金筛选/)
+    assert.equal(mounted.state().opportunities.cards.length, 0)
+  } finally { mounted.dispose() }
+})
+
 test('early opportunity renders before the research lists and unready model with its unconfirmed evidence visible', async () => {
   const saved = researchSnapshot('2026-10-28T10:30:00+08:00', { continuation: [zhengyuObservation()] })
   saved.adaptive.opportunityChannels = { version: 'opportunity-v1', recommendations: [earlyOpportunity()], observations: [] }

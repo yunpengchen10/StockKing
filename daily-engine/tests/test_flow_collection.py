@@ -1,9 +1,10 @@
 """Exact flow denominators and source-independent collection priorities."""
 from datetime import datetime, timedelta
+from copy import deepcopy
 
 import pytest
 
-from src.services.yao_scout.flow_collection import flow_collection_order
+from src.services.yao_scout.flow_collection import flow_candidate_priority, flow_collection_order
 from src.services.yao_scout.minute_history import SHANGHAI, compute_bar_evidence
 
 
@@ -56,3 +57,77 @@ def test_collection_finishes_true_sector_members_and_never_uses_price_speed():
     assert flow_collection_order(['600001', '600003', '600002'], membership, peers) == [
         '600001', '300999', '600002', '600003', '688001']
     assert flow_collection_order(['600001'], {}, {}) == ['600001']
+
+
+def minute_packet(code, *, end=END):
+    packet = compute_bar_evidence(bars(), end, expected_dates=[])
+    packet['code'] = code
+    return packet
+
+
+def test_complete_declining_candidates_precede_missing_windows_without_changing_pool_or_rank():
+    codes = ['600001', '600002', '600003', '600004', '600005']
+    packets = {code: minute_packet(code) for code in codes}
+    packets['600001'].pop('flowAmountWindows')
+    packets['600001']['metrics']['speed_5m_pct'] = 20
+    packets['600003'] = {'code': '600003', 'asOf': END.isoformat(), 'metrics': {'speed_5m_pct': 30}}
+    packets['600002']['metrics'].update(speed_5m_pct=-5, net_return_30m_pct=-7)
+    packets['600002']['fundEvidence'] = {'metrics': {'main_net_flow_30m': -9000000}}
+    packets['600004']['metrics'].update(speed_5m_pct=1, net_return_30m_pct=2)
+    packets['600005']['flowAmountWindows']['30']['amountCny'] = None
+    original = deepcopy((codes, packets))
+    prioritized = flow_candidate_priority(codes, packets, END)
+    assert prioritized == ['600002', '600004', '600001', '600003', '600005']
+    assert (codes, packets) == original
+    membership = {code: {'code': 'same-sector'} for code in codes}
+    peers = {'same-sector': [*codes, '300999']}
+    assert set(flow_collection_order(prioritized, membership, peers)) == set(codes) | {'300999'}
+
+
+@pytest.mark.parametrize('damage', ['stale', 'previous_day', 'future', 'tainted', 'unknown_source',
+    'wrong_identity', 'missing_amount', 'negative_amount', 'zero_amount', 'nan_amount', 'bool_amount',
+    'missing_bar', 'mismatched_window', 'lunch_window'])
+def test_unverifiable_candidate_never_takes_priority_from_complete_window(damage):
+    bad = minute_packet('600001')
+    good = minute_packet('600002')
+    if damage in {'stale', 'previous_day', 'future'}:
+        shift = {'stale': -timedelta(minutes=5), 'previous_day': -timedelta(days=1), 'future': timedelta(minutes=1)}[damage]
+        end = END + shift
+        bad['asOf'] = end.isoformat()
+        bad['flowAmountWindows']['30'].update(start=(end-timedelta(minutes=30)).isoformat(), end=end.isoformat())
+    elif damage == 'tainted':
+        bad['dataLineage'] = {'status': 'tainted', 'sessions': [{'code': '600001', 'day': END.date().isoformat(), 'status': 'tainted'}]}
+    elif damage == 'unknown_source':
+        bad['source'] = 'unknown'
+    elif damage == 'wrong_identity':
+        bad['code'] = '600999'
+    elif damage.endswith('_amount'):
+        bad['flowAmountWindows']['30']['amountCny'] = {
+            'missing_amount': None, 'negative_amount': -100, 'zero_amount': 0,
+            'nan_amount': float('nan'), 'bool_amount': True}[damage]
+    elif damage == 'missing_bar':
+        bad['flowAmountWindows']['30']['barCount'] = 29
+    elif damage == 'mismatched_window':
+        bad['flowAmountWindows']['30']['end'] = (END-timedelta(minutes=1)).isoformat()
+    else:
+        end = END.replace(hour=13, minute=15)
+        bad['asOf'] = end.isoformat()
+        bad['flowAmountWindows']['30'].update(start=(end-timedelta(minutes=30)).isoformat(), end=end.isoformat())
+        good = {'code': '600002', 'asOf': end.isoformat(), 'source': 'fixture'}
+        # Neither incomplete candidate may be promoted across lunch.
+        assert flow_candidate_priority(['600002', '600001'], {'600001': bad, '600002': good}, end) == ['600002', '600001']
+        return
+    assert flow_candidate_priority(['600001', '600002'], {'600001': bad, '600002': good}, END) == ['600002', '600001']
+
+
+def test_historical_taint_with_verified_current_window_and_unknown_cutoff():
+    ready = minute_packet('600002')
+    ready['dataLineage'] = {'status': 'tainted', 'sessions': [
+        {'code': '600002', 'day': '2026-11-02', 'status': 'tainted'},
+        {'code': '600002', 'day': END.date().isoformat(), 'status': 'verified', 'verifiedThrough': END.isoformat()},
+    ]}
+    codes = ['600001', '600002']
+    assert flow_candidate_priority(codes, {'600002': ready}, END) == ['600002', '600001']
+    assert flow_candidate_priority(codes, {'600002': ready}, 'unknown') == codes
+    ready['dataLineage']['sessions'][-1]['verifiedThrough'] = (END-timedelta(minutes=1)).isoformat()
+    assert flow_candidate_priority(codes, {'600002': ready}, END) == codes

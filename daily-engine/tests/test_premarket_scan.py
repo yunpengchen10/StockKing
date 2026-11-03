@@ -140,8 +140,17 @@ def test_storage_header_restores_opening_plan_after_restart(monkeypatch, tmp_pat
                 'run_id': result['run_id'], 'mode': 'king_live', 'status': result['status'],
                 'as_of_at': datetime(2026,9,14,9,20), 'cutoff_at': datetime(2026,9,14,9,20),
                 'model_version': result['modelVersion'], 'result_json': json.dumps(result)}])
-        shown = LocalPicksDisplayStore(db).read()['adaptive']
-        assert shown['premarketCandidates'] == result['premarketCandidates']
+        store = LocalPicksDisplayStore(db)
+        shown = store.read()['adaptive']
+        assert len(shown['premarketCandidates']) == len(result['premarketCandidates'])
+        for displayed, original in zip(shown['premarketCandidates'], result['premarketCandidates']):
+            assert {key: value for key, value in displayed.items() if key != 'quote'} == {
+                key: value for key, value in original.items() if key != 'quote'}
+            for key in ('code', 'price', 'pre_close', 'source', 'source_time', 'provider_timestamp'):
+                if key in original['quote']:
+                    assert displayed['quote'][key] == original['quote'][key]
+        # The display is a projection; the recovered frozen record remains full.
+        assert json.loads(store.path.read_text(encoding='utf-8'))['adaptive'] == result
         assert shown['premarketAssessment'] == result['premarketAssessment']
         assert shown['candidates'] == []
     finally:
