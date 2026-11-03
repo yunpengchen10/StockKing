@@ -73,6 +73,62 @@ const earlyOpportunity = () => ({ code: '600001', name: '早期启动样本', re
     firstDetectionAt: '2026-10-28T10:29:00+08:00', firstDetectionPrice: 10, triggerAt: null,
     buyWindow: { status: 'observed', askPrice: 10.1, sourceTime: '2026-10-28T10:29:55+08:00' } } })
 
+const flowOpportunity = () => {
+  const pick = earlyOpportunity()
+  const common = { status: 'observed', horizonMinutes: 30, provider: 'eastmoney', source: 'eastmoney:fund-minute',
+    asOf: '2026-10-28T10:29:00+08:00', windowStart: '2026-10-28T09:59:00+08:00' }
+  pick.name = '资金趋势样本'
+  Object.assign(pick.opportunity, { version: 'opportunity-flow-20261103-v1', channel: 'F', grade: 'F-A',
+    rankScore: null, rankingComposite: .675, supports: ['完整30分钟资金与趋势已核验'], missing: [],
+    metrics: { entryRiskAtr: 1.25, structuralLow30m: 9.7, netReturn30mPct: 1.2, pathEfficiency30m: .65 },
+    flowEvidence: { stock: { ...common, metrics: { netFlowCny: 2500000, netFlowRatio: .05, positiveMinuteFraction: .8 } },
+      sector: { ...common, sector: { name: '测试行业' }, coverage: { totalPeers: 10, usablePeers: 8, fraction: .8, excludedSelf: true },
+        metrics: { netFlowCny: 6000000, netFlowRatio: .03, positiveMemberFraction: .75, top1PositiveContribution: .25 } } },
+    rankingComponents: { entryRiskAtr: { rawValue: 1.25, rankValue: 1.25, percentile: .6, weight: .2, direction: 'lower', peerUnit: 'stock', peerCount: 8 } },
+  })
+  return pick
+}
+
+test('zero opportunities explain total fund evidence failure and do not promote three-minute collection counts', async () => {
+  const saved = researchSnapshot('2026-11-03T14:55:00+08:00')
+  saved.adaptive.opportunityChannels = { version: 'opportunity-flow-20261103-v1', recommendations: [], observations: [],
+    diagnostics: { researchedCount: 306, recommendationCount: 0,
+      failedConditionCounts: { stock_flow_unavailable: 306, sector_flow_unavailable: 306 } } }
+  saved.adaptive.dataQuality = { fundFlowArchive: { status: 'unavailable', reason: 'TimeoutError' },
+    fundCollection: { requested: 4792, returned: 533, usable: 521, unfinished: 4259 },
+    stageMissingReasons: { fund_evidence: 'provider_failed_or_stage_deadline_exhausted' } }
+  const before = JSON.stringify(saved)
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    const text = mounted.visibleText()
+    assert.match(text, /资金证据不可用.*本轮无法完成资金筛选/s)
+    assert.match(text, /已研究 306 只.*个股资金窗口可核验 0 \/ 306.*板块资金窗口可核验 0 \/ 306/s)
+    assert.match(text, /资金归档失败：归档超时/)
+    assert.match(text, /资金采集尚有 4259 只未完成/)
+    assert.match(text, /资金采集返回 533 \/ 4792/)
+    assert.match(text, /3分钟基础资金指标可用 521 只，不代表30分钟完整证据/)
+    assert.doesNotMatch(text, /本轮没有通过资金、30分钟持续趋势与入场位置检查/)
+    assert.equal(mounted.state().opportunities.cards.length, 0)
+    assert.equal(JSON.stringify(saved), before)
+  } finally { mounted.dispose() }
+})
+
+test('zero opportunities with fully verified fund windows retain the genuine unmet-conditions explanation', async () => {
+  const saved = researchSnapshot('2026-11-03T14:55:00+08:00')
+  saved.adaptive.opportunityChannels = { version: 'opportunity-flow-20261103-v1', recommendations: [], observations: [],
+    diagnostics: { researchedCount: 20, recommendationCount: 0, failedConditionCounts: { '个股_net_flow_not_positive': 20 } } }
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    const text = mounted.visibleText()
+    assert.match(text, /资金证据检查已完成.*本轮没有同时满足资金方向、持续趋势与入场位置条件/s)
+    assert.match(text, /个股资金窗口可核验 20 \/ 20/)
+    assert.doesNotMatch(text, /资金证据不可用|本轮无法完成资金筛选/)
+    assert.equal(mounted.state().opportunities.cards.length, 0)
+  } finally { mounted.dispose() }
+})
+
 test('early opportunity renders before the research lists and unready model with its unconfirmed evidence visible', async () => {
   const saved = researchSnapshot('2026-10-28T10:30:00+08:00', { continuation: [zhengyuObservation()] })
   saved.adaptive.opportunityChannels = { version: 'opportunity-v1', recommendations: [earlyOpportunity()], observations: [] }
@@ -82,8 +138,9 @@ test('early opportunity renders before the research lists and unready model with
   try {
     await flush()
     const text = mounted.visibleText()
-    assert.match(text, /机会精选 · 早期启动 \/ 主升确认/)
-    assert.match(text, /早期启动样本600001E-A · 早期启动/)
+    assert.match(text, /机会精选 · 历史 E \/ M 规则/)
+    assert.match(text, /早期启动样本600001E-A · 历史早期启动/)
+    assert.match(text, /旧版规则记录 · 未按当前资金策略核验/)
     assert.match(text, /价格方向突变，短时量能增加/)
     assert.match(text, /VWAP与板块同步尚未确认/)
     assert.match(text, /回落并持续无法收复开盘价/)
@@ -98,7 +155,7 @@ test('early opportunity renders before the research lists and unready model with
 
 test('expired opportunity quotes stay visible as historical evidence and failed refreshes preserve the cards', async () => {
   const saved = researchSnapshot('2026-10-28T10:30:00+08:00')
-  saved.adaptive.opportunityChannels = { recommendations: [earlyOpportunity()] }
+  saved.adaptive.opportunityChannels = { version: 'opportunity-flow-20261103-v1', recommendations: [flowOpportunity()] }
   const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved,
     StartKingPicksRefresh: async () => { throw new Error('报价服务暂不可用') },
   }, null, Date.parse('2026-10-28T10:30:00+08:00'))
@@ -107,13 +164,38 @@ test('expired opportunity quotes stay visible as historical evidence and failed 
     assert.match(mounted.visibleText(), /源时间在30秒内/)
     mounted.setNow(Date.parse('2026-10-28T10:30:26+08:00'))
     await mounted.runTimer(1000)
-    assert.match(mounted.visibleText(), /早期启动样本/)
+    assert.match(mounted.visibleText(), /资金趋势样本/)
     assert.match(mounted.visibleText(), /历史参考价 · 行情已过期/)
     assert.doesNotMatch(mounted.visibleText(), /源时间在30秒内/)
     await mounted.state().refresh(); await flush()
     assert.match(mounted.visibleText(), /报价服务暂不可用/)
-    assert.match(mounted.visibleText(), /早期启动样本/)
+    assert.match(mounted.visibleText(), /资金趋势样本/)
     assert.equal(refresh.readDisplayedPicks(mounted.storage).adaptive.opportunityChannels.recommendations.length, 1)
+  } finally { mounted.dispose() }
+})
+
+test('the complete page renders current flow amounts, real coverage, source windows and transparent ranking without rewriting evidence', async () => {
+  const saved = researchSnapshot('2026-10-28T10:30:00+08:00')
+  saved.adaptive.opportunityChannels = { version: 'opportunity-flow-20261103-v1', recommendations: [flowOpportunity()], observations: [] }
+  const before = JSON.stringify(saved)
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:00+08:00'))
+  try {
+    await flush()
+    const visible = mounted.visibleText(), all = mounted.text()
+    assert.match(visible, /机会精选 · 资金与持续趋势/)
+    assert.match(visible, /资金趋势样本600001F-A · 资金与持续趋势/)
+    assert.match(visible, /个股30分钟净额250\.00 万元 · 净额\/成交额 5\.00%/)
+    assert.match(visible, /板块30分钟净额测试行业 · 600\.00 万元 · 净额\/成交额 3\.00%/)
+    assert.match(visible, /板块资金覆盖8 \/ 10 只 · 80\.0%（剔除自身）/)
+    assert.match(visible, /净流入分钟占比 80\.0%/)
+    assert.match(visible, /距结构低点 1\.25 ATR/)
+    assert.match(all, /个股资金源时东方财富.*09:59:00.*10:29:00/s)
+    assert.match(all, /等权排序指标0\.675（0—1）/)
+    assert.match(all, /原值 1\.2500 · 越低排序越优 · 分位 0\.600 · 权重 20%/)
+    assert.doesNotMatch(visible, /早期启动 \/ 主升确认|E-A 或 M-A/)
+    assert.equal(mounted.state().opportunities.cards[0].current, true)
+    assert.equal(mounted.state().adaptivePicks.length, 0)
+    assert.equal(JSON.stringify(saved), before)
   } finally { mounted.dispose() }
 })
 
@@ -565,6 +647,72 @@ test('a completed manual refresh replaces the displayed background research list
     assert.deepEqual(cached.adaptive.nextDayWatchlist, [])
     assert.deepEqual(cached.adaptive.nextDayContinuationWatchlist.map(pick => pick.code), ['600002'])
   } finally { scan.resolve(null); mounted.dispose() }
+})
+
+test('completed task receipt loads its saved display and the manual read button never launches another scan', async () => {
+  const fresh = { ...latestSnapshot(), displayRunId: 'receipt-view', displayEvidenceMode: 'summary' }
+  let reads = 0, scans = 0
+  const mounted = mountPicks({
+    GetDisplayedKingPicks: async () => ++reads === 1 ? oldSnapshot() : fresh,
+    StartKingPicksRefresh: async () => { scans++; return { task_id: 'receipt-task', status: 'pending' } },
+    GetKingPicksRefreshTask: async () => ({ task_id: 'receipt-task', status: 'completed', result: null,
+      resultPersisted: true, displayRunId: fresh.displayRunId, displayGeneratedAt: fresh.generatedAt }),
+  })
+  try {
+    await flush()
+    await mounted.state().refresh(); await flush()
+    assert.equal(scans, 1)
+    assert.equal(reads, 2)
+    assert.equal(mounted.state().result.displayRunId, 'receipt-view')
+    assert.match(mounted.visibleText(), /读取已保存结果/)
+    assert.match(mounted.visibleText(), /当前展示证据摘要；完整研究证据保留在原始扫描记录中/)
+    assert.equal(mounted.state().loading, false)
+    await mounted.state().restoreDisplayed(); await flush()
+    assert.equal(reads, 3)
+    assert.equal(scans, 1)
+  } finally { mounted.dispose() }
+})
+
+test('partial historical recovery is visible until the next completed reconciliation and is not cached', async () => {
+  let recovering = true
+  const saved = latestSnapshot()
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => recovering ? { ...saved,
+    displayRecovery: { status: 'recovering_history', remainingHeaders: 6, message: '正在分批核对历史完成记录，当前已保存结果继续展示。' } } : saved })
+  try {
+    await flush()
+    assert.match(mounted.visibleText(), /尚未确认是否为最新结果；还有 6 条历史记录待核对/)
+    assert.equal(refresh.readDisplayedPicks(mounted.storage).displayRecovery, undefined)
+    recovering = false
+    await mounted.state().restoreDisplayed(); await flush()
+    assert.doesNotMatch(mounted.visibleText(), /历史记录待核对/)
+    assert.equal(mounted.state().result.generatedAt, saved.generatedAt)
+  } finally { mounted.dispose() }
+})
+
+test('summary explanation distinguishes omitted evidence from missing original records', async () => {
+  const saved = latestSnapshot()
+  const summary = { code: '600001', name: '摘要样本', displayEvidenceMode: 'summary', scoreVersion: 'stockking-v1.2',
+    selectionReasons: ['历史线索'], riskReasons: ['本轮准入未满足'],
+    primaryAdmission: { eligible: false, missingReasons: ['资金方向尚未确认'] } }
+  saved.displayEvidenceMode = 'summary'
+  saved.adaptive.evidenceInsufficient = [summary]
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved })
+  try {
+    await flush()
+    mounted.state().showWhy(summary, true); await flush()
+    const text = mounted.visibleText()
+    assert.match(text, /当前为准入摘要/)
+    assert.match(text, /指标明细未随本页摘要加载/)
+    assert.match(text, /来源附件未随本页摘要加载/)
+    assert.match(text, /行情来源 摘要未提供来源字段/)
+    assert.doesNotMatch(text, /该快照未保留来源|未取得指标记录|行情来源 未取得/)
+    assert.doesNotMatch(text, /Early|DistributionRisk/)
+    mounted.state().showWhy({ code: '600002', name: '简要摘要', displayEvidenceMode: 'summary' }, true)
+    await flush()
+    assert.match(mounted.visibleText(), /摘要未提供逻辑版本/)
+    assert.match(mounted.visibleText(), /摘要未列出具体线索/)
+    assert.doesNotMatch(mounted.visibleText(), /旧记录未保存结构化证据链|旧记录未保存具体入选理由/)
+  } finally { mounted.dispose() }
 })
 
 test('a late background read cannot restore research observations removed by a manual refresh with the same timestamp', async () => {

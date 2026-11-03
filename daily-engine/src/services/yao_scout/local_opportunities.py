@@ -77,9 +77,9 @@ class LocalOpportunityService(DailyOpportunityService):
         quality.update(research_count=len(queued), research_universe_count=universe_count,
                        deep_research_count=0,
                        research_limit=research_queue_limit(universe_count),
-                       research_policy='mainboard_activity_and_transition_discovery_v2',
+                       research_policy='mainboard_fund_flow_and_transition_discovery_v3',
                        research_coverage=(f'全主板初筛{universe_count}只；按主板池10%向上取整、至少300只'
-                                          f'且不超过实际股票数，活跃度与状态变化/事件分通道发现，本轮{len(queued)}只进入深研；'
+                                          f'且不超过实际股票数，资金流向与活跃度/状态变化分通道发现，本轮{len(queued)}只进入深研；'
                                           '未深研股票不作已排除或无机会结论'))
 
     @staticmethod
@@ -179,6 +179,8 @@ class LocalOpportunityService(DailyOpportunityService):
     def _refresh_verified_lineage(original, current):
         from .minute_integrity import _lineage
         if not original or not original.get('sessions'):
+            if current.get('status') == 'tainted':
+                return current
             return original or {'status':'unknown','reasonCodes':['minute_lineage_unavailable']}
         updates = {(row['code'],row['day']):row for row in current.get('sessions',[])}
         sessions = []
@@ -222,15 +224,19 @@ class LocalOpportunityService(DailyOpportunityService):
         deadline_at = (datetime.fromisoformat(target_at) + timedelta(seconds=120)
                        if run.get('official') and target_at else self.clock() + timedelta(seconds=120))
         scan_deadline = monotonic() + max(0, (deadline_at-self.clock()).total_seconds())
+        archive_reserve = 6 if self.opportunity_research and not opening_mode else 0
+        quote_reserve = 15
         quality['collectionPolicy'] = {'mode': 'cached_history_and_incremental_minutes',
             'deadlineAt': deadline_at.isoformat(), 'historicalBackfillInScan': False,
-            'quoteReserveSeconds': 15}
+            'quoteReserveSeconds': quote_reserve, 'fundArchiveReserveSeconds': archive_reserve}
         def remaining(reserve=0):
             # Both clocks are bounded: wall time enforces delivery, monotonic
             # protects against clock adjustments during a provider request.
             return max(0, min(scan_deadline-monotonic(),
                               (deadline_at-self.clock()).total_seconds())-reserve)
-        def budget_for(name, timeout, *, reserve=15):
+        def budget_for(name, timeout, *, reserve=None):
+            if reserve is None:
+                reserve = quote_reserve + archive_reserve
             budget = min(timeout, remaining(reserve))
             quality['stageBudgetsSeconds'][name] = budget
             return budget
@@ -240,12 +246,17 @@ class LocalOpportunityService(DailyOpportunityService):
             quality['stageTimingsMs'][stage_name] = round((tick-stage_started)*1000)
             stage_name, stage_started = name, tick
             self._progress(progress, message)
-        def fetch_batch(name, fetch, items, timeout, *, deadline_aware=False, workers=4):
+        def fetch_batch(name, fetch, items, timeout, *, deadline_aware=False, workers=4,
+                        reserve=None, shared_deadline=None):
             items = list(items)
             # Universe coverage must not multiply delivery latency. Unfinished
             # symbols remain explicit missing observations, never false signals.
-            budget = budget_for(name, timeout, reserve=0 if name=='final_quotes' else 15)
-            deadline = monotonic()+budget
+            reserve = 0 if name == 'final_quotes' else quote_reserve+archive_reserve if reserve is None else reserve
+            budget = budget_for(name, timeout, reserve=reserve)
+            if shared_deadline is not None:
+                budget = min(budget, max(0, shared_deadline-monotonic()))
+                quality['stageBudgetsSeconds'][name] = budget
+            deadline = shared_deadline if shared_deadline is not None else monotonic()+budget
             operation = (lambda item: fetch(item, deadline)) if deadline_aware else fetch
             if deadline_aware:
                 operation.__name__ = getattr(fetch, '__name__', 'fetch')
@@ -516,19 +527,40 @@ class LocalOpportunityService(DailyOpportunityService):
         if getattr(software_market, 'available', False):
             stage('market_breadth', 53, '正在补强全主板实际报价时间与市场广度')
             frame = software_market.enrich_snapshot_quotes(frame,
-                timeout=budget_for('market_breadth', 12), deadline=scan_deadline-15, clock=self.clock)
+                timeout=budget_for('market_breadth', 12),
+                deadline=scan_deadline-quote_reserve-archive_reserve, clock=self.clock)
             emotion = self._observe_market_emotion(frame, self.clock())
             quality['marketQuoteEnrichment'] = frame.attrs.get('market_quote_enrichment', {})
         # Quote enrichment changes the evidence available for INITIAL ranking,
         # not only market breadth. Rebuild the full queue and prepare new names.
         prepared_codes = {row['code'] for row in queued}
+        flow_discovery, discovery_membership = {}, None
+        if self.opportunity_research and not self.sector_fetcher:
+            from .sector_fund_evidence import prepare_sector_membership
+            from .fund_flow_discovery import fetch_flow_snapshot, build_flow_discovery
+            stage('flow_discovery', 54, '正在从全市场资金流向发现行业及个股')
+            try:
+                discovery_membership = prepare_sector_membership(
+                    frame['code'].astype(str).tolist(), self.clock(), self.yao.data_dir,
+                    timeout=budget_for('flow_membership', 10), snapshot=snapshot)
+                packets = fetch_batch('flow_snapshot',
+                    lambda _, deadline: fetch_flow_snapshot(self.clock(), deadline),
+                    [None], 15, deadline_aware=True)
+                packet = packets[0] if packets else {}
+                flow_discovery = build_flow_discovery(packet.get('rows') or [],
+                    *discovery_membership, self.clock())
+                quality['flowDiscovery'] = {key: value for key, value in packet.items() if key != 'rows'}
+                quality['flowDiscovery']['eligibleResearchCount'] = len(flow_discovery)
+            except Exception as exc:
+                quality['flowDiscovery'] = {'status': 'unavailable',
+                    'reasonCodes': [type(exc).__name__], 'eligibleResearchCount': 0}
         discovery_at = self.clock()
         frame.attrs['captured_at'] = discovery_at.isoformat()
         # Context lookup is local and bounded; it does not trigger a per-stock
         # news request. Unknown event coverage is not an exclusion condition.
         discovery_contexts = for_stocks(context_bundle, frame['code'].astype(str), discovery_at) if self.opportunity_research else {}
         queued = clean(research_queue(frame, now=discovery_at, previous_frame=previous_frame,
-                                      catalysts=discovery_contexts))
+                                      catalysts=discovery_contexts, flow_discovery=flow_discovery))
         if self.opportunity_research:
             try:
                 quality['discoverySnapshotSaved'] = discovery_store.save(frame, discovery_at)
@@ -602,9 +634,9 @@ class LocalOpportunityService(DailyOpportunityService):
             return
         queued = minute_queued
         codes = [row['code'] for row in queued]
-        prepared_sectors = None
+        prepared_sectors = discovery_membership
         stage('sector_membership', 57, '正在读取分钟研究股票的行业成分')
-        if not self.sector_fetcher:
+        if not self.sector_fetcher and prepared_sectors is None:
             from .sector_fund_evidence import prepare_sector_membership
             try:
                 prepared_sectors = prepare_sector_membership(codes, self.clock(), self.yao.data_dir,
@@ -649,18 +681,34 @@ class LocalOpportunityService(DailyOpportunityService):
             intraday.update(dict(fetch_batch('verified_minute_features', recalculate, verified_codes, 6)))
             quality['initialMinuteVerification'] = early_verification
         from .sector_fund_evidence import fetch_sector_batch, fetch_fund_evidence
+        from .flow_collection import flow_candidate_priority, flow_collection_order
+        flow_priority_codes = (flow_candidate_priority(codes, intraday, minute_cutoff)
+                               if self.opportunity_research else list(codes))
         sector_fetch = self.sector_fetcher or fetch_sector_batch
         stage('sector_fund_evidence', 72, '正在并行核验同一完成分钟的板块与资金证据')
         sector_partial, sector_errors = {}, []
+        flow_minutes = dict(intraday)
         sector_lock = Lock()
         def collect_sector(code, packet):
             with sector_lock:
                 sector_partial[code] = packet
+        def collect_flow_minutes(code, packet):
+            with sector_lock:
+                # Candidate evidence already passed its independent lineage
+                # verification. Retain it while adding exact older-end windows
+                # needed by other candidates in the same sector.
+                if code in intraday:
+                    flow_minutes[code] = {**intraday[code], 'flowAmountWindowsByEnd': {
+                        **(flow_minutes.get(code, {}).get('flowAmountWindowsByEnd') or {}),
+                        **(packet.get('flowAmountWindowsByEnd') or {})}}
+                else:
+                    flow_minutes[code] = packet
         def sectors_for(_, deadline):
             try:
-                return sector_fetch(codes,intraday,minute_cutoff,self.yao.data_dir,
+                return sector_fetch(flow_priority_codes,intraday,minute_cutoff,self.yao.data_dir,
                     **({'prepared':prepared_sectors, 'deadline':deadline,
-                        'timeout':max(0,deadline-monotonic()), 'on_result': collect_sector}
+                        'timeout':max(0,deadline-monotonic()), 'on_result': collect_sector,
+                        'on_minutes': collect_flow_minutes if self.opportunity_research else None}
                        if not self.sector_fetcher else {}))
             except Exception as error:
                 with sector_lock:
@@ -668,30 +716,43 @@ class LocalOpportunityService(DailyOpportunityService):
                 return {}
         def funds_for(code, deadline):
             cutoff = (intraday.get(code) or {}).get('asOf')
+            if self.opportunity_research and not cutoff:
+                cutoff = minute_cutoff.isoformat()
             if not cutoff:
                 return code, {'metrics':{}, 'reasonCodes':['stock_minute_missing'],
                               'gaps':['个股分钟截止时点缺失，未计算资金因子']}
             return code, (self.fund_fetcher or fetch_fund_evidence)(code,cutoff,
                 **({'deadline':deadline} if not self.fund_fetcher else {}))
-        fund_codes = fund_collection_order(codes, intraday)
-        quality['fundCollectionOrder'] = {'policy':'viable_minute_conditions_first_v1',
+        fund_codes = (flow_collection_order(flow_priority_codes, *(prepared_sectors or ({}, {})))
+                      if self.opportunity_research else fund_collection_order(codes, intraday))
+        quality['fundCollectionOrder'] = {'policy':('verified_current_30m_candidates_then_complete_sector_membership_v2'
+            if self.opportunity_research else 'viable_minute_conditions_first_v1'),
             'requestedCodes':fund_codes, 'formalEligibilityGranted':False,
-            'meaning':'优先采集已出现分钟回升和同刻放量的股票；其余仍按原序采集，未完成保持缺失'}
+            'priorityCandidateOrder': flow_priority_codes,
+            'meaning':('优先已有新鲜完整30分钟成交额证据的候选行业，资金与同行分钟共用次序；不按涨速或资金正负挑同行，完整成分分母不变'
+                if self.opportunity_research else '分钟条件仅决定采集次序，不授予入选资格')}
         # S and F both depend only on the already-frozen stock window. Serial
         # collection lets a slow sector consume the fund budget despite a healthy
         # fund feed. Both retain their own bounded workers and the same global
         # deadline, leaving the final quote reserve untouched.
+        shared_evidence_budget = budget_for('parallel_evidence', 40)
+        shared_evidence_deadline = monotonic()+shared_evidence_budget
         quality['parallelEvidenceCollection'] = {'enabled': True,
             'sharedCutoffAt': minute_cutoff.isoformat(), 'stageTimingsMs': {},
+            'sharedDeadlineAt': (self.clock()+timedelta(seconds=shared_evidence_budget)).isoformat(),
+            'archiveReserveSeconds': archive_reserve, 'quoteReserveSeconds': quote_reserve,
             'meaning': '板块与资金独立并行采集；各阶段耗时重叠，不可相加'}
         def collect_parallel(name, fetch, items, timeout, workers):
             began = monotonic()
             try:
-                return fetch_batch(name, fetch, items, timeout, deadline_aware=True, workers=workers)
+                return fetch_batch(name, fetch, items, timeout, deadline_aware=True, workers=workers,
+                                   shared_deadline=shared_evidence_deadline if self.opportunity_research
+                                   else min(shared_evidence_deadline, began+timeout))
             finally:
                 quality['parallelEvidenceCollection']['stageTimingsMs'][name] = round((monotonic()-began)*1000)
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix='scan-aligned-evidence') as pool:
-            fund_job = pool.submit(collect_parallel, 'fund_evidence', funds_for, fund_codes, 20, 8)
+            fund_job = pool.submit(collect_parallel, 'fund_evidence', funds_for, fund_codes,
+                                   40 if self.opportunity_research else 20, 8)
             sector_job = pool.submit(collect_parallel, 'sector_evidence', sectors_for, [None], 40, 1)
             sector_packets, fund_packets = sector_job.result(), fund_job.result()
         with sector_lock:
@@ -704,15 +765,24 @@ class LocalOpportunityService(DailyOpportunityService):
                           for packet in sectors.values()),
             'providerErrors': errors, 'missing': len(codes)-len(sectors)}
         funds = dict(fund_packets)
+        sector_flows = {}
+        if self.opportunity_research:
+            from .fund_flow_evidence import compute_sector_flows
+            from .fund_flow_archive import archive_fund_packets
+            archive_budget = budget_for('fund_flow_archive', archive_reserve, reserve=quote_reserve)
+            funds, quality['fundFlowArchive'] = archive_fund_packets(
+                funds, minute_cutoff, self.yao.data_dir/'fund_flow_history', clock=self.clock,
+                timeout=1, deadline=monotonic()+archive_budget)
+            members, peers = prepared_sectors or ({}, {})
         stage('fund_evidence', 80, '板块与资金采集完成；缺失因子将如实标记')
         quality['fundCollection'] = {
-            'requested': len(codes), 'returned': len(funds),
-            'usable': sum(finite((packet.get('metrics') or {}).get('main_net_flow_3m')) is not None
+            'requested': len(fund_codes), 'candidateCount': len(codes), 'returned': len(funds),
+            'legacy3mUsable': sum(finite((packet.get('metrics') or {}).get('main_net_flow_3m')) is not None
                           for packet in funds.values()),
-            'unfinished': len(codes)-len(funds),
+            'unfinished': len(fund_codes)-len(funds),
             'reasonCounts': dict(Counter(reason for packet in funds.values()
                                          for reason in set(packet.get('reasonCodes') or []))),
-            'meaning': '返回错误诊断不等于资金数据可用；个股分钟缺失与资金源失败分别统计',
+            'meaning': '采集返回、旧3分钟字段与归档后同窗30分钟可核验数量分别统计；均不等于入选数量',
         }
         for code in codes:
             for name, packets in (('sector_evidence',sectors),('fund_evidence',funds)):
@@ -743,6 +813,28 @@ class LocalOpportunityService(DailyOpportunityService):
                 intraday[code].update(metrics={}, v11Inputs={})
                 intraday[code].setdefault('gaps',[]).append('独立报价核验发现分钟价格或计算版本冲突，本轮隔离')
         quality['independentMinuteVerification'] = verification
+        if self.opportunity_research:
+            # The final quote check can quarantine a stock that is also a peer
+            # of another candidate. Rebuild sector flow only after that check.
+            for code, packet in opportunity_minutes.items():
+                flow_minutes[code] = {**packet, 'flowAmountWindowsByEnd':
+                    flow_minutes.get(code, {}).get('flowAmountWindowsByEnd') or {}}
+            sector_flows = compute_sector_flows({code: members.get(code, {}) for code in codes}, peers,
+                funds, flow_minutes, minute_cutoff, horizon=30)
+            from .fund_flow_evidence import compute_stock_flow
+            aligned_flows = {code: compute_stock_flow(packet, flow_minutes.get(code) or {}, minute_cutoff, horizon=30)
+                             for code, packet in funds.items()}
+            quality['fundCollection'].update(
+                aligned30mObserved=sum(packet.get('status') == 'observed' for packet in aligned_flows.values()),
+                candidate30mObserved=sum((aligned_flows.get(code) or {}).get('status') == 'observed' for code in codes),
+                positive30mCount=sum(packet.get('status') == 'observed' and
+                    (packet.get('metrics', {}).get('netFlowCny') or 0) > 0 for packet in aligned_flows.values()),
+                windowReasons=dict(Counter(reason for packet in aligned_flows.values() for reason in packet.get('reasons') or [])),
+                computedAfterFinalLineageVerification=True)
+            quality['sectorFlowCollection'] = {'requested': len(codes),
+                'observed': sum((sector_flows.get(code) or {}).get('status') == 'observed' for code in codes),
+                'minimumPeers': 3, 'coverageRequiredPct': 80, 'horizonMinutes': 30,
+                'computedAfterFinalLineageVerification': True}
         stage('evaluation', 94, '正在按证据规则筛选并整理候选')
         assessed = []
         researched = []
@@ -762,7 +854,8 @@ class LocalOpportunityService(DailyOpportunityService):
                 'factorCutoffAt':minute_cutoff.isoformat(),
                 'dataLineage':(intraday.get(code) or {}).get('dataLineage') or {'status':'unknown',
                     'reasonCodes':['minute_lineage_unavailable']},
-                'industry':((sectors.get(code) or {}).get('sector') or {}).get('name'),
+                'industry':((sectors.get(code) or {}).get('sector')
+                    or ((prepared_sectors or ({}, {}))[0].get(code)) or {}).get('name'),
                 'stateLabel':{'conditional':'条件观察','premarket':'盘前观察','expired':'已过期','windvane':'不可买风向标','data_insufficient':'数据不足'}[state],
                 'modelBranch':'量价结构条件观察', 'modelStatus':'evidence_rules_unvalidated',
                 'scoreMeaning':'本地证据规则未校准为收益预测；无综合评分或胜率',
@@ -1095,7 +1188,7 @@ class LocalOpportunityService(DailyOpportunityService):
             else:
                 reviewable = run['status'] in {'completed_observations', 'no_candidates_with_coverage_limits'}
                 # The legacy formal lane expires every candidate at 14:57.
-                # Its rule does not own a manual E/M research request, whose
+                # Its rule does not own a manual funds research request, whose
                 # quote/book/evidence checks still apply until the close.
                 if (slot == 'live' and not run.get('official') and run['status'] == 'expired'
                         and time(14, 57) <= completed_clock < time(15)):
@@ -1108,11 +1201,11 @@ class LocalOpportunityService(DailyOpportunityService):
             run['opportunityChannels'] = build_opportunity_channels(
                 researched if reviewable else [], completed, top_n=top_n,
                 minute_packets=opportunity_minutes, daily_packets=daily,
-                contexts=prepared_context, previous=prior_channels)
+                contexts=prepared_context, previous=prior_channels, sector_flow_packets=sector_flows)
             run['opportunityRecommendationCount'] = len(run['opportunityChannels']['recommendations'])
             quality['opportunityDiscovery'] = run['opportunityChannels']['diagnostics']
             if reviewable:
-                run['message'] = (f'机会精选{run["opportunityRecommendationCount"]}只（E早期启动 / M主升确认）；'
+                run['message'] = (f'机会精选{run["opportunityRecommendationCount"]}只（板块资金 / 持续趋势 / 买入位置）；'
                     f'模型验证精选{len(run["candidates"])}只。确认项和缺口逐股展示，规则排序不代表上涨概率。')
 
     def _persist_run(self, run):

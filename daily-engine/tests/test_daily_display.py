@@ -118,7 +118,7 @@ def test_unknown_daily_version_is_rejected_even_on_historical_reads(tmp_path, mo
 
 
 @pytest.mark.parametrize('version', [VERSION, 'king-daily-primary-v2', 'king-daily-primary-v3', 'king-daily-primary-v4'])
-def test_sql_history_header_restores_daily_branch_without_loading_rejected_payloads(tmp_path, monkeypatch, version):
+def test_sql_metadata_restores_daily_branch_and_does_not_repeat_payload_reads(tmp_path, monkeypatch, version):
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
     from src.storage import DatabaseManager, YaoRun
@@ -156,11 +156,15 @@ def test_sql_history_header_restores_daily_branch_without_loading_rejected_paylo
             reads.append(run_id)
             return get_run(run_id)
         db.get_yao_run = fetch
-        saved = LocalPicksDisplayStore(db).read()
+        for _ in range(4):
+            saved = LocalPicksDisplayStore(db).read()
+            if 'displayRecovery' not in saved:
+                break
         assert saved['adaptive'] == valid and saved['dailyCandidateCount'] == 1
-        assert reads == [valid['run_id']]
+        expected_reads = [row['run_id'] for row in (unknown, stale, missing, valid)]
+        assert reads == expected_reads  # New metadata rows are validated once, in bounded batches.
         assert LocalPicksDisplayStore(db).read() == saved
-        assert reads == [valid['run_id']]
+        assert reads == expected_reads
         assert LocalPicksDisplayStore(None).read() == saved
     finally:
         engine.dispose()
@@ -338,9 +342,12 @@ def test_history_headers_restore_repaired_observation_and_reject_formal_bypass(t
             reads.append(run_id)
             return get_run(run_id)
         db.get_yao_run = fetch
-        saved = LocalPicksDisplayStore(db).read()
+        for _ in range(4):
+            saved = LocalPicksDisplayStore(db).read()
+            if 'displayRecovery' not in saved:
+                break
         assert saved['adaptive'] == valid
-        assert reads == [valid['run_id']]
+        assert reads == [row['run_id'] for row in (invalid_profile, invalid_main, valid)]
         assert LocalPicksDisplayStore(None).read() == saved
     finally:
         engine.dispose()

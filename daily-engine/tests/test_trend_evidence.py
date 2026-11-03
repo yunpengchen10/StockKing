@@ -14,7 +14,7 @@ START = datetime(2026, 9, 15, 10, 0, tzinfo=SHANGHAI)
 def fixture(prices, *, start=START, amounts=None):
     amounts = amounts if amounts is not None else [1000.0] * len(prices)
     bars = {
-        start + timedelta(minutes=i): {"close": price, "amount_cny": amount}
+        start + timedelta(minutes=i): {"close": price, "low": price, "amount_cny": amount}
         for i, (price, amount) in enumerate(zip(prices, amounts))
     }
     return bars, max(bars)
@@ -25,7 +25,7 @@ def test_monotonic_log_trend_is_efficient_with_no_close_drawdown():
     evidence = compute_trend_evidence(bars, end, {at: 9.0 for at in bars})
     assert evidence["version"] == TREND_EVIDENCE_VERSION
     assert evidence["validationStatus"] == "unvalidated_descriptive"
-    assert evidence["missingReasons"] == {}
+    assert all(key.endswith('60m') or '60m_' in key for key in evidence["missingReasons"])
     for n in (15, 30):
         metrics = evidence["metrics"]
         assert metrics[f"signed_log_efficiency_{n}m"] == pytest.approx(1)
@@ -45,6 +45,25 @@ def test_equal_endpoint_rise_can_have_a_very_different_path():
     assert left["signed_log_efficiency_30m"] > right["signed_log_efficiency_30m"] > 0
     assert right["signed_log_efficiency_30m"] < 0.1
     assert right["close_max_drawdown_30m_pct"] > left["close_max_drawdown_30m_pct"]
+
+
+def test_complete_sixty_minute_window_has_its_own_observed_path_and_structure():
+    bars, end = fixture([10 + .01*i for i in range(61)])
+    result = compute_trend_evidence(bars, end, {at: 9. for at in bars})
+    assert result['metrics']['signed_log_efficiency_60m'] == pytest.approx(1)
+    assert result['metrics']['net_return_60m_pct'] == pytest.approx(6)
+    assert result['metrics']['window_low_60m'] == 10
+    assert result['metrics']['window_low_30m'] == 10.3
+    assert result['metrics']['close_max_drawdown_60m_cny'] == 0
+    assert result['missingReasons'] == {}
+
+
+def test_sixty_minute_evidence_never_uses_earlier_session_to_fill_lunch():
+    bars, end = fixture([10 + .01*i for i in range(61)], start=START.replace(hour=12, minute=50))
+    result = compute_trend_evidence(bars, end, {})
+    assert result['metrics']['signed_log_efficiency_60m'] is None
+    assert result['missingReasons']['signed_log_efficiency_60m'] == 'window_crosses_session_boundary'
+    assert result['metrics']['signed_log_efficiency_30m'] == pytest.approx(1)
 
 
 def test_rise_then_fade_reports_close_drawdown_and_giveback():

@@ -1,8 +1,7 @@
-"""Independent E/M research opportunities from evidence available at decision time.
+"""Current flow/trend research entry point; no execution or training authority.
 
-This pure module performs no I/O and grants no execution or model-training
-eligibility. Missing confirmation is not adverse evidence. Early opportunities
-do not inherit the formal model's historical, sector, VWAP or profit gates.
+No legacy fallback. Missing mandatory stock/sector flow or a complete thirty
+minute path remains observation-only. Short price speed never grants rank.
 """
 from __future__ import annotations
 
@@ -12,7 +11,8 @@ from datetime import datetime, time, timedelta
 import math
 from zoneinfo import ZoneInfo
 
-VERSION = 'opportunity-em-20261029-v2'
+from .flow_opportunity_policy import VERSION, PARAMETERS, policy_contract, assess_flow_policy, rank_qualified
+from .fund_flow_evidence import compute_stock_flow
 TZ = ZoneInfo('Asia/Shanghai')
 
 
@@ -41,20 +41,6 @@ def _fresh(value, now, seconds):
 
 def _source(value):
     return bool(value and not any(word in str(value).lower() for word in ('unknown', 'missing', '未取得', '未记录')))
-
-
-def policy_contract():
-    return {'version': VERSION, 'validationStatus': 'prospective_rules_unvalidated',
-        'channels': {'E': '状态跃迁、反转或加速的早期机会', 'M': '已有延续或回踩再起证据的确认机会'},
-        'missingPolicy': 'show_unknown_never_infer_adverse_or_fabricate_evidence',
-        'notRequired': ['twenty_day_baseline', 'above_vwap', 'sector_synchrony', 'estimated_fund_flow', 'trained_model'],
-        'hardVetoes': ['stale_or_conflicting_quote', 'tainted_market_data', 'no_buy_window',
-                       'strong_distribution_evidence', 'verified_major_adverse_event_or_restriction'],
-        'ranking': 'state_change_with_held_structure_then_directional_acceleration_then_path_efficiency_then_support_space_buyability',
-        'rankScoreMeaning': '当轮合格机会的规则名次分，不是胜率、收益预测或成交保证',
-        'maximumRecommendations': 5, 'probability': None, 'formalRecommendationAllowed': False,
-        'trainingEligible': False, 'executionVerified': False,
-        'meaning': '独立规则机会；至少需要真实时间变化及主动性、催化或板块支持，不以当日涨幅快照冒充启动。'}
 
 
 def _previous_rows(previous):
@@ -197,8 +183,6 @@ def _minute_assessment(row, packet, now, hard, missing):
         raw['a1_pct_per_min'] = raw['r1_pct']-raw['r5_pct']/5
     if raw.get('a3_pct_per_min') is None and raw.get('r3_pct') is not None and raw.get('r15_pct') is not None:
         raw['a3_pct_per_min'] = raw['r3_pct']/3-raw['r15_pct']/15
-    if not any(raw.get(f'r{n}_pct') is not None for n in (1, 3, 5, 15)):
-        missing.append('分钟包没有可核验涨速，不能由日涨幅补造状态跃迁')
     if (_number(packet.get('historyDays')) or 0) < 20:
         missing.append('20日同刻基准未齐；使用当日真实变化，历史异常程度未知')
     if (packet.get('dataLineage') or row.get('dataLineage') or {}).get('status') != 'verified':
@@ -208,223 +192,75 @@ def _minute_assessment(row, packet, now, hard, missing):
     return raw, {key: _number(value) for key, value in trend_metrics.items()}, stamp
 
 
-def _auxiliary(row, context, now, minute_at, support, missing, counter, hard):
-    quote = row.get('quote') or {}
-    active = _number(quote.get('active_buy_share_pct'))
-    if not (_source(quote.get('active_flow_source')) and _fresh(quote.get('active_flow_as_of'), now, 30)
-            and active is not None and 0 <= active <= 100):
-        active = None
-    if active is None:
-        missing.append('主动买卖分类未知')
-    elif active > 50:
-        support.append('新鲜外内盘口径买方占优（累计分类，不等于机构资金）')
-    elif active < 50:
-        counter.append('累计主动分类仍偏卖方，需继续观察近期修复')
-    flow, sector_relative, sector_return = None, None, None
-    for name in ('fundEvidence', 'sectorEvidence'):
-        packet = row.get(name) or {}
-        valid = bool(_source(packet.get('source')) and _fresh(packet.get('asOf'), now, 299)
-                     and minute_at and _at(packet.get('asOf')) == minute_at)
-        values = (packet.get('metrics') or {}) if valid else {}
-        if name == 'fundEvidence':
-            flow = _number(values.get('main_net_flow_3m'))
-        else:
-            sector_relative = _number(values.get('sector_relative_5m_pct'))
-            sector_return = _number(values.get('sector_return_5m_pct'))
-    if flow is None:
-        missing.append('同窗资金估算未知；不作为早期机会否决条件')
-    elif flow > 0:
-        support.append('同窗近3分钟供应商估算净额转正')
-    elif flow < 0:
-        counter.append('同窗近3分钟供应商估算净额为负')
-    leadership = sector_relative is not None and sector_relative > 0
-    if leadership:
-        support.append('同窗价格推进领先行业，行业未同步不否决早期机会')
-    if sector_return is None:
-        missing.append('板块同步证据未知')
-    elif sector_return <= 0:
-        counter.append('行业同窗尚未转强')
-    elif leadership:
-        support.append('行业与个股同窗向上，形成确认支持')
-    catalyst = False
-    event = (row.get('researchFactors') or {}).get('C') or {}
-    event_at = _at(event.get('asOf'))
-    if (event.get('status') == 'observed' and _source(event.get('source')) and event_at
-            and 0 <= (now-event_at).total_seconds() <= 86400
-            and (_number(event.get('score')) or 0) > 50
-            and ((_number((event.get('features') or {}).get('positive_event_count')) or 0) > 0)):
-        catalyst = True
-        support.append('时点合法的已披露正面业绩事件提供催化支持')
-    for event in context.get('catalysts') or []:
-        if (_known_event(event, now) and event.get('direction') == 'positive'
-                and (now-_at(event['availableAt'])).total_seconds() <= 86400):
-            catalyst = True
-            support.append('当时已可知的新催化：'+str(event.get('title') or event.get('type') or '已核验事件'))
+def _risk_context(context, now, code, hard, missing):
+    # These clock/source/identity guards remain independent of the flow policy.
     for event in (context.get('majorNegativeEvents') or [])+(context.get('regulatoryRisks') or []):
-        if _known_event(event, now) and event.get('severity') in ('major', 'critical', '重大'):
+        if (_known_event(event, now) and event.get('severity') in ('major', 'critical', '重大')
+                and (event.get('code') is None or str(event['code']) == code)):
             hard.append('已核验重大负面或监管限制：'+str(event.get('title') or event.get('type') or '重大事件'))
-    if not catalyst:
-        missing.append('独立新催化未核验；不把缺失当作利空')
-    return active, flow, leadership, sector_return, catalyst
+    disclosures = [deepcopy(event) for event in context.get('disclosures') or []
+                   if _known_disclosure(event, code, now)]
+    for event in disclosures:
+        missing.append('已披露待验证线索（仅标题，不替代资金证据）：'+str(event.get('title') or event.get('category')))
+    return disclosures
 
 
-def _assess(candidate, now, minute, daily, context, previous):
+def _assess(candidate, now, minute, daily, context, previous, sector_flow):
     row = deepcopy(candidate)
     quote, price, hard, missing, buy = _quote_assessment(row, now)
-    support, counter = [], []
     raw, trend, minute_at = _minute_assessment(row, minute, now, hard, missing)
-    active, flow, leadership, sector_return, catalyst = _auxiliary(
-        row, context or {}, now, minute_at, support, missing, counter, hard)
-    disclosures = [deepcopy(event) for event in (context or {}).get('disclosures') or []
-                   if _known_disclosure(event, str(row.get('code') or ''), now)]
-    for event in disclosures:
-        missing.append('已披露待验证线索（仅标题，不作正催化）：'+str(event.get('title') or event.get('category')))
-    r1, r3, r5, r15 = (raw.get(f'r{n}_pct') for n in (1, 3, 5, 15))
-    a1, a3 = raw.get('a1_pct_per_min'), raw.get('a3_pct_per_min')
+    disclosures = _risk_context(context or {}, now, str(row.get('code') or ''), hard, missing)
     minute_price = _number((minute or {}).get('currentPrice'))
     if (minute_price and minute_at and _number(quote.get('high')) and _number(quote.get('low'))
             and not _number(quote['low']) <= minute_price <= _number(quote['high'])):
         hard.append('当日分钟价格与独立报价日内范围冲突')
-    # The price at the end of the metric window is the breakout evidence.
-    # A later quote alone cannot turn an old minute window into a breakout.
-    high5, low5, vwap = (raw.get(key) for key in ('local_high_5m', 'local_low_5m', 'vwap'))
-    minute_breakout = bool(minute_price and high5 and minute_price > high5)
-    # A later executable-price observation can invalidate an old signal. It
-    # cannot manufacture a new completed-minute breakout or recovery.
-    breakout = bool(minute_breakout and price and price >= high5)
-    reclaim = bool((raw.get('vwap_reclaim') == 1 or raw.get('vwap_retest_success') == 1)
-                   and minute_price and vwap and minute_price >= vwap and price and price >= vwap)
-    reversal = bool(r1 is not None and r1 > 0 and
-                    ((r3 is not None and r3 <= 0) or (r15 is not None and r15 <= 0)))
-    accelerating = bool((r1 is not None and r1 > 0 and a1 is not None and a1 > 0)
-                        or (r3 is not None and r3 > 0 and a3 is not None and a3 > 0))
-    rising = bool(r3 is not None and r5 is not None and r3 > 0 and r5 > 0)
-    latest_falling = r1 is not None and r1 < 0
-    # A shallow latest-minute pullback is counter-evidence, not a shared gate
-    # that discards an otherwise observed 3/5/15-minute move in both channels.
-    repair_confirmed = bool((r3 is not None and r3 > 0) or breakout or reclaim)
-    transition = bool(minute_at and (reversal or accelerating or breakout) and repair_confirmed)
-    if accelerating:
-        support.append('短窗涨速高于自身较长窗口均速，已观察到加速')
-    if reversal:
-        support.append('短窗转正而此前窗口仍弱，已观察到反转线索')
-    if (reversal or accelerating) and not repair_confirmed:
-        missing.append('单分钟反弹尚未形成3分钟转正、完成突破或收复确认，不进入推荐')
-    if breakout:
-        support.append('已完成分钟价格越过此前5分钟局部高点')
-    if minute_breakout and not breakout:
-        counter.append('最新报价已跌回分钟突破位下方，原突破证据失效')
-    if latest_falling:
-        counter.append('最近完整1分钟价格回落，当前启动证据减弱')
-    above_vwap = bool(price and vwap and price > vwap)
-    if vwap is None:
-        missing.append('VWAP位置未知')
-    elif not above_vwap:
-        counter.append('当前尚未站回VWAP；保留早期反转评估')
-    else:
-        support.append('当前价格处于已核验分钟VWAP上方')
-    failed_breakout_unrepaired = raw.get('failed_breakout_risk') == 100 and not breakout
-    if failed_breakout_unrepaired:
-        counter.append('最近完整分钟存在突破失败，须核对是否已恢复')
-    selling = bool((flow is not None and flow < 0) or (active is not None and active < 50))
-    structural_failure = bool((price and low5 and price < low5) or raw.get('failed_breakout_risk') == 100)
-    live_low_broken = bool(price and low5 and price < low5)
-    if live_low_broken:
-        counter.append('最新报价已跌破信号窗口局部低点，原机会结构失效')
-    lower_high_unrepaired = bool(raw.get('lower_high_risk') == 100 and not (breakout or reclaim))
-    if lower_high_unrepaired:
-        counter.append('局部高点降低且尚无完成突破或收复，弱势结构未修复')
-    if (r1 is not None and r1 < 0 and r3 is not None and r3 < 0 and structural_failure and selling):
-        hard.append('完整分钟转弱、结构破坏与卖压同时出现，存在明确派发反证')
-    amount3, amount15 = raw.get('amount_3m'), raw.get('amount_15m')
-    volume_acceleration = bool(amount3 is not None and amount15 is not None and amount15 > 0
-                               and amount3/3 > amount15/15)
-    if volume_acceleration:
-        support.append('当日短窗成交速度超过自身较长窗口，不依赖20日基准')
-    # Acceleration and breakout are price transformations, not independent
-    # buying evidence. Nor can cumulative buying or unsigned turnover cancel
-    # an observed negative flow in the actual decision window.
-    initiative = bool((flow is not None and flow > 0)
-                      or (active is not None and active > 50 and (flow is None or flow >= 0))
-                      or (transition and volume_acceleration and not selling))
-    corroborated = initiative or catalyst or leadership
-    efficiency = trend.get('signed_log_efficiency_15m')
-    sustained = bool(rising and
-        ((r15 is not None and r15 > 0 and efficiency is not None and efficiency > 0)
-         or raw.get('vwap_retest_success') == 1
-         or (previous and price and price > (_number(previous.get('firstDetectionPrice')) or price))))
-    confirmed = bool(sustained and corroborated and
-                     (above_vwap or leadership or (flow is not None and flow > 0)))
-    channel = 'M' if confirmed else 'E'
-    if confirmed:
-        support.append('跨窗口延续或回踩再起已有当时证据')
-    structure_held = not (live_low_broken or failed_breakout_unrepaired or lower_high_unrepaired
-                          or (minute_breakout and not breakout))
-    qualified = bool((confirmed or transition) and corroborated and structure_held)
-    if not (confirmed or transition):
-        missing.append('尚未观察到独立状态跃迁或延续证据，日涨幅和热度不替代分钟变化')
-    if not corroborated:
-        missing.append('主动性、新催化或相对板块地位尚无独立支持')
-    daily_metrics = (daily or {}).get('metrics') or {}
-    daily_prev = _number(daily_metrics.get('last_close'))
-    aligned = bool(daily_prev and _number(quote.get('pre_close')) and abs(daily_prev-_number(quote['pre_close'])) <= .011)
-    resistance = min((value for value in (_number(daily_metrics.get('high20')),
-                                          _number(daily_metrics.get('high60')))
-                      if aligned and price and value and value > price), default=None)
-    remaining = (resistance/price-1)*100 if resistance and price else None
-    if remaining is None:
-        missing.append('T至T+5剩余空间未知；新高不因缺少历史压力而被否决，不编造目标价')
-    invalidation = ['新鲜报价或正常卖盘失效时停止沿用本次机会',
-                    '连续转弱并伴随结构破坏、明确卖压或重大负面时重新评估']
-    if low5 and price and low5 < price:
-        invalidation.append(f'失效参考为已观察分钟低点{low5:.2f}元；T+1不保证可按此价退出')
-    grade = 'C' if hard else channel+'-A' if qualified and buy['status'] == 'observed' else 'B'
+    stock_flow = compute_stock_flow(row.get('fundEvidence') or {}, minute or {}, minute_at,
+                                   horizon=PARAMETERS['windowMinutes'])
+    sector_flow = sector_flow or {}
+    assessment = assess_flow_policy(row, minute, daily, quote, buy, trend, minute_at, now,
+                                    stock_flow, sector_flow)
+    missing.extend(assessment['missing'])
+    support, counter = assessment['support'], assessment['counterEvidence']
+    grade = 'C' if hard else 'F-A' if assessment['qualified'] else 'B'
+    selection_mode = assessment['selectionMode'] if grade == 'F-A' else 'observation'
     first = previous.get('firstDetectionAt') if previous else now.isoformat()
     first_price = previous.get('firstDetectionPrice') if previous else price
-    change_rate = max((value for value in (a1, a3) if value is not None), default=None)
-    # Falling comparison windows must not inflate a rebound's rank: e.g.
-    # +0.1% after a -10% five-minute move is not +2.1%/minute new strength.
-    directional_rates = []
-    for short_return, long_return, short_minutes, long_minutes in ((r1, r5, 1, 5), (r3, r15, 3, 15)):
-        if short_return is not None and long_return is not None:
-            directional_rates.append(short_return/short_minutes-max(long_return/long_minutes, 0.))
-    directional_rate = max(directional_rates, default=None)
-    pullback_adjustment = min(r1, 0.) if r1 is not None else 0.
-    ranking_change = directional_rate+pullback_adjustment if directional_rate is not None else None
-    rank_tuple = (float(transition), ranking_change if ranking_change is not None else -math.inf,
-                  efficiency if efficiency is not None else -math.inf,
-                  float(initiative)+float(leadership)+float(catalyst),
-                  remaining if remaining is not None else -math.inf,
-                  -(buy['spreadPct'] if buy['spreadPct'] is not None else math.inf))
-    opportunity = {'version': VERSION, 'channel': channel, 'grade': grade, 'rankScore': None,
-        'rankScoreMeaning': policy_contract()['rankScoreMeaning'],
-        'support': list(dict.fromkeys(support)), 'supports': list(dict.fromkeys(support)),
-        'missing': list(dict.fromkeys(missing)), 'counterEvidence': list(dict.fromkeys(counter+hard)),
-        'hardVetoes': hard, 'reasons': hard or support or ['仅保留观察，证据尚不支持机会入选'],
+    structural_low = assessment['metrics']['structuralLow30m']
+    invalidation = ['报价、盘口或必需资金/分钟证据失效时停止沿用本次机会',
+                    '30分钟结构破坏或已核验重大负面时重新评估；T+1不保证按失效参考价退出']
+    if structural_low is not None:
+        invalidation.append(f'完整30分钟已观察低点{structural_low:.2f}元为结构参考，不是保证成交的止损价')
+    metrics = {**raw, **assessment['metrics'],
+               'stockNetFlowRatio30m': (stock_flow.get('metrics') or {}).get('netFlowRatio'),
+               'sectorNetFlowRatio30m': (sector_flow.get('metrics') or {}).get('netFlowRatio')}
+    opportunity = {
+        'version': VERSION, 'channel': 'F', 'grade': grade, 'selectionMode': selection_mode,
+        'rankScore': None, 'rankingComposite': None, 'rankingComponents': {},
+        'rankingValues': assessment['rankingValues'], 'rankScoreMeaning': policy_contract()['rankScoreMeaning'],
+        'sectorKey': assessment['sectorKey'], 'sector': assessment['sector'],
+        'support': support, 'supports': support, 'missing': list(dict.fromkeys(missing)),
+        'counterEvidence': list(dict.fromkeys(counter+hard)), 'hardVetoes': hard,
+        'failedConditions': assessment['failedConditions'],
+        'reasons': hard or assessment['failedConditions'] or support,
         'invalidation': invalidation, 'firstDetectionAt': first, 'firstDetectionPrice': first_price,
         'detectedAt': now.isoformat(), 'triggerAt': None,
         'sourceEvidence': {'quoteSource': quote.get('source'),
             'quoteSourceTime': quote.get('provider_timestamp') or quote.get('source_time'),
             'minuteSource': (minute or {}).get('source'), 'minuteAsOf': minute_at.isoformat() if minute_at else None,
             'bookSourceTime': buy['sourceTime']},
-        'metrics': {**raw, 'pathEfficiency15m': efficiency, 'accelerationPerMinute': change_rate,
-                    'directionalAccelerationPerMinute': directional_rate,
-                    'repairConfirmed': repair_confirmed, 'structureHeldAtDecision': structure_held,
-                    'independentInitiative': initiative,
-                    'recentPullbackRankAdjustment': pullback_adjustment,
-                    'rankingChangeRate': ranking_change,
-                    'activeBuySharePct': active, 'fundFlow3m': flow},
-        'buyWindow': buy, 'spaceStatus': 'observed' if remaining is not None else 'unknown',
-        'remainingSpacePct': remaining, 'researchOnly': True, 'probability': None,
-        'disclosureEvidence': disclosures,
-        'validationStatus': 'prospective_rules_unvalidated', 'triggerMeaning': '未重建首次触发；分钟源时仅为观察截止'}
+        'flowEvidence': {'stock': stock_flow, 'sector': deepcopy(sector_flow)},
+        'metrics': metrics, 'buyWindow': buy, 'spaceStatus': 'unknown', 'remainingSpacePct': None,
+        'researchOnly': True, 'probability': None, 'disclosureEvidence': disclosures,
+        'validationStatus': 'prospective_rules_unvalidated',
+        'triggerMeaning': '固定窗口决策记录；不是已成交或事后重建首次触发',
+    }
     row.update(opportunity=opportunity, ruleRecommendation=False, formalEligible=False,
                trainingEligible=False, training_eligible=False, executable=False)
-    return row, rank_tuple
+    return row
 
 
 def build_opportunity_channels(candidates, now, *, top_n=5, minute_packets=None,
-                               daily_packets=None, contexts=None, previous=None):
+                               daily_packets=None, contexts=None, previous=None, sector_flow_packets=None):
     now = _at(now)
     if now is None:
         raise ValueError('opportunity decision time requires an explicit timezone')
@@ -437,7 +273,7 @@ def build_opportunity_channels(candidates, now, *, top_n=5, minute_packets=None,
             code = str(item.get('code') or '')
             if code not in prior or first < _at(prior[code]['firstDetectionAt']):
                 prior[code] = record
-    assessed, seen = [], set()
+    research, seen = [], set()
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
@@ -445,25 +281,33 @@ def build_opportunity_channels(candidates, now, *, top_n=5, minute_packets=None,
         if not code or code in seen:
             continue
         seen.add(code)
-        assessed.append(_assess(candidate, now, (minute_packets or {}).get(code),
-            (daily_packets or {}).get(code), (contexts or {}).get(code), prior.get(code)))
-    eligible = sorted((item for item in assessed if item[0]['opportunity']['grade'] in ('E-A', 'M-A')),
-                      key=lambda item: tuple(-value for value in item[1])+(str(item[0]['code']),))
-    for index, (row, _) in enumerate(eligible):
-        row['opportunity']['rankScore'] = round(100*(len(eligible)-index)/len(eligible), 4)
-        row['opportunity']['rank'] = index+1
-        row['opportunity']['rankingPeerCount'] = len(eligible)
-    limit = max(0, min(5, int(top_n)))
-    recommendations = [row for row, _ in eligible[:limit]]
-    for row in recommendations:
-        row['ruleRecommendation'] = True
-    research = [row for row, _ in assessed]
+        research.append(_assess(candidate, now, (minute_packets or {}).get(code),
+            (daily_packets or {}).get(code), (contexts or {}).get(code), prior.get(code),
+            (sector_flow_packets or {}).get(code)))
+    eligible = rank_qualified([row for row in research if row['opportunity']['grade'] == 'F-A'])
+    limit = max(0, min(PARAMETERS['maximumRecommendations'], int(top_n)))
+    recommendations, sectors = [], Counter()
+    for index, row in enumerate(eligible):
+        opportunity = row['opportunity']
+        opportunity['rank'] = index + 1
+        opportunity['rankingPeerCount'] = len(eligible)
+        sector = opportunity['sectorKey']
+        if len(recommendations) >= limit:
+            opportunity['selectionExclusion'] = 'outside_maximum_recommendations'
+        elif sectors[sector] >= PARAMETERS['maximumPerSector']:
+            opportunity['selectionExclusion'] = 'sector_concentration_limit'
+        else:
+            row['ruleRecommendation'] = True
+            recommendations.append(row)
+            sectors[sector] += 1
     observations = [row for row in research if not row['ruleRecommendation']]
     reasons = Counter(reason for row in research for reason in row['opportunity']['hardVetoes'])
+    failures = Counter(reason for row in research for reason in row['opportunity']['failedConditions'])
     return {'version': VERSION, 'asOf': now.isoformat(), 'policy': policy_contract(),
-        'recommendations': recommendations, 'observations': observations,
-        'researchCandidates': research,
+        'recommendations': recommendations, 'observations': observations, 'researchCandidates': research,
         'diagnostics': {'researchedCount': len(research), 'qualifiedCount': len(eligible),
             'recommendationCount': len(recommendations), 'observationCount': len(observations),
             'gradeCounts': dict(Counter(row['opportunity']['grade'] for row in research)),
-            'hardVetoCounts': dict(reasons), 'missingConfirmationDoesNotEqualAdverseEvidence': True}}
+            'hardVetoCounts': dict(reasons), 'failedConditionCounts': dict(failures),
+            'missingConfirmationDoesNotEqualAdverseEvidence': True,
+            'mandatoryMissingRemainsObservation': True, 'selectionVersion': VERSION}}

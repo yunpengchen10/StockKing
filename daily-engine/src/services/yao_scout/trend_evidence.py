@@ -17,11 +17,23 @@ import math
 from typing import Any
 
 
-TREND_EVIDENCE_VERSION = "minute-trend-evidence-v1"
+TREND_EVIDENCE_VERSION = "minute-trend-evidence-v2"
 SHANGHAI = timezone(timedelta(hours=8))
-HORIZONS = (15, 30)
+HORIZONS = (15, 30, 60)
 
 _DEFINITIONS = {
+    "net_return_{n}m_pct": {
+        "unit": "percent", "formula": "100*(P_n/P_0-1)",
+        "meaning": "固定完整窗口首尾分钟收盘价变化；不是可成交收益",
+    },
+    "window_low_{n}m": {
+        "unit": "CNY/share", "formula": "min(i=0..n, minute_low_i)",
+        "meaning": "完整窗口已观察分钟低价最小值，仅作结构参考，不保证可按此退出",
+    },
+    "close_max_drawdown_{n}m_cny": {
+        "unit": "CNY/share", "formula": "max(j=0..n,max(i=0..j,P_i)-P_j)",
+        "meaning": "窗口内分钟收盘路径最大价差回撤，用于与同基准ATR比较",
+    },
     "signed_log_efficiency_{n}m": {
         "unit": "ratio [-1,1]",
         "formula": "(log(P_n)-log(P_0))/sum(i=1..n,abs(log(P_i)-log(P_(i-1)))); flat path=0",
@@ -128,14 +140,22 @@ def compute_trend_evidence(
             continue
 
         logs = [math.log(close) for close in closes]
+        metrics[f"net_return_{n}m_pct"] = 100 * (closes[-1] / closes[0] - 1)
+        lows = [_number(bar.get("low"), positive=True) for bar in bars]
+        if all(low is not None and low <= close for low, close in zip(lows, closes)):
+            metrics[f"window_low_{n}m"] = min(lows)
+        else:
+            reasons[f"window_low_{n}m"] = "missing_or_invalid_minute_low"
         changes = [right - left for left, right in zip(logs, logs[1:])]
         variation = math.fsum(abs(change) for change in changes)
         metrics[f"signed_log_efficiency_{n}m"] = (logs[-1] - logs[0]) / variation if variation else 0.0
-        peak, drawdown = closes[0], 0.0
+        peak, drawdown, drawdown_cny = closes[0], 0.0, 0.0
         for close in closes:
             peak = max(peak, close)
             drawdown = max(drawdown, 1 - close / peak)
+            drawdown_cny = max(drawdown_cny, peak - close)
         metrics[f"close_max_drawdown_{n}m_pct"] = 100 * drawdown
+        metrics[f"close_max_drawdown_{n}m_cny"] = drawdown_cny
         rise = max(logs) - logs[0]
         if rise > 0:
             metrics[f"close_pullback_to_rise_{n}m"] = (max(logs) - logs[-1]) / rise

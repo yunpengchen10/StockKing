@@ -98,14 +98,25 @@ def test_refresh_is_async_deduplicated_and_reopen_resumes(runtime, monkeypatch):
         assert shown["adaptive"] == old["adaptive"]
         assert shown["refreshTask"]["task_id"] == first.json()["task_id"]
         assert shown["refreshTask"]["progress"] == 60
+        assert shown["refreshTask"]["result"] is None
+        assert shown["refreshTask"]["resultPersisted"] is False
         assert shown["refreshTask"]["started_at"].endswith(("+08:00", "+00:00"))
     finally:
         gate.set()
     done = completed_response(client, queue, first)
     assert done["status"] == "completed" and done["progress"] == 100
-    assert done["result"]["adaptive"]["candidates"][0]["code"] == "600002"
+    assert done["result"] is None and done["resultPersisted"] is True
+    assert done["displayRunId"] == "fixture-600002"
+    assert done["displayGeneratedAt"] == "2026-09-29T10:30:00+08:00"
+    assert queue.get_task(done["task_id"]).result == {
+        "resultPersisted": True, "displayRunId": "fixture-600002",
+        "displayGeneratedAt": "2026-09-29T10:30:00+08:00",
+    }
+    shown = client.get("/picks/display").json()
+    assert shown["adaptive"]["candidates"][0]["code"] == "600002"
     assert calls == [("live", {"top_n": 5, "official": False})]
-    assert LocalPicksDisplayStore(db).read() == done["result"]
+    assert LocalPicksDisplayStore(db).read() == {
+        key: value for key, value in shown.items() if key != "currentPrimaryReadiness"}
 
 
 @pytest.mark.parametrize("result", [
@@ -228,7 +239,8 @@ def test_display_projection_preserves_recommendations_and_full_durable_evidence(
     store = LocalPicksDisplayStore(db)
     shown = store.save(result)
     assert shown["adaptive"]["candidates"] == result["candidates"]
-    assert shown["adaptive"]["evidenceInsufficient"] == [insufficient]
+    assert shown["adaptive"]["evidenceInsufficient"] == [{"code": "600003", "displayEvidenceMode": "summary"}]
+    assert shown["displayEvidenceMode"] == "summary"
     assert shown["adaptive"]["precisionWatchlist"] == [{
         code_key: "600002", "name": "等待样本",
         "precisionDecision": {"profiles": {"regular": {"entryEligible": False, "reasons": ["等待确认"]}}},
@@ -423,3 +435,13 @@ def test_task_endpoint_rejects_unrelated_tasks_and_missing_ids(runtime):
     task = queue.submit_background_task(lambda: {}, stock_code="other", report_type="other")
     assert client.get("/picks/refresh/tasks/" + task.task_id).status_code == 404
     assert client.get("/picks/refresh/tasks/missing").status_code == 404
+
+
+def test_display_response_remains_available_without_optional_fast_json_module(runtime, monkeypatch):
+    client, db, _, _ = runtime
+    saved = LocalPicksDisplayStore(db).save(scan())
+    monkeypatch.setattr(endpoint, "_orjson", None)
+    response = client.get("/picks/display")
+    assert response.status_code == 200
+    assert response.json()["displayRunId"] == saved["displayRunId"]
+    assert response.json()["adaptive"] == saved["adaptive"]
