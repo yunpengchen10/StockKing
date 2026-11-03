@@ -6,7 +6,13 @@ import threading
 from typing import Any, Dict, Literal
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import JSONResponse, ORJSONResponse
 from pydantic import BaseModel, Field
+
+try:
+    import orjson as _orjson
+except ImportError:
+    _orjson = None
 
 from api.deps import get_config_dep, get_database_manager
 from api.v1.errors import api_error
@@ -22,6 +28,12 @@ from src.services.stock_king_display import LocalPicksDisplayStore
 router = APIRouter()
 _refresh_lock = threading.RLock()
 _refresh_tasks: dict[str, str] = {}
+
+
+def _picks_json_response(payload: Dict[str, Any]) -> JSONResponse:
+    # The packaged engine includes orjson; source/dev environments may not.
+    # Both render immediately; the display route calls this inside its worker.
+    return ORJSONResponse(payload) if _orjson is not None else JSONResponse(payload)
 
 
 class PicksRequest(BaseModel):
@@ -48,6 +60,12 @@ class AdviceRequest(BaseModel):
 def _refresh_task_payload(task) -> Dict[str, Any]:
     def timestamp(value):
         return value.astimezone().isoformat() if value is not None else None
+    completed = task.status == QueueTaskStatus.COMPLETED
+    # Status requests must never walk or serialize research evidence. Older
+    # in-memory tasks may still hold a full saved display; read only its identity.
+    result = task.result if completed and isinstance(task.result, dict) else {}
+    adaptive = result.get("adaptive")
+    adaptive = adaptive if isinstance(adaptive, dict) else {}
     return {
         "task_id": task.task_id,
         "trace_id": task.trace_id or task.task_id,
@@ -58,7 +76,10 @@ def _refresh_task_payload(task) -> Dict[str, Any]:
         "created_at": timestamp(task.created_at),
         "started_at": timestamp(task.started_at),
         "completed_at": timestamp(task.completed_at),
-        "result": task.result if task.status == QueueTaskStatus.COMPLETED and isinstance(task.result, dict) else None,
+        "result": None,
+        "resultPersisted": completed and bool(result),
+        "displayRunId": result.get("displayRunId") or adaptive.get("run_id") or adaptive.get("runId"),
+        "displayGeneratedAt": result.get("displayGeneratedAt") or result.get("generatedAt") or adaptive.get("generatedAt"),
     }
 
 
@@ -90,7 +111,14 @@ def refresh_local_picks(
                 YaoScoutService(config=config, db_manager=db_manager), progress_callback=report,
             ).run("live", top_n=request.top_n, official=False)
             report(98, "扫描完成，正在保存本次展示结果")
-            return store.save(result)
+            saved = store.save(result)
+            # Persistence is the completion boundary. The task queue retains
+            # only this receipt; the display endpoint serves the saved view.
+            return {
+                "resultPersisted": True,
+                "displayRunId": saved.get("displayRunId"),
+                "displayGeneratedAt": saved.get("generatedAt"),
+            }
 
         task = queue.submit_background_task(
             execute, stock_code="king_local_refresh", stock_name="本地精选刷新",
@@ -102,24 +130,26 @@ def refresh_local_picks(
 
 
 @router.get("/picks/refresh/tasks/{task_id}")
-def get_local_picks_refresh_task(task_id: str) -> Dict[str, Any]:
+async def get_local_picks_refresh_task(task_id: str) -> JSONResponse:
     task = get_task_queue().get_task(task_id)
     if task is None or task.report_type != "stock_king_local_refresh":
         raise api_error(404, "stock_king_refresh_task_not_found", "本地精选刷新任务不存在或已过期，上次展示结果仍保留")
-    return _refresh_task_payload(task)
+    return _picks_json_response(_refresh_task_payload(task))
 
 
 @router.get("/picks/display")
 def get_local_picks_display(
     db_manager: DatabaseManager = Depends(get_database_manager),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     store = LocalPicksDisplayStore(db_manager)
     payload = store.with_current_primary_readiness(store.read())
     with _refresh_lock:
         active = _active_refresh(get_task_queue(), store.storage_key)
         if active:
             payload["refreshTask"] = _refresh_task_payload(active)
-    return payload
+    # This synchronous route runs in FastAPI's worker pool. Render here rather
+    # than letting FastAPI recursively encode the payload on the event loop.
+    return _picks_json_response(payload)
 
 
 @router.post("/picks")
