@@ -14,6 +14,7 @@ import { withRecordReadTimeout } from '../utils/recordRead.mjs'
 import { nextDayQueueLabel, nextDayTouchLabel, savedRecommendationSummary, primaryRecommendationPicks, primaryRecommendationState, primaryAdmissionReasons, marketBreadthSummary, firstRecommendationEvidence, isDailyPrimaryRun, dailyObservationPicks } from '../utils/pickLedger.mjs'
 import { premarketDisplayState, premarketText, premarketQuoteState, premarketPlanLabel } from '../utils/premarket.mjs'
 import { opportunityDisplay, opportunityRecommendations } from '../utils/opportunityDisplay.mjs'
+import { themeBoardDisplay, themeFeedbackDisplay, themePercent } from '../utils/themeDisplay.mjs'
 
 const router = useRouter()
 const message = useMessage()
@@ -100,6 +101,10 @@ const premarketNow = ref(Date.now())
 let premarketTimer = null
 const opportunities = computed(() => opportunityDisplay(adaptive.value.opportunityChannels, premarketNow.value, viewingHistory.value,
   adaptive.value.dataQuality || adaptive.value.data_quality || {}))
+const themeBoard = computed(() => themeBoardDisplay(adaptive.value.themeBoard || pageResult.value.themeBoard, premarketNow.value, viewingHistory.value))
+const themeFeedback = computed(() => themeFeedbackDisplay(
+  (!viewingHistory.value && pageResult.value.currentThemeFeedback) || adaptive.value.themeFeedback || pageResult.value.themeFeedback,
+  premarketNow.value, viewingHistory.value))
 const showAllOpportunityObservations = ref(false)
 const visibleOpportunityObservations = computed(() => showAllOpportunityObservations.value
   ? opportunities.value.observations : opportunities.value.observations.slice(0, 10))
@@ -126,9 +131,10 @@ function updatePremarketClock() {
   if (premarketTimer !== null) clearTimeout(premarketTimer)
   premarketTimer = null
   premarketNow.value = Date.now()
-  if (!disposed && pageActive.value && (premarketView.value.current || opportunities.value.cards.some(card => card.current))) premarketTimer = setTimeout(updatePremarketClock, 1000)
+  if (!disposed && pageActive.value && (premarketView.value.current || themeBoard.value.fresh || opportunities.value.cards.some(card => card.current))) premarketTimer = setTimeout(updatePremarketClock, 1000)
 }
-watch([premarketAssessment, () => adaptive.value.opportunityChannels, viewingHistory], updatePremarketClock)
+watch([premarketAssessment, () => adaptive.value.opportunityChannels, () => adaptive.value.themeBoard,
+  () => pageResult.value.currentThemeFeedback, viewingHistory], updatePremarketClock)
 const snapshotIsOld = computed(() => {
   const raw = adaptive.value.generatedAt || result.value.generatedAt
   const stamp = raw ? new Date(raw) : null
@@ -622,6 +628,23 @@ onDeactivated(() => {
 
     <section v-if="viewMode === 'adaptive' && restoring && !viewingHistory" class="picks-loading" role="status" aria-live="polite"><n-spin size="small" /><span>正在读取最新已完成的推荐…</span></section>
     <section v-if="!restoring || viewingHistory" v-show="viewMode === 'adaptive'">
+      <section class="theme-board" aria-label="题材主线">
+        <div class="theme-section-heading"><div><h3>{{ themeBoard.title }}</h3><p>先确认热门题材，再比较核心股票与入场位置。</p></div><n-tag size="small" :type="themeBoard.fresh ? 'info' : 'warning'" :bordered="false">{{ themeBoard.stateLabel }}</n-tag></div>
+        <p class="theme-source">来源 {{ themeBoard.source || '未记录' }} · 行情源时间 {{ formatTime(themeBoard.sourceTime) }}</p>
+        <div v-if="themeBoard.themes.length" class="theme-grid">
+          <article v-for="theme in themeBoard.cards" :key="theme.id" class="theme-card" :class="{ 'theme-selected': theme.selected }">
+            <div class="theme-card-heading"><strong>#{{ theme.rank ?? '—' }} {{ theme.name }}</strong><n-tag size="small" :type="theme.selected ? 'info' : 'default'" :bordered="false">{{ theme.selected ? '本轮主线' : '观察' }} · {{ theme.stage }}</n-tag></div>
+            <dl class="theme-metrics"><div><dt>当日涨跌</dt><dd>{{ themePercent(theme.changePct, 2, true) }}</dd></div><div><dt>上涨家数占比</dt><dd>{{ themePercent(theme.breadthPct, 1) }}</dd></div><div><dt>相对概念中位数</dt><dd>{{ theme.relativeStrengthPct === null ? '未取得' : `${theme.relativeStrengthPct > 0 ? '+' : ''}${theme.relativeStrengthPct.toFixed(2)} 个百分点` }}</dd></div><div><dt>概念成交额占比</dt><dd>{{ themePercent(theme.amountSharePct, 2) }}</dd></div></dl>
+            <p>成分核验 {{ theme.coverage.validCount ?? '未知' }} / {{ theme.coverage.expectedCount ?? '未知' }} 只 · {{ theme.coverage.complete ? '完整' : '待补齐' }}</p>
+            <p v-if="theme.feedbackPenalty > 0" class="theme-feedback-adjustment">此前多日走弱反馈：排序扣减 {{ theme.feedbackPenalty.toFixed(3) }}</p>
+            <details class="sk-help-details"><summary>排序依据与来源</summary><p>热度排序值 {{ theme.heatScore === null ? '未取得' : theme.heatScore.toFixed(3) }}（0—1），不是上涨概率。</p><p v-if="theme.explanation">{{ theme.explanation }}</p><p>题材源时间 {{ formatTime(theme.sourceTime) }}</p></details>
+          </article>
+        </div>
+        <details v-if="themeBoard.themes.length > themeBoard.cards.length" class="sk-help-details theme-missed"><summary>题材排行 · {{ themeBoard.themes.length }} 个已记录题材</summary><p>显示全榜前 {{ themeBoard.rankedPreview.length }} 个；主线资格还需核验完整成分、上涨广度与相对强度。</p><div class="theme-table-wrap"><table class="theme-review-table"><thead><tr><th>排名 / 题材</th><th>当日涨跌</th><th>上涨占比</th><th>状态</th></tr></thead><tbody><tr v-for="theme in themeBoard.rankedPreview" :key="theme.id"><td>#{{ theme.rank ?? '—' }} {{ theme.name }}</td><td>{{ themePercent(theme.changePct, 2, true) }}</td><td>{{ themePercent(theme.breadthPct, 1) }}</td><td>{{ theme.selected ? '本轮主线' : theme.coverage.complete ? '观察' : '成分待补齐' }} · {{ theme.stage }}</td></tr></tbody></table></div></details>
+        <p v-if="!themeBoard.selected.length" class="theme-empty" role="status">{{ themeBoard.emptyMessage }}</p>
+        <p v-for="gap in themeBoard.gaps" :key="gap" class="theme-gap">{{ gap }}</p>
+        <p class="theme-source">{{ themeBoard.scope }}</p>
+      </section>
       <div v-if="result.adaptive" class="adaptive-summary scan-list-summary" aria-label="本轮名单概览">
         <div><b>本轮名单</b><span v-if="opportunities.available">机会精选 {{ opportunities.cards.length }} 只</span><span v-if="premarketView.current">集合竞价 / 开盘预案 {{ premarketPicks.length }} 只</span><span v-else>{{ isDailyPrimary ? '日线条件推荐' : primaryContractKnown ? opportunities.available ? '模型验证精选' : '主推荐' : '旧版候选' }} {{ adaptivePicks.length }} 只</span><span v-if="hasDailyObservation">日线观察 {{ dailyPicks.length }} 只</span><span>研究观察 {{ nextDayWatchlist.length + nextDayContinuationWatchlist.length }} 只（潜伏 {{ nextDayWatchlist.length }} / 延续 {{ nextDayContinuationWatchlist.length }}）</span></div>
         <small>本轮生成 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</small>
@@ -668,6 +691,7 @@ onDeactivated(() => {
           <n-card v-for="(card, index) in opportunities.cards" :key="`opportunity-${codeOf(card.pick)}`" size="small" :bordered="false" class="pick-card opportunity-card" :class="{ 'opportunity-historical': !card.current }">
             <template #header><div class="pick-title"><b>{{ index + 1 }}</b><strong>{{ nameOf(card.pick) }}</strong><code>{{ codeOf(card.pick) }}</code><n-tag size="small" :bordered="false" :type="card.channel === 'E' ? 'info' : 'success'">{{ card.grade }} · {{ card.channelLabel }}</n-tag></div></template>
             <div class="pick-body">
+              <p v-if="card.theme" class="theme-stock-identity"><span>所属主线</span>{{ card.theme.name }} · 题材第 {{ card.theme.rank ?? '—' }}<template v-if="card.theme.leaderRank !== null"> · 题材内第 {{ card.theme.leaderRank }}</template> · {{ card.theme.stage }}</p>
               <div class="pick-quote"><strong>{{ card.price === null ? '未取得' : `¥${card.price.toFixed(2)}` }}</strong><span>扫描参考价</span></div>
               <div class="quote-evidence"><b>{{ card.quoteLabel }}</b><br/>来源 {{ quoteSourceLabel(card.source) }} · 源时间 {{ formatTime(card.sourceTime) }}</div>
               <div v-if="card.isFlowStrategy" class="opportunity-flow-metrics">
@@ -692,7 +716,7 @@ onDeactivated(() => {
                   <p><span>个股资金源时</span>{{ quoteSourceLabel(card.funding.stock.source) }} · {{ formatTime(card.funding.stock.windowStart) }} 至 {{ formatTime(card.funding.stock.sourceTime) }} · {{ card.funding.stock.observed ? '完整30分钟窗口' : '窗口未核验' }}</p>
                   <p><span>板块资金源时</span>{{ quoteSourceLabel(card.funding.sector.source) }} · {{ formatTime(card.funding.sector.windowStart) }} 至 {{ formatTime(card.funding.sector.sourceTime) }} · {{ card.funding.sector.observed ? '完整30分钟窗口' : '窗口未核验' }}</p>
                   <p><span>板块资金广度</span>正净流入成分占比 {{ card.funding.sector.positiveMemberFraction === null ? '未取得' : `${dailyValue(card.funding.sector.positiveMemberFraction * 100, 1)}%` }} · 最大单股正净流入贡献 {{ card.funding.sector.topPositiveFraction === null ? '未取得' : `${dailyValue(card.funding.sector.topPositiveFraction * 100, 1)}%` }}</p>
-                  <p><span>等权排序指标</span>{{ card.rankingComposite === null ? '未记录' : card.rankingComposite.toFixed(3) }}（0—1）；只表示本轮合格池内的相对排序，不代表上涨概率或已验证收益。</p>
+                  <p><span>{{ card.isThemeStrategy ? '股内排序指标' : '等权排序指标' }}</span>{{ card.rankingComposite === null ? '未记录' : card.rankingComposite.toFixed(3) }}（0—1）；{{ card.isThemeStrategy ? '先按题材主线排序，再比较题材内核心股票；' : '' }}只表示本轮合格池内的相对排序，不代表上涨概率或已验证收益。</p>
                   <p v-for="component in card.rankingComponents" :key="component.key"><span>{{ component.label }}</span>原值 {{ dailyValue(component.rawValue, 4) }}<template v-if="component.peerUnit === 'unique_sector'"> · 板块中位值 {{ dailyValue(component.rankValue, 4) }}</template> · {{ component.direction === 'lower' ? '越低排序越优' : '越高排序越优' }} · 分位 {{ dailyValue(component.percentile, 3) }} · 权重 {{ component.weight === null ? '未记录' : `${dailyValue(component.weight * 100, 0)}%` }} · {{ component.peerUnit === 'unique_sector' ? '板块数' : '股票数' }} {{ component.peerCount ?? '未知' }}</p>
                 </template>
                 <p v-else><span>历史排序含义</span>{{ card.rankScore === null ? '排序分未记录' : `保存时规则排序分 ${card.rankScore.toFixed(1)}` }}；不代表上涨概率或已验证收益。</p>
@@ -713,6 +737,25 @@ onDeactivated(() => {
         </div>
         <details v-if="opportunities.observations.length" class="sk-help-details opportunity-observations"><summary>其他机会与待确认线索 · {{ opportunities.observations.length }} 只</summary><p v-if="opportunities.observations.length > 10" class="opportunity-observation-count">当前展示 {{ visibleOpportunityObservations.length }} / {{ opportunities.observations.length }} 只，按本轮保存顺序。</p><article v-for="card in visibleOpportunityObservations" :key="`opportunity-observation-${codeOf(card.pick)}`"><b>{{ nameOf(card.pick) }} {{ codeOf(card.pick) }} · {{ card.grade }}</b><p>{{ card.supports.join('；') || '支持证据未记录' }}</p><p>待确认：{{ card.missing.join('；') || '继续观察状态变化' }}</p><p v-if="card.counterEvidence.length">反向证据：{{ card.counterEvidence.join('；') }}</p></article><n-button v-if="opportunities.observations.length > 10" size="small" secondary @click="toggleOpportunityObservations">{{ showAllOpportunityObservations ? '收起至前10条' : `查看全部 ${opportunities.observations.length} 条` }}</n-button></details>
         <p class="opportunity-footnote">机会精选独立于下方模型验证精选。价格随时间过期后保留为历史参考；刷新期间保留已保存名单，每轮原始依据可在扫描历史回看。</p>
+      </section>
+      <section class="theme-feedback" aria-label="题材每日反馈">
+        <div class="theme-section-heading"><div><h3>{{ themeFeedback.title }}</h3><p>{{ themeFeedback.sourceDay ? `观察日 ${themeFeedback.sourceDay}` : '等待首次有效扫描与收盘核验' }} · 更新 {{ formatTime(themeFeedback.asOf) }}</p></div><n-tag size="small" :type="themeFeedback.available ? 'info' : 'warning'" :bordered="false">{{ themeFeedback.statusLabel }}</n-tag></div>
+        <p v-if="themeFeedback.summary" class="theme-feedback-summary">{{ themeFeedback.summary }}</p>
+        <div v-if="themeFeedback.themes.length" class="theme-grid">
+          <article v-for="theme in themeFeedback.themes" :key="theme.id" class="theme-card">
+            <div class="theme-card-heading"><strong>{{ theme.name || theme.id }}</strong><span>{{ theme.status === 'sample_only' ? '样本观察' : theme.continuationLabel }}</span></div>
+            <p v-if="theme.scopeLabel">{{ theme.scopeLabel }}</p>
+            <dl class="theme-metrics"><div><dt>{{ theme.status === 'sample_only' ? '候选样本平均变化' : '冻结成分平均变化' }}</dt><dd>{{ themePercent(theme.meanObservationChangePct, 2, true) }}</dd></div><div><dt>首轮入选组变化</dt><dd>{{ themePercent(theme.selectedMeanChangePct, 2, true) }}</dd></div><div><dt>{{ theme.status === 'sample_only' ? '上涨样本占比' : '上涨成员占比' }}</dt><dd>{{ themePercent(theme.positiveMemberPct, 1) }}</dd></div><div><dt>{{ theme.status === 'sample_only' ? '核验样本' : '核验成分' }}</dt><dd>{{ theme.observedCount ?? '未知' }} / {{ theme.memberCount ?? '未知' }} 只</dd></div></dl>
+            <p v-if="theme.referenceAt">首轮冻结 {{ formatTime(theme.referenceAt) }}<template v-if="theme.laterSelectedCodes?.length"> · 后来入选 {{ theme.laterSelectedCodes.length }} 只，不计为当日漏选</template></p>
+            <p v-for="(reason, index) in theme.attributions" :key="`${reason.code}-${index}`">{{ reason.label }}<template v-if="reason.evidence"> · {{ reason.evidence }}</template></p>
+          </article>
+        </div>
+        <details v-if="themeFeedback.missedLeaders.length" class="sk-help-details theme-missed"><summary>漏选强股对照 · {{ themeFeedback.missedLeaders.length }} 只</summary><p>仅比较当时已经冻结的候选与对照，未扫描的全市场股票不在此统计中；后续上涨不代表当时满足买入条件。</p><div class="theme-table-wrap"><table class="theme-review-table"><thead><tr><th>股票</th><th>参考价后变化</th><th>当时状态</th><th>反馈</th></tr></thead><tbody><tr v-for="item in themeFeedback.missedLeaders" :key="`${item.themeId}-${item.code}`"><td>{{ item.name || item.code }} <code>{{ item.code }}</code></td><td>{{ themePercent(item.observationChangePct, 2, true) }}</td><td>{{ item.researched ? '已研究，未入选' : '已留对照，未深研' }}</td><td>{{ item.label || '查看原始扫描条件' }}</td></tr></tbody></table></div></details>
+        <p v-if="themeFeedback.adjustments.length" class="theme-feedback-adjustment">下一轮已提供 {{ themeFeedback.adjustments.length }} 个题材的轻微降权依据，具体扣减见对应题材卡；当前强度与数据准入仍独立核验。</p>
+        <p v-else class="theme-source">本轮未提供有效降权；新结果继续积累，不根据单日涨跌改写排序权重。</p>
+        <p v-if="themeFeedback.unobservedThemeCount" class="theme-source">另有 {{ themeFeedback.unobservedThemeCount }} 个非主线题材没有完整成分观察，本页未将它们计为选股成败。</p>
+        <p v-for="gap in themeFeedback.gaps" :key="gap" class="theme-gap">{{ gap }}</p>
+        <p class="theme-source">{{ themeFeedback.meaning }}</p>
       </section>
       <section v-if="nextDayQueues.length" class="research-observations" aria-label="研究观察">
       <h3>研究观察 · 不计入主推荐（潜伏 {{ nextDayWatchlist.length }} 只 / 延续 {{ nextDayContinuationWatchlist.length }} 只）</h3>
@@ -1036,6 +1079,7 @@ onDeactivated(() => {
 </template>
 
 <style scoped>
+.theme-board,.theme-feedback{margin:14px 0 20px;padding:18px;border:1px solid var(--sk-border);border-radius:12px;background:var(--sk-surface)}.theme-board{border-top:3px solid var(--sk-accent)}.theme-section-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.theme-section-heading h3{font-size:17px;margin:0 0 7px}.theme-section-heading p,.theme-source{font-size:12px;line-height:1.7;color:var(--sk-text-muted);margin:6px 0}.theme-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(270px,100%),1fr));gap:12px;margin:14px 0}.theme-card{padding:14px;border:1px solid var(--sk-border);border-radius:9px;background:var(--sk-surface-2);min-width:0}.theme-card.theme-selected{border-color:var(--sk-accent)}.theme-card-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.theme-card-heading>strong{font-size:14px}.theme-card-heading>span{font-size:12px;color:var(--sk-text-muted)}.theme-metrics{display:grid;grid-template-columns:1fr 1fr;gap:12px 9px;margin:16px 0}.theme-metrics dt{color:var(--sk-text-muted);font-size:11px;line-height:1.5}.theme-metrics dd{font-size:15px;margin:4px 0 0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.theme-card p,.theme-card details,.theme-missed,.theme-feedback-summary{font-size:12px;line-height:1.7}.theme-card p{margin:8px 0}.theme-card details{margin-top:12px}.theme-feedback-adjustment{font-size:12px;color:var(--sk-accent);line-height:1.7}.theme-gap,.theme-empty{font-size:12px;line-height:1.7;border-left:2px solid #d39b36;padding:6px 10px;margin:10px 0;color:var(--sk-text-muted)}.theme-table-wrap{overflow-x:auto;margin:12px 0}.theme-review-table{width:100%;border-collapse:collapse;font-size:12px;line-height:1.6}.theme-review-table th,.theme-review-table td{padding:8px;text-align:left;border-bottom:1px solid var(--sk-border)}.theme-review-table th{font-weight:500;color:var(--sk-text-muted)}.theme-review-table code{font-size:11px;color:var(--sk-text-muted)}.pick-body .theme-stock-identity{padding:8px 10px;background:var(--sk-surface-2);border-radius:5px;font-size:12px;line-height:1.7}@media(max-width:650px){.theme-section-heading{flex-direction:column}.theme-board,.theme-feedback{padding:14px}}
 .opportunity-section{margin:18px 0 22px;padding:16px;border:1px solid var(--sk-accent);border-radius:12px;background:color-mix(in srgb,var(--sk-surface-2) 35%,transparent)}.opportunity-section>.adaptive-summary{margin-top:0}.opportunity-intro{font-size:13px;line-height:1.7;margin:8px 0 14px;color:var(--sk-text-muted)}.opportunity-card{border-top:3px solid var(--sk-accent)!important}.opportunity-historical{border-top-color:var(--sk-border)!important}.opportunity-grid{grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr))}.opportunity-footnote{font-size:11px;line-height:1.7;color:var(--sk-text-muted);margin:14px 0 0}.opportunity-observations{margin-top:14px;font-size:12px;line-height:1.7}.opportunity-observations article{padding:10px 0;border-top:1px solid var(--sk-border)}.opportunity-observations article p{margin:5px 0;color:var(--sk-text-muted)}
 .primary-readiness{margin:14px 0;padding:14px;border:1px solid var(--sk-border);border-left:3px solid #d39b36;border-radius:10px;background:var(--sk-surface);font-size:13px;line-height:1.7}.primary-readiness p{margin:7px 0;color:var(--sk-text-muted)}
 .admission-diagnostics{margin:14px 0;padding:14px;border:1px solid var(--sk-border);border-radius:10px;background:var(--sk-surface);font-size:12px;line-height:1.65}.admission-diagnostics>summary{font-size:14px;font-weight:600;cursor:pointer}.admission-diagnostics[open]>summary{margin-bottom:10px}.admission-check-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.admission-check{display:flex;flex-direction:column;gap:4px;padding:10px;background:var(--sk-surface-2);border-radius:6px;border-left:3px solid #18a058}.admission-check.check-blocked{border-left-color:#d39b36}.admission-check small,.admission-diagnostics>small{color:var(--sk-text-muted)}.admission-check b{font-variant-numeric:tabular-nums}.pick-body .daily-selection-reason{display:block;font-size:13px}.daily-facts{margin:10px 0}

@@ -132,8 +132,13 @@ def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
     run = payload.get("adaptive")
     if not isinstance(run, dict):
         return payload
-    omitted = {"controls", "windvanes", "morningResearch", "dailyObservationResearch", "dailyObservationQuotes"}
+    omitted = {"controls", "windvanes", "morningResearch", "dailyObservationResearch", "dailyObservationQuotes", "themeResearchUniverse"}
     shown = {key: value for key, value in run.items() if key not in omitted}
+    if isinstance(run.get('themeBoard'), dict):
+        board = run['themeBoard']
+        shown['themeBoard'] = {key: value for key, value in board.items() if key != 'themes'}
+        shown['themeBoard']['themes'] = [{key: value for key, value in theme.items()
+            if key not in {'memberQuotes', 'memberCodes'}} for theme in board.get('themes', [])]
     if isinstance(run.get('opportunityChannels'), dict):
         channels = run['opportunityChannels']
         shown['opportunityChannels'] = {key: _without_raw(value) for key, value in channels.items()
@@ -271,7 +276,9 @@ def _daily_refresh_error(run: dict[str, Any]) -> str:
 def _opportunity_versions(*, historical: bool = False) -> set[str]:
     """Known frozen contracts survive upgrades; fresh publications use current rules."""
     from src.services.yao_scout.opportunity_channels import VERSION
-    return {VERSION, 'opportunity-em-20261028-v1', 'opportunity-em-20261029-v2'} if historical else {VERSION}
+    from src.services.yao_scout.theme_opportunities import VERSION as THEME_VERSION
+    current = {VERSION, THEME_VERSION}
+    return current | {'opportunity-em-20261028-v1', 'opportunity-em-20261029-v2'} if historical else current
 
 
 def _opportunity_assessment_valid(run: dict[str, Any], *, historical: bool = False) -> bool:
@@ -334,6 +341,9 @@ def _opportunity_assessment_valid(run: dict[str, Any], *, historical: bool = Fal
             and (row.get('opportunity') or {}).get('grade') in accepted_grades
             and not (row.get('opportunity') or {}).get('hardVetoes')
             and ((row.get('opportunity') or {}).get('buyWindow') or {}).get('status') == 'observed'
+            and (version != 'opportunity-theme-20261113-v1' or (
+                ((row.get('opportunity') or {}).get('theme') or {}).get('selected') is True
+                and ((row.get('opportunity') or {}).get('theme') or {}).get('coreEligible') is True))
             and not quote_check(row.get('quote') or {}, row.get('code'), published) for row in rows)
     except (ValueError, TypeError, OverflowError):
         return False
@@ -563,7 +573,12 @@ class LocalPicksDisplayStore:
                 message='当前学习登记状态读取失败，模型和样本进度未知；不能据此判断模型缺失。',
                 action='稍后重试读取学习登记状态；继续保留原推荐快照。',
                 blockerCodes=[code for code in current['blockerCodes'] if code != 'validated_model_missing'])
-        return {**payload, 'currentPrimaryReadiness': current}
+        from src.services.yao_scout.theme_feedback import ThemeFeedbackStore
+        try:
+            feedback = ThemeFeedbackStore(self.path.parent).read_context(current_at, include_today=True)['feedback']
+        except Exception as error:
+            feedback = {'status': 'unavailable', 'summary': '题材反馈读取暂不可用', 'gaps': [type(error).__name__]}
+        return {**payload, 'currentPrimaryReadiness': current, 'currentThemeFeedback': feedback}
 
     def read(self) -> dict[str, Any]:
         # Reading history never starts a live scan. The normal polling path

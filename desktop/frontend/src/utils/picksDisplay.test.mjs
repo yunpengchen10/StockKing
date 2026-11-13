@@ -11,6 +11,7 @@ import * as pickExplain from './pickExplain.mjs'
 import * as pickLedger from './pickLedger.mjs'
 import * as premarket from './premarket.mjs'
 import * as opportunityDisplay from './opportunityDisplay.mjs'
+import * as themeDisplay from './themeDisplay.mjs'
 
 const flush = async () => { for (let n = 0; n < 30; n++) await Promise.resolve(); await vue.nextTick() }
 const deferred = () => {
@@ -24,6 +25,71 @@ const snapshot = (generatedAt, source = 'scheduled') => ({
 })
 const oldSnapshot = () => snapshot('2026-07-13T10:30:00+08:00', 'manual')
 const latestSnapshot = () => snapshot('2026-10-13T10:30:00+08:00')
+
+test('post-close feedback arrives on a saved-result poll without requesting a new scan', async () => {
+  const saved = snapshot('2026-11-13T10:30:00+08:00')
+  let feedback = { status: 'no_history', summary: '等待今日收盘核验', asOf: '2026-11-13T10:30:00+08:00' }
+  let scans = 0
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => ({ ...saved, currentThemeFeedback: feedback }),
+    StartKingPicksRefresh: async () => { scans++; throw new Error('feedback read must not scan') } }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    assert.match(mounted.visibleText(), /等待今日收盘核验/)
+    mounted.setNow(Date.parse('2026-11-13T15:35:00+08:00'))
+    feedback = { status: 'reviewed', asOf: '2026-11-13T15:31:00+08:00', sourceDay: '2026-11-13', summary: '已核验今日题材兑现结果' }
+    await mounted.runTimer(30000)
+    assert.match(mounted.visibleText(), /已核验今日题材兑现结果/)
+    assert.equal(mounted.state().themeFeedback.available, true)
+    assert.equal(mounted.state().result.generatedAt, saved.generatedAt)
+    assert.equal(scans, 0)
+  } finally { mounted.dispose() }
+})
+
+test('theme-first page renders main themes, core stocks and feedback in order without changing old snapshots', async () => {
+  const saved = snapshot('2026-11-13T10:30:00+08:00')
+  const theme = { id: 'BK001', name: '题材测试主线', rank: 1, leaderRank: 1, stage: '持续', selected: true,
+    heatScore: .8, changePct: 2.3, breadthPct: 70, relativeStrengthPct: 1.2, amountSharePct: 4.5,
+    feedbackPenalty: .04, sourceTime: '2026-11-13T10:29:50+08:00', coverage: { complete: true, expectedCount: 10, validCount: 10 } }
+  saved.adaptive.themeBoard = { status: 'observed', source: 'fixture:concept', sourceTime: theme.sourceTime, themes: [theme] }
+  saved.adaptive.themeFeedback = { status: 'reviewed', sourceDay: '2026-11-11', asOf: '2026-11-11T15:30:00+08:00', summary: '冻结历史反馈', themes: [] }
+  saved.currentThemeFeedback = { status: 'partial', sourceDay: '2026-11-12', asOf: '2026-11-12T15:30:00+08:00', summary: '最新收盘反馈',
+    themes: [{ id: 'BK001', name: '题材测试主线', continuation: 'weakened', meanObservationChangePct: -.5, selectedMeanChangePct: null,
+      memberCount: 10, observedCount: 8, positiveMemberPct: 25, attributions: [{ code: 'weak', label: '题材后续走弱' }] },
+      { id: 'BK002', name: '候选样本题材', status: 'sample_only', scope: 'candidate_observations', scopeLabel: '已冻结候选样本（非全题材）',
+        continuation: 'unknown', observedCount: 3, memberCount: 4, meanObservationChangePct: 1.1, attributions: [] }],
+    adjustments: { BK001: .04 }, missedLeaders: [{ themeId: 'BK001', code: '600002', name: '对照强股样本', researched: false, observationChangePct: 3.1 }] }
+  const pick = { code: '600001', name: '主线核心样本', referencePrice: 10, quote: { source: 'fixture', price: 10, source_time: theme.sourceTime },
+    opportunity: { version: 'opportunity-theme-20261113-v1', channel: 'F', grade: 'F-A', theme } }
+  saved.adaptive.opportunityChannels = { version: pick.opportunity.version, recommendations: [pick], observations: [] }
+  const before = JSON.stringify(saved)
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    const visible = mounted.visibleText()
+    assert.ok(visible.indexOf('今日主线') < visible.indexOf('核心股票 · 热门题材优先'))
+    assert.ok(visible.indexOf('核心股票 · 热门题材优先') < visible.indexOf('每日反馈'))
+    assert.match(visible, /题材测试主线/)
+    assert.match(visible, /fixture:concept/)
+    assert.match(visible, /70.0%/)
+    assert.match(visible, /主线核心样本/)
+    assert.match(visible, /题材内第 1/)
+    assert.match(visible, /最新收盘反馈/)
+    assert.doesNotMatch(visible, /冻结历史反馈/)
+    assert.match(visible, /首轮入选组变化未取得/)
+    assert.match(visible, /题材后续走弱/)
+    assert.match(visible, /已冻结候选样本（非全题材）/)
+    assert.match(visible, /候选样本平均变化/)
+    assert.match(visible, /样本观察/)
+    assert.match(mounted.text(), /对照强股样本/)
+    assert.match(mounted.text(), /已留对照，未深研/)
+    mounted.state().viewingHistory = true
+    await flush()
+    assert.match(mounted.visibleText(), /历史主线 · 当时判断/)
+    assert.match(mounted.visibleText(), /冻结历史反馈/)
+    assert.doesNotMatch(mounted.visibleText(), /最新收盘反馈/)
+    assert.equal(JSON.stringify(saved), before)
+  } finally { mounted.dispose() }
+})
 const researchSnapshot = (generatedAt, { latent = [], continuation = [], source = 'scheduled' } = {}) => ({
   ...snapshot(generatedAt, source),
   adaptive: { ...snapshot(generatedAt, source).adaptive,
@@ -309,6 +375,7 @@ function mountPicks(api = {}, cached = null, now = null) {
     '../utils/pickLedger.mjs': pickLedger,
     '../utils/premarket.mjs': premarket,
     '../utils/opportunityDisplay.mjs': opportunityDisplay,
+    '../utils/themeDisplay.mjs': themeDisplay,
     '../utils/picksRefresh.mjs': {
       ...refresh,
       createPicksRefreshController: options => refresh.createPicksRefreshController({ ...options, setTimer: clock.setTimeout, clearTimer: clock.clearTimeout }),

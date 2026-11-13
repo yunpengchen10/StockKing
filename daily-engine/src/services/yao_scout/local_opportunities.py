@@ -43,11 +43,12 @@ def allocate_profile_candidates(ordered, profile, limit):
 
 class LocalOpportunityService(DailyOpportunityService):
     persistent_claims = True
-    def __init__(self, yao, ai_config=None, *, minute_fetcher=None, sector_fetcher=None, fund_fetcher=None, context_provider=None, progress_callback=None, selection_mode='auto', opportunity_research=True, **kwargs):
+    def __init__(self, yao, ai_config=None, *, minute_fetcher=None, sector_fetcher=None, fund_fetcher=None, context_provider=None, theme_fetcher=None, progress_callback=None, selection_mode='auto', opportunity_research=True, **kwargs):
         super().__init__(yao, None, **kwargs)
         self.minute_fetcher = minute_fetcher
         self.sector_fetcher, self.fund_fetcher = sector_fetcher, fund_fetcher
         self.context_provider = context_provider
+        self.theme_fetcher = theme_fetcher
         self.progress_callback = progress_callback
         if selection_mode not in ('auto', 'intraday'):
             raise ValueError('selection_mode must be auto or intraday')
@@ -77,9 +78,9 @@ class LocalOpportunityService(DailyOpportunityService):
         quality.update(research_count=len(queued), research_universe_count=universe_count,
                        deep_research_count=0,
                        research_limit=research_queue_limit(universe_count),
-                       research_policy='mainboard_fund_flow_and_transition_discovery_v3',
+                       research_policy='mainboard_theme_first_with_frozen_controls_v1',
                        research_coverage=(f'全主板初筛{universe_count}只；按主板池10%向上取整、至少300只'
-                                          f'且不超过实际股票数，资金流向与活跃度/状态变化分通道发现，本轮{len(queued)}只进入深研；'
+                                          f'且不超过实际股票数，热门题材核心股优先，其余保留资金/状态变化对照，本轮{len(queued)}只进入深研；'
                                           '未深研股票不作已排除或无机会结论'))
 
     @staticmethod
@@ -296,6 +297,16 @@ class LocalOpportunityService(DailyOpportunityService):
         if frame.empty or (snapshot.attrs.get('stale') and not opening_mode and not repairable_directory):
             raise ValueError('全市场行情为空或陈旧，本轮保留历史结果')
         emotion = self._observe_market_emotion(frame, snapshot_received_at) if not opening_mode else {}
+        from .theme_feedback import ThemeFeedbackStore
+        from .theme_rotation import fetch_theme_market, build_theme_board, prioritize_theme_queue
+        theme_context = {'history': [], 'feedback': {'status': 'unavailable', 'summary': '尚无已完成题材复盘'}}
+        try:
+            theme_context = ThemeFeedbackStore(self.yao.data_dir).read_context(self.clock())
+        except (OSError, ValueError, TypeError, sqlite3.Error):
+            pass
+        run['themeFeedback'] = theme_context['feedback']
+        run['themeBoard'] = {'status': 'unavailable', 'themes': [], 'selection': {'selectedIds': []},
+            'gaps': ['盘前仅显示上一轮已保存主线，连续交易阶段重新核验当前题材']}
         # The former heat score is no longer a fallback recommendation engine.
         # A queue gives several forms of activity a chance to be researched;
         # independent price, structure and remaining-space evidence decides entry.
@@ -320,8 +331,8 @@ class LocalOpportunityService(DailyOpportunityService):
         run['recommendationPolicy'] = policy_contract()
         old = {p.get('code') for p in previous.get('candidates', [])}
         quality.update(model_universe_count=0,
-                       selection_method='各字段独立源时核验；活跃度、跨扫描状态变化、低位修复和已披露事件分通道发现；缺失不视为利空',
-                       chatgpt_alignment='E早期启动与M主升确认独立机会精选；确认项用于支持和反证，规则分不是胜率')
+                       selection_method='先核验热门题材与核心成员，再研究资金、持续走势及入场位置；保留未选对照和每日反馈',
+                       chatgpt_alignment='市场主线→题材核心股→入场核验→每日价格观察与次日主线优先级反馈；规则排序不是胜率')
         software_market.read_timeout = 12
         stage('daily_history', 20, f'已读取 {len(frame)} 只主板股票，正在核验 {len(queued)} 只日线证据')
         from .research_factors import character_factor, event_factor
@@ -524,13 +535,30 @@ class LocalOpportunityService(DailyOpportunityService):
                            delivery_limit='目标前90秒启动全池复核；实际源时间、决策与延迟另记，不保证分钟数据秒级同步')
         # Archive the whole mainboard, never only the selected or rising stocks.
         # Reception time is an availability boundary, not a quote timestamp.
+        theme_quote_frame = snapshot
         if getattr(software_market, 'available', False):
             stage('market_breadth', 53, '正在补强全主板实际报价时间与市场广度')
-            frame = software_market.enrich_snapshot_quotes(frame,
+            theme_quote_frame = software_market.enrich_snapshot_quotes(snapshot,
                 timeout=budget_for('market_breadth', 12),
-                deadline=scan_deadline-quote_reserve-archive_reserve, clock=self.clock)
+                deadline=scan_deadline-quote_reserve-archive_reserve, clock=self.clock,
+                include_all_a=self.opportunity_research)
+            frame = mainboard(theme_quote_frame)
             emotion = self._observe_market_emotion(frame, self.clock())
             quality['marketQuoteEnrichment'] = frame.attrs.get('market_quote_enrichment', {})
+        if self.opportunity_research:
+            stage('theme_discovery', 54, '正在核验热门题材、成分强度和此前每日反馈')
+            previous_ids = list(dict.fromkeys(str(theme['id'])
+                for board in theme_context.get('history', [])[:3]
+                for theme in board.get('themes', []) if theme.get('selected') and theme.get('id')))
+            theme_packets = fetch_batch('theme_discovery',
+                lambda _, deadline: (self.theme_fetcher or fetch_theme_market)(
+                    self.clock(), deadline, self.yao.data_dir, include_ids=previous_ids,
+                    quote_rows=clean(theme_quote_frame.to_dict('records'))),
+                [None], 22, deadline_aware=True, workers=1)
+            run['themeBoard'] = build_theme_board(theme_packets[0] if theme_packets else {}, self.clock(),
+                history=theme_context.get('history'), feedback=theme_context.get('feedback'))
+            quality['themeDiscovery'] = {key: run['themeBoard'].get(key)
+                for key in ('status', 'source', 'sourceTime', 'asOf', 'gaps', 'selection')}
         # Quote enrichment changes the evidence available for INITIAL ranking,
         # not only market breadth. Rebuild the full queue and prepare new names.
         prepared_codes = {row['code'] for row in queued}
@@ -561,6 +589,9 @@ class LocalOpportunityService(DailyOpportunityService):
         discovery_contexts = for_stocks(context_bundle, frame['code'].astype(str), discovery_at) if self.opportunity_research else {}
         queued = clean(research_queue(frame, now=discovery_at, previous_frame=previous_frame,
                                       catalysts=discovery_contexts, flow_discovery=flow_discovery))
+        if self.opportunity_research and run['themeBoard'].get('status') == 'observed':
+            queued = prioritize_theme_queue([*queued, *clean(frame.to_dict('records'))],
+                run['themeBoard'], research_queue_limit(len(frame)))
         if self.opportunity_research:
             try:
                 quality['discoverySnapshotSaved'] = discovery_store.save(frame, discovery_at)
@@ -794,7 +825,16 @@ class LocalOpportunityService(DailyOpportunityService):
         self._await_target(run)
         # Quotes are acquired LAST, so minute/history I/O cannot age the final price.
         stage('final_quotes', 88, '正在刷新最终报价并核验有效时间')
-        quote_groups = [all_codes[start:start+20] for start in range(0, len(all_codes), 20)]
+        # All selected-theme peers supply a common publication-time comparison,
+        # including non-mainboard peers for theme breadth only. Researched names
+        # retain first request priority; missing peers stay in the denominator.
+        theme_peer_codes = list(dict.fromkeys(str(code)
+            for theme in run.get('themeBoard', {}).get('themes', []) if theme.get('selected')
+            for code in theme.get('memberCodes', [])))
+        final_quote_codes = list(dict.fromkeys([*all_codes, *theme_peer_codes]))[:2000]
+        quality['themeFeedbackQuoteCoverage'] = {'requested': len(final_quote_codes),
+            'themeMembers': len(theme_peer_codes), 'limit': 2000, 'missingNotExcluded': True}
+        quote_groups = [final_quote_codes[start:start+20] for start in range(0, len(final_quote_codes), 20)]
         quote_batches = fetch_batch('final_quotes', self._quotes, quote_groups, 15)
         quotes = {code: quote for batch in quote_batches for code, quote in batch.items()}
         verification = self._verify_archived_quotes(codes,self.clock(),quotes=quotes,
@@ -1163,7 +1203,7 @@ class LocalOpportunityService(DailyOpportunityService):
             'source_time_max': quote_stamps[-1] if quote_stamps else None,
             'providers': sorted({q['source'] for q in quotes.values() if q.get('source')})}
         if self.opportunity_research:
-            from .opportunity_channels import build_opportunity_channels
+            from .theme_opportunities import build_theme_opportunities
             prior_channels = next(((record.get('result') or {}).get('opportunityChannels')
                 for record in history if (record.get('result') or {}).get('opportunityChannels')), {})
             completed = self.clock()
@@ -1198,14 +1238,35 @@ class LocalOpportunityService(DailyOpportunityService):
             quality['opportunityPublication'] = {'checkedAt': completed.isoformat(),
                 'scanSlot': slot, 'official': bool(run.get('official')), 'targetAt': target_at,
                 'permitted': reviewable, 'windowStatus': window_status or run['status']}
-            run['opportunityChannels'] = build_opportunity_channels(
+            run['opportunityChannels'] = build_theme_opportunities(
                 researched if reviewable else [], completed, top_n=top_n,
+                theme_board=run.get('themeBoard'),
                 minute_packets=opportunity_minutes, daily_packets=daily,
                 contexts=prepared_context, previous=prior_channels, sector_flow_packets=sector_flows)
             run['opportunityRecommendationCount'] = len(run['opportunityChannels']['recommendations'])
             quality['opportunityDiscovery'] = run['opportunityChannels']['diagnostics']
+            # Freeze selected and unselected members at the same completed scan.
+            # Stale/missing quotes remain gaps in the feedback ledger; no later
+            # price is substituted for an unavailable decision-time reference.
+            theme_members = {}
+            for theme in run['themeBoard'].get('themes', []):
+                if theme.get('selected'):
+                    for code in theme.get('memberCodes', []):
+                        theme_members.setdefault(str(code), []).append(theme['id'])
+            selected = {row['code'] for row in run['opportunityChannels']['recommendations']}
+            research_by_code = {row['code']: row for row in researched}
+            frame_rows = {str(row['code']): row for row in clean(frame.to_dict('records'))}
+            run['themeResearchUniverse'] = []
+            for code, ids in theme_members.items():
+                item = research_by_code.get(code, {})
+                quote = quotes.get(code) or item.get('quote') or {}
+                run['themeResearchUniverse'].append({'code': code, 'name': (frame_rows.get(code) or {}).get('name') or quote.get('name') or code,
+                    'price': quote.get('price'), 'source': quote.get('source'),
+                    'source_time': quote.get('provider_timestamp') or quote.get('source_time'),
+                    'themeIds': ids, 'selected': code in selected, 'researched': code in research_by_code,
+                    'eligibleUniverse': code in frame_rows})
             if reviewable:
-                run['message'] = (f'机会精选{run["opportunityRecommendationCount"]}只（板块资金 / 持续趋势 / 买入位置）；'
+                run['message'] = (f'机会精选{run["opportunityRecommendationCount"]}只（热门题材 / 核心股票 / 资金走势 / 买入位置）；'
                     f'模型验证精选{len(run["candidates"])}只。确认项和缺口逐股展示，规则排序不代表上涨概率。')
 
     def _persist_run(self, run):
@@ -1222,8 +1283,20 @@ class LocalOpportunityService(DailyOpportunityService):
                     self.clock(), max_labels=300, budget_seconds=4.0)
             except Exception as error:
                 result['dailyObservationReview'] = {'status': 'failed', 'reason': type(error).__name__}
-            # Checkpoint the independent daily result before any minute review
-            # or external historical request can fail or consume its budget.
+            # Preserve the independent daily checkpoint before new public I/O.
+            self.db.save_yao_run(clean(result))
+            from .theme_feedback import ThemeFeedbackStore
+            try:
+                feedback_store = ThemeFeedbackStore(self.yao.data_dir)
+                pending = feedback_store.pending_codes(self.clock(), limit=2000)
+                batches, _ = bounded_fetch_map(self._quotes,
+                    [pending[start:start+20] for start in range(0, len(pending), 20)],
+                    workers=4, timeout=20)
+                close_quotes = {code: quote for batch in batches for code, quote in batch.items()}
+                result['themeFeedback'] = feedback_store.review(self.clock(), close_quotes)
+            except Exception as error:
+                result['themeFeedback'] = {'status': 'unavailable', 'summary': '题材复盘证据暂未齐备',
+                    'gaps': [type(error).__name__]}
             self.db.save_yao_run(clean(result))
             # Settle existing evidence before potentially slow public I/O. Save
             # this checkpoint so interruption cannot hide work already done.
@@ -1303,6 +1376,12 @@ class LocalOpportunityService(DailyOpportunityService):
         elif slot == 'weekly' and result.get('status') == 'audit_only':
             result['localTraining'] = SignalLearningService(self.yao.data_dir).train_and_evaluate(self.clock())
         elif slot in ('live','0920','0940','0955','1030','1455'):
+            if result.get('themeBoard'):
+                from .theme_feedback import ThemeFeedbackStore
+                try:
+                    result['themeFeedbackArchive'] = ThemeFeedbackStore(self.yao.data_dir).save_scan(result, self.clock())
+                except (OSError, ValueError, TypeError, sqlite3.Error) as error:
+                    result['themeFeedbackArchive'] = {'status': 'unavailable', 'reason': type(error).__name__}
             learning = SignalLearningService(self.yao.data_dir)
             result = learning.persist_scan(
                 result, slot, result.get('cutoff_at') or self.clock(), bool(result.get('official')))

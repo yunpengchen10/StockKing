@@ -37,6 +37,7 @@ def make_service(monkeypatch, start, tmp_path, fetch=None, batch=None):
                 'amount': 980000000, 'volume':100000000, 'provider_timestamp': tick[0].isoformat(),
                 'active_buy_share_pct':60,'active_flow_source':'fixture','active_flow_as_of':tick[0].isoformat()}
     service = local.LocalOpportunityService(yao, {'api_key': 'must-not-be-used'},
+        theme_fetcher=lambda *args, **kwargs: {},
         selection_mode='intraday',  # These fixtures exercise the minute contract explicitly.
         context_provider=SimpleNamespace(collect=lambda now: {'tables': [
             {'kind': kind, 'status': 'available', 'observedAt': now.isoformat(), 'source': 'fixture', 'rows': rows}
@@ -310,7 +311,7 @@ def test_manual_progress_tracks_evidence_stages_and_usable_minutes(monkeypatch, 
     progress = []
     service.progress_callback = lambda value, message: progress.append((value, message))
     result = service.run('live')
-    assert [value for value, _ in progress] == [12, 20, 48, 55, 57, 60, 72, 80, 88, 94]
+    assert [value for value, _ in progress] == [12, 20, 48, 54, 55, 57, 60, 72, 80, 88, 94]
     assert result['dataQuality']['minute_coverage'] == {'requested': 1, 'usable': 1, 'missing': 0}
     assert 'minute_warmup' not in result['dataQuality']['stageTimingsMs']
     assert set(result['dataQuality']['stageTimingsMs']) >= {'snapshot', 'daily_history', 'minute_evidence', 'final_quotes', 'evaluation'}
@@ -505,7 +506,7 @@ def test_expanded_prescreen_researches_every_stock_in_a_small_universe(monkeypat
     assert result['dataQuality']['research_universe_count'] == 45
     assert result['dataQuality']['research_count'] == 45
     assert result['dataQuality']['research_limit'] == 45
-    assert result['dataQuality']['research_policy'] == 'mainboard_fund_flow_and_transition_discovery_v3'
+    assert result['dataQuality']['research_policy'] == 'mainboard_theme_first_with_frozen_controls_v1'
     assert result['dataQuality']['deep_research_count'] == 45
     budgets = result['dataQuality']['stageBudgetsSeconds']
     assert budgets['daily_history'] == 25

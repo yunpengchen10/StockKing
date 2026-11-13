@@ -1,6 +1,10 @@
+import { themeIdentity } from './themeDisplay.mjs'
+
 const rows = value => Array.isArray(value) ? value.filter(item => item && typeof item === 'object') : []
 const number = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) ? Number(value) : null
 const FLOW_VERSION = 'opportunity-flow-20261103-v1'
+const THEME_VERSION = 'opportunity-theme-20261113-v1'
+const flowVersions = new Set([FLOW_VERSION, THEME_VERSION])
 const fraction = value => { const n = number(value); return n !== null && n >= 0 && n <= 1 ? n : null }
 const componentLabels = {
   sectorNetFlowRatio: '板块净额/成交额', stockNetFlowRatio: '个股净额/成交额',
@@ -44,7 +48,7 @@ export function opportunityRecommendations(channels) {
 // Collection counts cover candidates plus their peers. Only this assessment's
 // 30-minute failure counts describe the researched selection pool.
 export function opportunityFundingStatus(channels, quality = {}) {
-  if (channels?.version !== FLOW_VERSION) return null
+  if (!flowVersions.has(channels?.version)) return null
   const count = value => Number.isInteger(number(value)) && number(value) >= 0 ? number(value) : null
   const diagnostics = channels.diagnostics || {}
   const researched = count(diagnostics.researchedCount)
@@ -65,7 +69,9 @@ export function opportunityFundingStatus(channels, quality = {}) {
     not_researched: ['本轮尚无可评估股票', '本轮未完成候选研究，暂不能判断是否存在资金趋势机会。'],
     unknown: ['资金核验覆盖未记录', '该记录未提供完整的资金核验统计，不能据此判断资金筛选已完成。'],
     partial: ['部分资金证据不可用', '本轮资金筛选覆盖不完整；已核验部分也没有形成入选机会。'],
-    verified: ['资金证据检查已完成', '本轮没有同时满足资金方向、持续趋势与入场位置条件的机会。'],
+    verified: ['资金证据检查已完成', channels?.version === THEME_VERSION
+      ? '本轮没有同时满足热门题材、核心股、资金方向、持续趋势与入场位置条件的机会。'
+      : '本轮没有同时满足资金方向、持续趋势与入场位置条件的机会。'],
   }
   const reasons = []
   const archive = quality?.fundFlowArchive || {}
@@ -109,7 +115,8 @@ export function opportunityCard(pick, now, historical = false) {
   const rejected = quote.fresh === false || quote.is_fresh === false || quote.stale === true
     || ['stale', 'missing', 'invalid', 'conflict'].includes(quote.status)
   const legacy = ['E', 'M'].includes(evidence.channel) || String(evidence.version || '').startsWith('opportunity-em-')
-  const isFlowStrategy = evidence.version === FLOW_VERSION && evidence.channel === 'F'
+  const isThemeStrategy = evidence.version === THEME_VERSION && evidence.channel === 'F'
+  const isFlowStrategy = flowVersions.has(evidence.version) && evidence.channel === 'F'
   const current = isFlowStrategy && !historical && !legacy && !sourceMissing && !rejected && age !== null && age >= 0 && age <= 30000
   const quoteLabel = historical ? '历史快照 · 未做当前核验'
     : legacy ? '旧版规则记录 · 未按当前资金策略核验'
@@ -119,8 +126,9 @@ export function opportunityCard(pick, now, historical = false) {
     : current ? '源时间在30秒内 · 已保存参考价'
     : '历史参考价 · 行情已过期，需重新核验'
   return {
-    pick, legacy, isFlowStrategy, channel: ['F', 'M', 'E'].includes(evidence.channel) ? evidence.channel : '',
-    channelLabel: evidence.channel === 'F' ? evidence.selectionMode === 'flow_pullback' ? '资金趋势 · 回踩' : '资金与持续趋势'
+    pick, legacy, isFlowStrategy, isThemeStrategy, theme: isThemeStrategy ? themeIdentity(evidence.theme) : null,
+    channel: ['F', 'M', 'E'].includes(evidence.channel) ? evidence.channel : '',
+    channelLabel: isThemeStrategy ? '主线核心股' : evidence.channel === 'F' ? evidence.selectionMode === 'flow_pullback' ? '资金趋势 · 回踩' : '资金与持续趋势'
       : evidence.channel === 'M' ? '历史主升确认' : evidence.channel === 'E' ? '历史早期启动' : '研究观察',
     grade: evidence.grade || '未分级', current, quoteLabel, sourceTime, source, price,
     supports: opportunityText(evidence.supports || evidence.support || evidence.reasons),
@@ -148,11 +156,13 @@ export function opportunityDisplay(channels, now, historical = false, quality = 
   const savedRows = [...rows(channels?.recommendations), ...rows(channels?.observations)]
   const legacy = String(channels?.version || '').startsWith('opportunity-em-')
     || (savedRows.length > 0 && savedRows.every(row => ['E', 'M'].includes(row.opportunity?.channel)))
+  const themeFirst = channels?.version === THEME_VERSION
   return {
     available: Boolean(channels && typeof channels === 'object'),
-    legacy,
-    title: legacy ? '机会精选 · 历史 E / M 规则' : '机会精选 · 资金与持续趋势',
+    legacy, themeFirst,
+    title: legacy ? '机会精选 · 历史 E / M 规则' : themeFirst ? '核心股票 · 热门题材优先' : '机会精选 · 资金与持续趋势',
     introduction: legacy ? '保留当时 E / M 规则的名单与证据，仅供历史复核；未按当前资金与持续趋势策略重新赋予资格。'
+      : themeFirst ? '先确认本轮热门题材，在主线中比较核心股票，再核验资金、30分钟持续趋势与入场位置。题材和股内排名均保留当时依据，排序不是胜率。'
       : '先看资金流向的板块和个股，再核验30分钟持续趋势与入场位置。资金是供应商大单分类估算；等权排序指标不是胜率。',
     cards: opportunityRecommendations(channels).map(pick => opportunityCard(pick, now, historical)),
     observations: rows(channels?.observations).map(pick => opportunityCard(pick, now, historical)),

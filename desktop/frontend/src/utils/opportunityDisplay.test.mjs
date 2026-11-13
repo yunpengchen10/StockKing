@@ -6,6 +6,26 @@ const now = Date.parse('2026-10-28T10:30:00+08:00')
 const sample = () => ({ code: '600001', referencePrice: 10.1, quote: { price: 10.1, source: 'tencent', source_time: '2026-10-28T10:29:45+08:00' },
   opportunity: { version: 'opportunity-flow-20261103-v1', channel: 'F', grade: 'F-A', supports: ['资金与持续趋势已核验'], missing: '独立催化待确认', firstDetectionAt: '2026-10-28T10:29:00+08:00', rankScore: null } })
 
+test('theme-first recommendations preserve flow evidence and expose their frozen theme identity', () => {
+  const pick = sample()
+  Object.assign(pick.opportunity, { version: 'opportunity-theme-20261113-v1', theme: {
+    id: 'BK001', name: '测试主线', rank: 1, leaderRank: 2, stage: '持续', selected: true, heatScore: .8,
+  } })
+  const card = opportunityCard(pick, now)
+  assert.equal(card.isThemeStrategy, true)
+  assert.equal(card.isFlowStrategy, true)
+  assert.equal(card.current, true)
+  assert.equal(card.theme.name, '测试主线')
+  assert.equal(card.theme.leaderRank, 2)
+  assert.equal(card.channelLabel, '主线核心股')
+  const shown = opportunityDisplay({ version: pick.opportunity.version, recommendations: [pick] }, now)
+  assert.equal(shown.themeFirst, true)
+  assert.match(shown.title, /热门题材优先/)
+  assert.match(shown.introduction, /先确认本轮热门题材/)
+  assert.ok(shown.fundingStatus)
+  assert.equal(opportunityCard(pick, now, true).current, false)
+})
+
 test('missing confirmations remain visible without rejecting or upgrading the backend F-A decision', () => {
   const pick = sample()
   const card = opportunityCard(pick, now)

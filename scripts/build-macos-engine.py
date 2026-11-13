@@ -32,6 +32,8 @@ args += ['--hidden-import', 'torch']
 subprocess.run(args + ["main.py"], cwd=root, check=True)
 executable = root / "dist/backend/stock_analysis/stock_analysis"
 modules = ("api.app", "src.services.yao_scout.local_opportunities",
+           "src.services.yao_scout.theme_rotation", "src.services.yao_scout.theme_feedback",
+           "src.services.yao_scout.theme_opportunities",
            "src.services.yao_scout.local_observation_review", "src.quant.service",
            "src.services.screening.pipeline", "lightgbm", "futu", "orjson", "torch")
 with tempfile.TemporaryDirectory(prefix="stock-king-import-probes-") as probe_directory:

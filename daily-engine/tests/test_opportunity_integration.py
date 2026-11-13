@@ -51,6 +51,9 @@ def complete_flow_service(monkeypatch, tmp_path, now=NOW):
     service, tick, _, saved = make_service(monkeypatch, now, tmp_path)
     service.selection_mode = 'auto'
     codes = ['600001', '600002', '600003', '600004']
+    from src.services.yao_scout import theme_rotation
+    from tests.test_theme_opportunities import theme_board
+    monkeypatch.setattr(theme_rotation, 'build_theme_board', lambda *args, **kwargs: theme_board(codes, tick[0]))
     service.yao._fetch_snapshot = lambda: pd.DataFrame([
         {'code': code, 'name': '测试股', 'price': 10.12} for code in codes])
     history = pd.DataFrame({'date': pd.bdate_range(end=previous_session(now), periods=60),

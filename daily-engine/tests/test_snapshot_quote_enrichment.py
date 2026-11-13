@@ -19,6 +19,21 @@ def client():
     return SoftwareMarketClient('http://127.0.0.1:9000', 'test-only')
 
 
+def test_all_a_theme_scope_includes_growth_peers_without_expanding_candidate_scope(monkeypatch):
+    frame = pd.DataFrame([{'code': code, 'name': name} for code, name in
+        [('600001', '主板'), ('300001', '创业板'), ('688001', '科创板'), ('600002', 'ST样本')]])
+    requests = []
+    def fetch(self, codes, **kwargs):
+        requests.extend(codes)
+        return {'quotes': [quote(code) for code in codes]}
+    monkeypatch.setattr(SoftwareMarketClient, 'quotes', fetch)
+    enriched = client().enrich_snapshot_quotes(frame, clock=lambda: NOW, include_all_a=True)
+    assert set(requests) == set(frame.code)
+    assert enriched.attrs['market_quote_enrichment']['observed'] == 4
+    from src.services.yao_scout.daily_opportunities import mainboard
+    assert mainboard(enriched).code.tolist() == ['600001']
+
+
 def test_quote_clock_is_only_attached_to_its_own_prices(monkeypatch, tmp_path):
     frame = snapshot(NOW)
     frame.attrs.pop('source_time')

@@ -74,7 +74,7 @@ class SoftwareMarketClient:
         frame.attrs.update({key: result.get(key) for key in ('expected_count','unique_count','received_count','pages')})
         return frame
 
-    def enrich_snapshot_quotes(self, snapshot, *, timeout=12, deadline=None, clock=None):
+    def enrich_snapshot_quotes(self, snapshot, *, timeout=12, deadline=None, clock=None, include_all_a=False):
         """Attach same-observation prices/clocks for the full mainboard universe.
 
         This is a separate bounded stage: the existing universe snapshot never
@@ -91,9 +91,11 @@ class SoftwareMarketClient:
             frame.attrs['market_quote_enrichment'] = {'status':'unavailable', 'reason':'universe_fields_missing'}
             return frame
         records = frame.to_dict('records')
+        pattern = (r'(?:600|601|603|605|000|001|002|003|300|301|688|689)\d{3}' if include_all_a
+                   else r'(?:600|601|603|605|000|001|002|003)\d{3}')
         codes = list(dict.fromkeys(str(row['code']).zfill(6) for row in records
-            if re.fullmatch(r'(?:600|601|603|605|000|001|002|003)\d{3}', str(row['code']).zfill(6))
-            and not re.search(r'ST|退|整理|停牌', str(row['name']), re.I)))
+            if re.fullmatch(pattern, str(row['code']).zfill(6))
+            and (include_all_a or not re.search(r'ST|退|整理|停牌', str(row['name']), re.I))))
         code_set = set(codes)
         budget = max(0., min(float(timeout), deadline-monotonic())) if deadline is not None else max(0., float(timeout))
         end = monotonic()+budget
@@ -131,6 +133,7 @@ class SoftwareMarketClient:
             observation['source'] for observation in observations.values()}))
         frame.attrs['market_quote_received_at'] = received.isoformat()
         frame.attrs['market_quote_enrichment'] = {
+            'scope': 'all_shanghai_shenzhen_theme_peers' if include_all_a else 'mainboard_candidates',
             'status':'complete' if len(observations) == len(codes) and codes else 'partial',
             'requested':len(codes), 'observed':len(observations),
             'missing_batches':len(missing), 'source_time_meaning':'provider_quote_update_time',
