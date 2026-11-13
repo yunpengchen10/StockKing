@@ -305,6 +305,7 @@ class LocalOpportunityService(DailyOpportunityService):
         except (OSError, ValueError, TypeError, sqlite3.Error):
             pass
         run['themeFeedback'] = theme_context['feedback']
+        market_context_packet = {}
         run['themeBoard'] = {'status': 'unavailable', 'themes': [], 'selection': {'selectedIds': []},
             'gaps': ['盘前仅显示上一轮已保存主线，连续交易阶段重新核验当前题材']}
         # The former heat score is no longer a fallback recommendation engine.
@@ -537,8 +538,23 @@ class LocalOpportunityService(DailyOpportunityService):
         # Reception time is an availability boundary, not a quote timestamp.
         theme_quote_frame = snapshot
         if getattr(software_market, 'available', False):
+            if self.opportunity_research:
+                stage('market_context', 53, '正在复用市场题材资讯并补齐沪深全A题材行情目录')
+                def market_input(kind, deadline):
+                    timeout = max(.1, min(8 if kind == 'context' else 11, deadline-monotonic()))
+                    value = (software_market.theme_context(now=self.clock(), timeout=timeout) if kind == 'context'
+                             else software_market.snapshot(include_all_a=True, timeout=timeout))
+                    return kind, value
+                market_inputs = dict(fetch_batch('market_inputs', market_input,
+                    ['context', 'universe'], 12, deadline_aware=True, workers=2))
+                market_context_packet = market_inputs.get('context') or {}
+                universe = market_inputs.get('universe')
+                if universe is not None and universe.attrs.get('directory_complete'):
+                    theme_quote_frame = universe
+                quality['themeUniverse'] = {'scope': theme_quote_frame.attrs.get('universe_scope', 'mainboard_fallback'),
+                    'count': len(theme_quote_frame), 'complete': bool(theme_quote_frame.attrs.get('directory_complete'))}
             stage('market_breadth', 53, '正在补强全主板实际报价时间与市场广度')
-            theme_quote_frame = software_market.enrich_snapshot_quotes(snapshot,
+            theme_quote_frame = software_market.enrich_snapshot_quotes(theme_quote_frame,
                 timeout=budget_for('market_breadth', 12),
                 deadline=scan_deadline-quote_reserve-archive_reserve, clock=self.clock,
                 include_all_a=self.opportunity_research)
@@ -546,6 +562,10 @@ class LocalOpportunityService(DailyOpportunityService):
             emotion = self._observe_market_emotion(frame, self.clock())
             quality['marketQuoteEnrichment'] = frame.attrs.get('market_quote_enrichment', {})
         if self.opportunity_research:
+            from .market_context import build_market_brief, event_candidate_codes, prioritize_market_queue
+            quality['marketContext'] = {key: {name: (market_context_packet.get(key) or {}).get(name)
+                for name in ('status', 'source', 'sourceTime', 'observedAt', 'gaps')}
+                for key in ('events', 'funds', 'news')}
             stage('theme_discovery', 54, '正在核验热门题材、成分强度和此前每日反馈')
             previous_ids = list(dict.fromkeys(str(theme['id'])
                 for board in theme_context.get('history', [])[:3]
@@ -592,6 +612,15 @@ class LocalOpportunityService(DailyOpportunityService):
         if self.opportunity_research and run['themeBoard'].get('status') == 'observed':
             queued = prioritize_theme_queue([*queued, *clean(frame.to_dict('records'))],
                 run['themeBoard'], research_queue_limit(len(frame)))
+        if self.opportunity_research and market_context_packet:
+            # Existing mainboard policy remains; event links seed research even
+            # when a whole-market concept index is incomplete.
+            combined = {}
+            for row in [*queued, *clean(frame.to_dict('records'))]:
+                combined.setdefault(str(row['code']), row)
+            queued = prioritize_market_queue(list(combined.values()), market_context_packet,
+                self.clock(), research_queue_limit(len(frame)))
+            quality['marketContext']['eventSeedCount'] = len(event_candidate_codes(market_context_packet, self.clock()))
         if self.opportunity_research:
             try:
                 quality['discoverySnapshotSaved'] = discovery_store.save(frame, discovery_at)
@@ -831,7 +860,8 @@ class LocalOpportunityService(DailyOpportunityService):
         theme_peer_codes = list(dict.fromkeys(str(code)
             for theme in run.get('themeBoard', {}).get('themes', []) if theme.get('selected')
             for code in theme.get('memberCodes', [])))
-        final_quote_codes = list(dict.fromkeys([*all_codes, *theme_peer_codes]))[:2000]
+        event_codes = event_candidate_codes(market_context_packet, self.clock()) if self.opportunity_research else []
+        final_quote_codes = list(dict.fromkeys([*event_codes, *all_codes, *theme_peer_codes]))[:2000]
         quality['themeFeedbackQuoteCoverage'] = {'requested': len(final_quote_codes),
             'themeMembers': len(theme_peer_codes), 'limit': 2000, 'missingNotExcluded': True}
         quote_groups = [final_quote_codes[start:start+20] for start in range(0, len(final_quote_codes), 20)]
@@ -1244,6 +1274,8 @@ class LocalOpportunityService(DailyOpportunityService):
                 minute_packets=opportunity_minutes, daily_packets=daily,
                 contexts=prepared_context, previous=prior_channels, sector_flow_packets=sector_flows)
             run['opportunityRecommendationCount'] = len(run['opportunityChannels']['recommendations'])
+            run['marketBrief'] = build_market_brief(market_context_packet, quotes, completed,
+                opportunities=run['opportunityChannels'])
             quality['opportunityDiscovery'] = run['opportunityChannels']['diagnostics']
             # Freeze selected and unselected members at the same completed scan.
             # Stale/missing quotes remain gaps in the feedback ledger; no later
@@ -1266,8 +1298,8 @@ class LocalOpportunityService(DailyOpportunityService):
                     'themeIds': ids, 'selected': code in selected, 'researched': code in research_by_code,
                     'eligibleUniverse': code in frame_rows})
             if reviewable:
-                run['message'] = (f'机会精选{run["opportunityRecommendationCount"]}只（热门题材 / 核心股票 / 资金走势 / 买入位置）；'
-                    f'模型验证精选{len(run["candidates"])}只。确认项和缺口逐股展示，规则排序不代表上涨概率。')
+                run['message'] = (f'重点观察{len(run["marketBrief"]["focusStocks"])}只，'
+                    f'资金与买点条件满足{run["opportunityRecommendationCount"]}只；依据、待确认条件和风险逐股展示。')
 
     def _persist_run(self, run):
         """Finish research and ledger work inside the official slot claim."""

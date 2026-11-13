@@ -2364,6 +2364,27 @@ func (receiver StockDataApi) GetIndustryValuation(bkName string) *models.Industr
 }
 
 func (receiver StockDataApi) GetAllStocks(page int, pageSize int, name string, technicalIndicators models.TechnicalIndicators, stableCodeOrder ...bool) *models.AllStocksResp {
+	return receiver.getStockUniversePage(context.Background(), page, pageSize, name, technicalIndicators, len(stableCodeOrder) > 0 && stableCodeOrder[0], false)
+}
+
+// GetAllAStocksForSnapshot includes all Shanghai/Shenzhen A-share concept peers.
+// Existing GetAllStocks stable-order callers retain their mainboard universe.
+func (receiver StockDataApi) GetAllAStocksForSnapshot(page, pageSize int) *models.AllStocksResp {
+	return receiver.GetAllAStocksForSnapshotContext(context.Background(), page, pageSize)
+}
+
+func (receiver StockDataApi) GetAllAStocksForSnapshotContext(ctx context.Context, page, pageSize int) *models.AllStocksResp {
+	return receiver.getStockUniversePage(ctx, page, pageSize, "", models.TechnicalIndicators{}, true, true)
+}
+
+func snapshotUniverseFilter(includeAllA bool) string {
+	if includeAllA {
+		return `(MARKET in ("上交所主板","深交所主板","深交所创业板","上交所科创板","上交所风险警示板","深交所风险警示板"))`
+	}
+	return `(MARKET in ("上交所主板","深交所主板"))`
+}
+
+func (receiver StockDataApi) getStockUniversePage(ctx context.Context, page int, pageSize int, name string, technicalIndicators models.TechnicalIndicators, stableCodeOrder, includeAllA bool) *models.AllStocksResp {
 	indicators := ""
 	// 将 TechnicalIndicators 转换为 map 并遍历构建查询条件
 	indicatorConditions := []string{}
@@ -2411,7 +2432,7 @@ func (receiver StockDataApi) GetAllStocks(page int, pageSize int, name string, t
 	}
 	url := "https://data.eastmoney.com/dataapi/xuangu/list?st=CHANGE_RATE&sr=-1&ps=" + convertor.ToString(pageSize) + "&p=" + convertor.ToString(page) + "&sty=SECUCODE%2CSECURITY_CODE%2CSECURITY_NAME_ABBR%2CNEW_PRICE%2CCHANGE_RATE%2CVOLUME_RATIO%2CHIGH_PRICE%2CLOW_PRICE%2CPRE_CLOSE_PRICE%2CVOLUME%2CDEAL_AMOUNT%2CTURNOVERRATE%2CMARKET%2CCONCEPT%2CINDUSTRY&filter=%28MARKET+in+%28%22%E4%B8%8A%E4%BA%A4%E6%89%80%E4%B8%BB%E6%9D%BF%22%2C%22%E6%B7%B1%E4%BA%A4%E6%89%80%E4%B8%BB%E6%9D%BF%22%2C%22%E6%B7%B1%E4%BA%A4%E6%89%80%E5%88%9B%E4%B8%9A%E6%9D%BF%22%2C%22%E4%B8%8A%E4%BA%A4%E6%89%80%E7%A7%91%E5%88%9B%E6%9D%BF%22%2C%22%E4%B8%8A%E4%BA%A4%E6%89%80%E9%A3%8E%E9%99%A9%E8%AD%A6%E7%A4%BA%E6%9D%BF%22%2C%22%E6%B7%B1%E4%BA%A4%E6%89%80%E9%A3%8E%E9%99%A9%E8%AD%A6%E7%A4%BA%E6%9D%BF%22%2C%22%E5%8C%97%E4%BA%AC%E8%AF%81%E5%88%B8%E4%BA%A4%E6%98%93%E6%89%80%22%29%29" + url2.QueryEscape(search+indicators) + "&source=SELECT_SECURITIES&client=WEB&hyversion=v2"
 	//logger.SugaredLogger.Infof("url:%s", url)
-	if len(stableCodeOrder) > 0 && stableCodeOrder[0] {
+	if stableCodeOrder {
 		// The research universe is SH/SZ mainboard. Query that exact universe;
 		// mixed-market totals can include instruments absent from quote pages.
 		parsed, parseErr := url2.Parse(url)
@@ -2419,7 +2440,7 @@ func (receiver StockDataApi) GetAllStocks(page int, pageSize int, name string, t
 			query := parsed.Query()
 			query.Set("st", "SECURITY_CODE")
 			query.Set("sr", "1")
-			query.Set("filter", `(MARKET in ("上交所主板","深交所主板"))`)
+			query.Set("filter", snapshotUniverseFilter(includeAllA))
 			// Requesting CONCEPT silently inner-joins the quote page and omits
 			// stocks with no concept record while leaving the total unchanged.
 			query.Set("sty", strings.ReplaceAll(query.Get("sty"), ",CONCEPT,", ","))
@@ -2428,6 +2449,7 @@ func (receiver StockDataApi) GetAllStocks(page int, pageSize int, name string, t
 		}
 	}
 	resp, err := receiver.client.SetTimeout(time.Duration(receiver.config.CrawlTimeOut)*time.Second).R().
+		SetContext(ctx).
 		SetHeader("Host", "data.eastmoney.com").
 		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0").
 		Get(url)

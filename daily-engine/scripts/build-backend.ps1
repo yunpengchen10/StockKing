@@ -96,6 +96,7 @@ $hiddenImports = @(
   'src.services.yao_scout.opportunity_channels',
   'src.services.yao_scout.theme_rotation',
   'src.services.yao_scout.theme_feedback',
+  'src.services.yao_scout.market_context',
   'src.services.yao_scout.theme_opportunities',
   'src.services.yao_scout.opportunity_discovery',
   'src.services.yao_scout.discovery_snapshot',

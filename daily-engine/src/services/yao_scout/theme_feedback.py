@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo('Asia/Shanghai')
 MEANING = '冻结参考价至收盘的价格观察，非成交收益；归因是证据描述而非因果结论；仅小幅调整题材优先级，不修改模型权重。'
 VERSION = 'theme-feedback-v1'
+BRIEF_MEANING = '市场主线重点观察股的首次有效参考价至当日收盘价格变化；仅为watch观察，非买入建议成交收益，不计入规则精选胜率、训练样本或题材降权。'
 
 
 def _stamp(value):
@@ -71,6 +72,15 @@ def _empty(now, status='no_history', gaps=None):
             'modelWeightsChanged': False, 'trainingEligible': False}
 
 
+def _empty_brief(now, status='no_history', gaps=None):
+    return {'version': 'market-brief-feedback-v1', 'status': status, 'asOf': now.isoformat(),
+            'sourceDay': None, 'recordType': 'watch_observation', 'summary': '尚无已保存的市场重点观察复盘。',
+            'items': [], 'rows': [], 'watchCount': 0, 'observedCount': 0, 'pendingCount': 0,
+            'coverage': {'watchCount': 0, 'observedCount': 0, 'pct': None},
+            'gaps': gaps or [], 'meaning': BRIEF_MEANING, 'trainingEligible': False,
+            'includedInRulePerformance': False, 'adjustments': {}}
+
+
 def _quote(raw, code, now, *, close=False):
     """Reuse the public adapter's explicit post-close exception, never fetched_at."""
     from .local_observation_review import _quote as validate_quote
@@ -109,6 +119,15 @@ class ThemeFeedbackStore:
                 CREATE TABLE IF NOT EXISTS feedback(
                     day TEXT NOT NULL, as_of TEXT NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY(day,as_of));
+                CREATE TABLE IF NOT EXISTS brief_references(
+                    day TEXT NOT NULL, code TEXT NOT NULL, known_at TEXT NOT NULL,
+                    payload TEXT NOT NULL, PRIMARY KEY(day,code));
+                CREATE TABLE IF NOT EXISTS brief_closes(
+                    day TEXT NOT NULL, code TEXT NOT NULL, known_at TEXT NOT NULL,
+                    payload TEXT NOT NULL, PRIMARY KEY(day,code));
+                CREATE TABLE IF NOT EXISTS brief_feedback(
+                    day TEXT NOT NULL, as_of TEXT NOT NULL, payload TEXT NOT NULL,
+                    PRIMARY KEY(day,as_of));
         ''')
 
     @contextmanager
@@ -140,6 +159,103 @@ class ThemeFeedbackStore:
         sessions = self._sessions(start, now.date())
         return (timedelta(0) <= now.date() - start <= timedelta(days=7)
                 and start in sessions and len([d for d in sessions if d > start]) <= 5)
+
+    @staticmethod
+    def _has_brief_tables(db):
+        return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='brief_references'").fetchone() is not None
+
+    @staticmethod
+    def _save_brief(db, run, now, fallback_decision):
+        brief = run.get('marketBrief')
+        if not isinstance(brief, dict):
+            return {'status': 'no_brief', 'watchCount': 0}
+        decision = _stamp(brief.get('asOf')) if brief.get('asOf') else fallback_decision
+        if decision is None or decision > now or decision.date() != now.date():
+            return {'status': 'rejected', 'watchCount': 0, 'gaps': ['市场简报时刻无效或超前']}
+        at, day = now.isoformat(), decision.date().isoformat()
+        count = 0
+        for raw in brief.get('focusStocks') or []:
+            if not isinstance(raw, dict) or not (code := _code(raw.get('code'))):
+                continue
+            quote_raw = dict(raw.get('quote') or raw)
+            quote_raw['source_time'] = quote_raw.get('source_time') or quote_raw.get('sourceTime')
+            source_at = _stamp(quote_raw.get('provider_timestamp') or quote_raw.get('source_time'))
+            session_reference = (raw.get('quoteFreshness') == 'session_reference' and source_at is not None
+                and source_at.date() == decision.date() and source_at <= decision
+                and (time(11, 30) <= decision.time() < time(13) and time(11, 27) <= source_at.time() < time(13)
+                     or decision.time() >= time(15) and time(14, 57) <= source_at.time() <= time(15, 5)))
+            # The brief already distinguishes an explicit resting-session
+            # reference from live execution evidence. Preserve its provider
+            # clock; validate the original quote without inventing a new price.
+            quote, gaps = _quote(quote_raw, code, source_at if session_reference else decision)
+            record = {'code': code, 'name': raw.get('name') or code, 'recordType': 'watch_observation',
+                'firstSeenAt': decision.isoformat(), 'referenceAt': decision.isoformat() if not gaps else None,
+                'referenceKnownAt': at if not gaps else None, 'referenceQuote': quote if not gaps else None,
+                'watchSource': brief.get('source'), 'themeIds': raw.get('themeIds') or ([raw['themeId']] if raw.get('themeId') else []),
+                'themes': raw.get('themes') or ([{'id': raw.get('themeId'), 'name': raw.get('themeName')}] if raw.get('themeId') else []),
+                'eventDate': raw.get('eventDate'), 'eventSourceTime': raw.get('eventSourceTime'),
+                'quoteFreshness': 'session_reference' if session_reference else raw.get('quoteFreshness'),
+                'watchStatusAtDecision': raw.get('status'), 'ruleRecommendationAtDecision': raw.get('ruleRecommendation') is True,
+                'gaps': gaps, 'trainingEligible': False, 'includedInRulePerformance': False}
+            previous = db.execute('SELECT payload FROM brief_references WHERE day=? AND code=?', (day, code)).fetchone()
+            if previous is None:
+                db.execute('INSERT INTO brief_references VALUES(?,?,?,?)', (day, code, at, _json(record)))
+            elif not gaps:
+                prior = json.loads(previous['payload'])
+                # Do not retime an unavailable original price. A later first
+                # valid reference has its own explicit decision/known times.
+                if not prior.get('referenceQuote'):
+                    record['firstSeenAt'] = prior['firstSeenAt']
+                    db.execute('UPDATE brief_references SET payload=? WHERE day=? AND code=?', (_json(record), day, code))
+            count += 1
+        return {'status': 'saved', 'watchCount': count}
+
+    def _review_brief(self, db, now, quotes):
+        day, at = now.date().isoformat(), now.isoformat()
+        references = [json.loads(row['payload']) for row in db.execute(
+            'SELECT payload FROM brief_references WHERE day=? AND known_at<=? ORDER BY code', (day, at))]
+        if not references:
+            return _empty_brief(now, 'no_watches')
+        items = []
+        for row in references:
+            code = row['code']
+            known = _stamp(row.get('referenceKnownAt'))
+            reference = row.get('referenceQuote') if known and known <= now else None
+            close, gaps = _quote(quotes.get(code), code, now, close=True)
+            if reference and not gaps and _stamp(close['source_time']) >= _stamp(row['referenceAt']):
+                db.execute('INSERT OR IGNORE INTO brief_closes VALUES(?,?,?,?)', (day, code, at, _json(close)))
+            settled = db.execute('SELECT payload FROM brief_closes WHERE day=? AND code=? AND known_at<=?', (day, code, at)).fetchone()
+            close = json.loads(settled['payload']) if settled and reference else None
+            observed = bool(reference and close)
+            item = {**row, 'referenceQuote': reference, 'closeQuote': close,
+                'referencePrice': reference['price'] if reference else None, 'closePrice': close['price'] if close else None,
+                'referenceAt': row.get('referenceAt') if reference else None,
+                'referenceKnownAt': row.get('referenceKnownAt') if reference else None,
+                'status': 'observed' if observed else 'pending_data',
+                'observationChangePct': round((close['price']/reference['price']-1)*100, 6) if observed else None,
+                'gaps': [] if observed else ['缺少当时有效参考价'] if not reference else (gaps or ['收盘证据时间早于观察参考'])}
+            item['changePct'] = item['observationChangePct']
+            items.append(item)
+        observed = sum(row['status'] == 'observed' for row in items)
+        result = _empty_brief(now, 'reviewed' if observed == len(items) else 'partial' if observed else 'pending_data')
+        result.update(sourceDay=day, items=items, rows=items, watchCount=len(items), observedCount=observed,
+            pendingCount=len(items)-observed, gaps=[] if observed == len(items) else ['部分重点观察股缺少原参考价或当日收盘证据'],
+            coverage={'watchCount': len(items), 'observedCount': observed, 'pct': round(100*observed/len(items), 4)},
+            summary=f'市场重点观察{len(items)}只，已核验{observed}只收盘价格变化，{len(items)-observed}只待补证据；不计入规则精选收益。')
+        db.execute('INSERT OR REPLACE INTO brief_feedback VALUES(?,?,?)', (day, at, _json(result)))
+        return result
+
+    def _read_brief(self, db, now, include_today):
+        if not self._has_brief_tables(db):
+            return _empty_brief(now)
+        operator = '<=' if include_today else '<'
+        row = db.execute('SELECT day,payload FROM brief_feedback WHERE day'+operator+'? AND as_of<=? ORDER BY day DESC,as_of DESC LIMIT 1',
+                         (now.date().isoformat(), now.isoformat())).fetchone()
+        if not row:
+            return _empty_brief(now)
+        if not self._fresh(row['day'], now):
+            return _empty_brief(now, 'expired', ['重点观察反馈超过5个交易日或7个自然日'])
+        return json.loads(row['payload'])
 
     @staticmethod
     def _pool(run):
@@ -211,8 +327,12 @@ class ThemeFeedbackStore:
                     if not row['gaps']:
                         db.execute('INSERT OR IGNORE INTO baselines VALUES(?,?,?,?)',
                             (day, row['code'], at, _json(row)))
+                brief_archive = self._save_brief(db, run, now, decision)
+            else:
+                brief_archive = {'status': 'already_saved'}
         return {'status': 'saved' if added else 'already_saved', 'scanId': scan_id,
-                'universeCount': len(frozen), 'validReferenceCount': sum(not r['gaps'] for r in frozen), 'gaps': gaps}
+                'universeCount': len(frozen), 'validReferenceCount': sum(not r['gaps'] for r in frozen),
+                'marketBriefArchive': brief_archive, 'gaps': gaps}
 
     def pending_codes(self, now, limit=500):
         """Only today's references can settle with today's current quotes."""
@@ -220,11 +340,22 @@ class ThemeFeedbackStore:
         if not self.path.is_file() or now.date() not in self._sessions(now.date(), now.date()) or now.time() < time(15):
             return []
         with self._db(write=False) as db:
+            brief_codes = []
+            if self._has_brief_tables(db):
+                pending = db.execute('''SELECT b.code,b.payload FROM brief_references b LEFT JOIN brief_closes c
+                    ON c.day=b.day AND c.code=b.code AND c.known_at<=? WHERE b.day=? AND b.known_at<=?
+                    AND c.code IS NULL ORDER BY b.code LIMIT ?''',
+                    (now.isoformat(), now.date().isoformat(), now.isoformat(), min(2000, max(0, int(limit))))).fetchall()
+                for row in pending:
+                    reference = json.loads(row['payload'])
+                    known = _stamp(reference.get('referenceKnownAt'))
+                    if reference.get('referenceQuote') and known and known <= now:
+                        brief_codes.append(row['code'])
             rows = db.execute('''SELECT b.code FROM baselines b LEFT JOIN closes c
                 ON c.day=b.day AND c.code=b.code AND c.known_at<=? WHERE b.day=? AND b.known_at<=?
                 AND c.code IS NULL ORDER BY b.code LIMIT ?''',
                 (now.isoformat(), now.date().isoformat(), now.isoformat(), min(2000, max(0, int(limit))))).fetchall()
-        return [r['code'] for r in rows]
+        return list(dict.fromkeys([*brief_codes, *(r['code'] for r in rows)]))[:min(2000, max(0, int(limit)))]
 
     def _adjustments(self, db, now, *, before_day=None):
         rows = db.execute('SELECT day,as_of,payload FROM feedback WHERE as_of<=? AND day>=? ORDER BY day DESC,as_of DESC',
@@ -248,16 +379,18 @@ class ThemeFeedbackStore:
         now = _now(now)
         day, at = now.date().isoformat(), now.isoformat()
         if now.date() not in self._sessions(now.date(), now.date()) or now.time() < time(15):
-            return _empty(now, 'unavailable', ['尚未收盘或非核验交易日'])
+            return {**_empty(now, 'unavailable', ['尚未收盘或非核验交易日']),
+                    'marketBriefFeedback': _empty_brief(now, 'unavailable', ['尚未收盘或非核验交易日'])}
         if not self.path.is_file():
-            return _empty(now, 'no_scans', ['当日没有冻结扫描'])
+            return {**_empty(now, 'no_scans', ['当日没有冻结扫描']), 'marketBriefFeedback': _empty_brief(now)}
         quotes = quotes if isinstance(quotes, dict) else {}
         with self._db() as db:
             db.execute('BEGIN IMMEDIATE')
+            brief_feedback = self._review_brief(db, now, quotes)
             scans = [json.loads(r[0]) for r in db.execute(
                 'SELECT payload FROM scans WHERE day=? AND known_at<=? ORDER BY known_at,decision_at,scan_id', (day, at))]
             if not scans:
-                return _empty(now, 'no_scans', ['当日没有冻结扫描'])
+                return {**_empty(now, 'no_scans', ['当日没有冻结扫描']), 'marketBriefFeedback': brief_feedback}
             baselines = [json.loads(r[0]) for r in db.execute(
                 'SELECT payload FROM baselines WHERE day=? AND known_at<=? ORDER BY code', (day, at))]
             for row in baselines:
@@ -273,6 +406,7 @@ class ThemeFeedbackStore:
                 observations[row['code']] = {**row, 'closeQuote': close,
                     'observationChangePct': round((close['price']/row['quote']['price']-1)*100, 6) if close else None}
             feedback = self._describe(scans, observations, now, theme_board)
+            feedback['marketBriefFeedback'] = brief_feedback
             db.execute('INSERT OR REPLACE INTO feedback VALUES(?,?,?)', (day, at, _json(feedback)))
             feedback['adjustments'], feedback['adjustmentSourceDays'] = self._adjustments(db, now)
             db.execute('UPDATE feedback SET payload=? WHERE day=? AND as_of=?', (_json(feedback), day, at))
@@ -371,7 +505,8 @@ class ThemeFeedbackStore:
         now = _now(now)
         day, at = now.date().isoformat(), now.isoformat()
         if not self.path.is_file():
-            return {'history': [], 'feedback': _empty(now)}
+            brief = _empty_brief(now)
+            return {'history': [], 'feedback': {**_empty(now), 'marketBriefFeedback': brief}, 'marketBriefFeedback': brief}
         with self._db(write=False) as db:
             day_operator = '<=' if include_today else '<'
             rows = db.execute('SELECT day,as_of,payload FROM feedback WHERE day'+day_operator+'? AND as_of<=? ORDER BY day DESC,as_of DESC', (day, at)).fetchall()
@@ -400,4 +535,6 @@ class ThemeFeedbackStore:
                     history.append({**(scan.get('boardMeta') or {}),
                         'asOf': (scan.get('boardMeta') or {}).get('asOf') or scan['asOf'],
                         **{k: scan[k] for k in ('knownAt', 'sourceDay', 'themes')}})
-        return {'history': history, 'feedback': feedback}
+            brief = self._read_brief(db, now, include_today)
+            feedback['marketBriefFeedback'] = brief
+        return {'history': history, 'feedback': feedback, 'marketBriefFeedback': brief}

@@ -6,6 +6,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 import tempfile
 import threading
 from collections import OrderedDict
@@ -345,7 +346,7 @@ def _opportunity_assessment_valid(run: dict[str, Any], *, historical: bool = Fal
                 ((row.get('opportunity') or {}).get('theme') or {}).get('selected') is True
                 and ((row.get('opportunity') or {}).get('theme') or {}).get('coreEligible') is True))
             and not quote_check(row.get('quote') or {}, row.get('code'), published) for row in rows)
-    except (ValueError, TypeError, OverflowError):
+    except (AttributeError, ValueError, TypeError, OverflowError):
         return False
 
 
@@ -373,6 +374,119 @@ def _opportunity_header_valid(row: dict[str, Any], *, historical: bool = False) 
         return False
 
 
+def _market_brief_valid(run: dict[str, Any], *, historical: bool = False) -> bool:
+    """Admit independently sourced watch ideas, never repair formal eligibility.
+
+    Check every clock against the original publication, so reopening a frozen
+    result does not silently refresh it. Session-close references remain watch
+    evidence even when intraday minute/flow assessment is unavailable.
+    """
+    from src.services.yao_scout.daily_opportunities import is_market_open
+    from src.services.yao_scout.premarket import previous_session
+    from src.services.yao_scout.theme_rotation import _invalid_quote_evidence
+
+    def stamp(value):
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ValueError('source timestamp requires an offset')
+        return parsed.astimezone(_SHANGHAI_TZ)
+
+    def named(value):
+        return isinstance(value, str) and bool(value.strip())
+
+    def positive(value):
+        return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+    brief = run.get('marketBrief')
+    if not isinstance(brief, dict) or brief.get('version') != 'market-brief-v1' or brief.get('status') != 'observed':
+        return False
+    profiles = run.get('profileCandidates', {})
+    if (run.get('candidates') != [] or not isinstance(profiles, dict)
+            or any(not isinstance(rows, list) or rows for rows in profiles.values())):
+        return False
+    mainlines, stocks = brief.get('mainlines'), brief.get('focusStocks')
+    if (not isinstance(mainlines, list) or not 1 <= len(mainlines) <= 3
+            or not isinstance(stocks, list) or not 1 <= len(stocks) <= 5):
+        return False
+    packet = run.get('opportunityChannels')
+    if packet is not None and (not isinstance(packet, dict)
+            or packet.get('version') not in _opportunity_versions(historical=historical)
+            or not isinstance(packet.get('recommendations'), list)):
+        return False
+    recommendations = (packet or {}).get('recommendations') or []
+    if recommendations and not _opportunity_assessment_valid(run, historical=historical):
+        return False
+    recommended = {row.get('code'): row for row in recommendations}
+    try:
+        published = stamp(run.get('generatedAt') or run.get('as_of') or run.get('cutoff_at'))
+        assessed = stamp(brief.get('asOf'))
+        if (assessed.date() != published.date() or not 0 <= (published-assessed).total_seconds() <= 30
+                or not is_market_open('cn', published.date())):
+            return False
+        previous = previous_session(assessed).isoformat()
+        today = assessed.date().isoformat()
+        themes = {}
+        for index, theme in enumerate(mainlines, 1):
+            if not isinstance(theme, dict):
+                return False
+            identity, event_day = theme.get('id'), theme.get('eventDate')
+            event_at = stamp(theme.get('eventSourceTime'))
+            coverage, leaders = theme.get('quoteCoverage'), theme.get('leaders')
+            if (not named(identity) or identity in themes or not named(theme.get('name'))
+                    or not named(theme.get('source')) or not named(theme.get('catalyst'))
+                    or type(theme.get('rank')) is not int or theme['rank'] != index
+                    or event_day not in {today, previous} or event_at.date().isoformat() > event_day
+                    or not 0 <= (assessed-event_at).total_seconds() <= 7*86400
+                    or theme.get('status') != ('current_event' if event_day == today else 'continuation')
+                    or not isinstance(coverage, dict)
+                    or any(type(coverage.get(key)) is not int for key in ('validCount', 'expectedCount'))
+                    or not 0 < coverage['validCount'] <= coverage['expectedCount']
+                    or not isinstance(leaders, list) or not leaders
+                    or any(not isinstance(code, str) or not re.fullmatch(r'(?:600|601|603|605|000|001|002|003)\d{3}', code) for code in leaders)):
+                return False
+            themes[identity] = theme
+        seen = set()
+        for row in stocks:
+            if not isinstance(row, dict):
+                return False
+            code = row.get('code')
+            theme = themes.get(row.get('themeId'))
+            source_at = stamp(row.get('sourceTime'))
+            age, clock, source_clock = (assessed-source_at).total_seconds(), assessed.time(), source_at.time()
+            session_reference = (time(11, 30) <= clock < time(13) and time(11, 27) <= source_clock <= clock
+                or clock >= time(15) and time(14, 57) <= source_clock <= time(15, 5))
+            live = (0 <= age <= 300 and (time(9, 30) <= clock < time(11, 30) or time(13) <= clock < time(15))
+                    and (time(9, 30) <= source_clock < time(11, 30) or time(13) <= source_clock < time(15)))
+            if (not isinstance(code, str) or code in seen or not theme or code not in theme['leaders']
+                    or not named(row.get('name')) or re.search(r'ST|退|整理|停牌', row['name'], re.I)
+                    or row.get('themeName') != theme['name'] or not named(row.get('reason'))
+                    or row.get('eventDate') != theme['eventDate'] or row.get('eventSourceTime') != theme['eventSourceTime']
+                    or not positive(row.get('price')) or not positive(row.get('changePct')) or _invalid_quote_evidence(row)
+                    or not named(row.get('source')) or source_at.date() != assessed.date() or age < 0
+                    or row.get('executable') is not False or row.get('trainingEligible') is True
+                    or row.get('quoteFreshness') not in {'live', 'session_reference'}
+                    or (row['quoteFreshness'] == 'live' and not live)
+                    or (row['quoteFreshness'] == 'session_reference' and not session_reference)):
+                return False
+            seen.add(code)
+            if row.get('status') == 'watch':
+                if row.get('ruleRecommendation') is not False:
+                    return False
+            elif row.get('status') == 'conditions_met':
+                original = recommended.get(code)
+                if (row.get('ruleRecommendation') is not True or not original or not live or age > 30
+                        or row['quoteFreshness'] != 'live'
+                        or (original.get('opportunity') or {}).get('failedConditions')
+                        or not (time(9, 30) <= clock < time(11, 30) or time(13) <= clock < time(15))
+                        or row['price'] != (original.get('quote') or {}).get('price')):
+                    return False
+            else:
+                return False
+        return True
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def displayable_run(run: Any, *, historical: bool = False) -> bool:
     """A source outage is not an empty selection. Old snapshots do not expire here."""
     if not isinstance(run, dict) or run.get("status") not in _VALID_STATUSES:
@@ -387,6 +501,18 @@ def displayable_run(run: Any, *, historical: bool = False) -> bool:
         # A valid daily branch cannot publish an unsupported or old opportunity
         # contract as a new result. Historical reads retain the recorded version.
         return False
+    if run.get('marketBrief') is not None:
+        # Independent watch evidence cannot launder a damaged formal list.
+        if opportunity is not None and (not isinstance(opportunity.get('recommendations'), list)
+                or (opportunity['recommendations'] and not _opportunity_assessment_valid(run, historical=historical))):
+            return False
+        if opportunity and opportunity['recommendations']:
+            from src.services.yao_scout.theme_rotation import _invalid_quote_evidence
+            if any((row.get('opportunity') or {}).get('failedConditions') or _invalid_quote_evidence(row.get('quote'))
+                   for row in opportunity['recommendations']):
+                return False
+        if _market_brief_valid(run, historical=historical):
+            return True
     quality = run.get("dataQuality") or run.get("data_quality") or {}
     if run.get('premarketAssessment'):
         # A validated previous-session plan can be saved before trades/minutes

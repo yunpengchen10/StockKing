@@ -49,10 +49,12 @@ class SoftwareMarketClient:
         result = self._request('bars', {'codes': [code], 'period': str(period), 'count': count, 'end': end or ''})
         return result.get('results', {}).get(code, {'bars': []})
 
-    def snapshot(self):
+    def snapshot(self, *, include_all_a=False, timeout=None):
         import pandas as pd
         from .public_market_quotes import TZ
-        result = self._request('snapshot', {})
+        client = (SoftwareMarketClient(self.url, self.token, read_timeout=min(self.read_timeout, max(.1, timeout)))
+                  if timeout is not None else self)
+        result = client._request('snapshot', {'all_a': True} if include_all_a else {})
         frame = pd.DataFrame(result.get('items', []))
         checked = datetime.now(TZ)
         def fresh(row):
@@ -65,6 +67,7 @@ class SoftwareMarketClient:
         complete = bool(result.get('complete'))
         selection_stale = fresh_count != len(frame) or frame.empty
         frame.attrs.update(source='software:go/eastmoney', fetched_at=result.get('fetched_at'),
+                           universe_scope=result.get('universe_scope'),
                            stale=not complete or selection_stale,
                            complete=complete, directory_complete=complete,
                            selection_fields_stale=selection_stale,
@@ -143,6 +146,11 @@ class SoftwareMarketClient:
 
     def sectors(self):
         return self._request('sectors', {})
+
+    def theme_context(self, *, now=None, timeout=8):
+        """Independent market-page evidence, bounded and safe without a browser."""
+        client = SoftwareMarketClient(self.url, self.token, read_timeout=min(self.read_timeout, max(.1, timeout)))
+        return client._request('theme-context', {'date': now.strftime('%Y-%m-%d') if now else '', 'count': 100})
 
     def quotes(self, codes, *, clock=None):
         from src.services.public_market_quotes import normalize_quote_codes, parse_quote_payload, _assess, TZ

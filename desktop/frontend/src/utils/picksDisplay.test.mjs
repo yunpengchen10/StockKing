@@ -26,6 +26,56 @@ const snapshot = (generatedAt, source = 'scheduled') => ({
 const oldSnapshot = () => snapshot('2026-07-13T10:30:00+08:00', 'manual')
 const latestSnapshot = () => snapshot('2026-10-13T10:30:00+08:00')
 
+test('default page connects real market-event observations while folding technical modules and preserving historical dates', async () => {
+  const saved = snapshot('2026-11-13T10:30:00+08:00')
+  saved.adaptive.themeBoard = { status: 'unavailable', themes: [], gaps: ['完整成分未齐'] }
+  saved.adaptive.opportunityChannels = { version: 'opportunity-theme-20261113-v1', recommendations: [],
+    diagnostics: { researchedCount: 10, failedConditionCounts: { stock_flow_unavailable: 10, sector_flow_unavailable: 10 } } }
+  saved.adaptive.marketBrief = { version: 'market-brief-v1', asOf: saved.generatedAt, status: 'observed',
+    mainlines: [{ id: 'event-1', name: '事件题材样本', rank: 1, catalyst: '已发布的真实事件线索', source: 'fixture:event',
+      eventDate: '2026-11-12', eventSourceTime: '2026-11-12T14:00:00+08:00', status: 'continuation', statusLabel: '昨日题材今日跟踪',
+      quoteCoverage: { validCount: 1, expectedCount: 2 }, rankScope: '事件关联股票，非全概念成分排名' }],
+    focusStocks: [{ code: '600001', name: '事件关联股票样本', themeName: '事件题材样本', price: 10.5, changePct: 2,
+      sourceTime: '2026-11-13T10:29:50+08:00', source: 'fixture:quote', status: 'watch', ruleRecommendation: false,
+      reason: '昨日事件关联，今日报价已核验', pending: ['资金与入场位置等待确认'], risks: ['事件延续仍待核验'] }] }
+  saved.currentThemeFeedback = { status: 'no_scans', sourceDay: '2026-11-12', asOf: '2026-11-12T15:30:00+08:00', summary: '旧完整题材反馈',
+    marketBriefFeedback: { status: 'partial', sourceDay: '2026-11-12', asOf: '2026-11-12T15:30:00+08:00', summary: '上一日重点观察反馈样本',
+      rows: [{ code: '600009', name: '昨日观察样本', referencePrice: 10, closePrice: 10.4, changePct: 4, gaps: [] },
+        { code: '600008', name: '缺收盘样本', referencePrice: 12, closePrice: null, changePct: null, gaps: ['缺收盘报价'] }] } }
+  const before = JSON.stringify(saved)
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    const visible = mounted.visibleText()
+    assert.ok(visible.indexOf('今日主线') < visible.indexOf('重点股票'))
+    assert.ok(visible.indexOf('重点股票') < visible.indexOf('昨日反馈'))
+    assert.match(visible, /昨日题材今日跟踪/)
+    assert.match(visible, /事件 2026-11-12 · fixture:event/)
+    assert.match(visible, /事件关联股票样本600001/)
+    assert.match(visible, /观察 \/ 等待确认/)
+    assert.match(visible, /¥10.50/)
+    assert.match(visible, /资金与入场位置等待确认/)
+    assert.match(visible, /上一日重点观察反馈样本/)
+    assert.match(visible, /昨日观察样本.*¥10.00 → ¥10.40.*\+4.00%/s)
+    assert.match(visible, /缺收盘样本.*待核验.*未取得.*缺收盘报价/s)
+    assert.doesNotMatch(visible, /旧完整题材反馈/)
+    assert.doesNotMatch(visible, /题材证据待补齐|资金证据不可用|自动学习|模型验证精选|策略分组/)
+    assert.match(mounted.text(), /资金证据不可用/)
+    assert.match(mounted.text(), /非全概念成分排名/)
+    assert.equal(mounted.state().adaptivePicks.length, 0)
+    mounted.setNow(Date.parse('2026-11-13T10:31:00+08:00'))
+    await mounted.runTimer(1000)
+    assert.match(mounted.visibleText(), /历史参考价 · 行情已过期/)
+    assert.doesNotMatch(mounted.visibleText(), /源时间在30秒内/)
+    mounted.state().moreDetailsOpen = true
+    mounted.state().controlsOpen = true
+    await flush()
+    assert.match(mounted.visibleText(), /资金证据不可用/)
+    assert.match(mounted.visibleText(), /自动学习/)
+    assert.equal(JSON.stringify(saved), before)
+  } finally { mounted.dispose() }
+})
+
 test('post-close feedback arrives on a saved-result poll without requesting a new scan', async () => {
   const saved = snapshot('2026-11-13T10:30:00+08:00')
   let feedback = { status: 'no_history', summary: '等待今日收盘核验', asOf: '2026-11-13T10:30:00+08:00' }
@@ -66,8 +116,8 @@ test('theme-first page renders main themes, core stocks and feedback in order wi
   try {
     await flush()
     const visible = mounted.visibleText()
-    assert.ok(visible.indexOf('今日主线') < visible.indexOf('核心股票 · 热门题材优先'))
-    assert.ok(visible.indexOf('核心股票 · 热门题材优先') < visible.indexOf('每日反馈'))
+    assert.ok(visible.indexOf('今日主线') < visible.indexOf('重点股票'))
+    assert.ok(visible.indexOf('重点股票') < visible.indexOf('昨日反馈'))
     assert.match(visible, /题材测试主线/)
     assert.match(visible, /fixture:concept/)
     assert.match(visible, /70.0%/)
@@ -75,11 +125,11 @@ test('theme-first page renders main themes, core stocks and feedback in order wi
     assert.match(visible, /题材内第 1/)
     assert.match(visible, /最新收盘反馈/)
     assert.doesNotMatch(visible, /冻结历史反馈/)
-    assert.match(visible, /首轮入选组变化未取得/)
-    assert.match(visible, /题材后续走弱/)
-    assert.match(visible, /已冻结候选样本（非全题材）/)
-    assert.match(visible, /候选样本平均变化/)
-    assert.match(visible, /样本观察/)
+    assert.match(mounted.text(), /首轮入选组变化未取得/)
+    assert.match(mounted.text(), /题材后续走弱/)
+    assert.match(mounted.text(), /已冻结候选样本（非全题材）/)
+    assert.match(mounted.text(), /候选样本平均变化/)
+    assert.match(mounted.text(), /样本观察/)
     assert.match(mounted.text(), /对照强股样本/)
     assert.match(mounted.text(), /已留对照，未深研/)
     mounted.state().viewingHistory = true
@@ -104,7 +154,7 @@ const zhengyuObservation = () => ({ code: '603089', name: '正裕工业', refere
 test('current model readiness explains an old empty snapshot without changing its frozen evidence', async () => {
   const saved = researchSnapshot('2026-10-26T10:30:00+08:00')
   saved.currentPrimaryReadiness = { modelUsableNow: false, progressKnown: true, progressFresh: true, countsAsOf: '2026-10-26T15:30:00+08:00', minimumSignalDaysForAnyTraining: 156, progress: { validSamples: 0, validSampleDays: 0 } }
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-26T15:35:00+08:00'))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-26T15:35:00+08:00'))
   try {
     await flush()
     assert.match(mounted.visibleText(), /模型验证精选 · 等待模型验证/)
@@ -121,7 +171,7 @@ test('cold-start controls are visible separately from formal recommendations and
   saved.adaptive.primaryReadiness = { modelUsableNow: false, progressKnown: false, minimumSignalDaysForAnyTraining: 156 }
   saved.adaptive.coldStartResearch = { coldStartControlCount: 1, evidenceEligibleCount: 1, entryPlanReadyCount: 1, recordingMode: 'official_frozen', trainingEligibleCount: 1, trainingControlCount: 1,
     items: [{ code: '600001', name: '研究样本', minimumPrice: 9.95, maximumPrice: 10.15, invalidationPrice: 9.5, expiresAt: '2026-10-26T10:35:00+08:00', trainingEligible: true }] }
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-26T10:31:00+08:00'))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-26T10:31:00+08:00'))
   try {
     await flush()
     assert.match(mounted.visibleText(), /数量未知/)
@@ -164,7 +214,7 @@ test('zero opportunities explain total fund evidence failure and do not promote 
     fundCollection: { requested: 4792, returned: 533, usable: 521, unfinished: 4259 },
     stageMissingReasons: { fund_evidence: 'provider_failed_or_stage_deadline_exhausted' } }
   const before = JSON.stringify(saved)
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
   try {
     await flush()
     const text = mounted.visibleText()
@@ -184,7 +234,7 @@ test('zero opportunities with fully verified fund windows retain the genuine unm
   const saved = researchSnapshot('2026-11-03T14:55:00+08:00')
   saved.adaptive.opportunityChannels = { version: 'opportunity-flow-20261103-v1', recommendations: [], observations: [],
     diagnostics: { researchedCount: 20, recommendationCount: 0, failedConditionCounts: { '个股_net_flow_not_positive': 20 } } }
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
   try {
     await flush()
     const text = mounted.visibleText()
@@ -200,7 +250,7 @@ test('early opportunity renders before the research lists and unready model with
   saved.adaptive.opportunityChannels = { version: 'opportunity-v1', recommendations: [earlyOpportunity()], observations: [] }
   saved.adaptive.primaryReadiness = { modelUsableNow: false, progressKnown: false }
   const before = JSON.stringify(saved)
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:00+08:00'))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:00+08:00'))
   try {
     await flush()
     const text = mounted.visibleText()
@@ -222,7 +272,7 @@ test('early opportunity renders before the research lists and unready model with
 test('expired opportunity quotes stay visible as historical evidence and failed refreshes preserve the cards', async () => {
   const saved = researchSnapshot('2026-10-28T10:30:00+08:00')
   saved.adaptive.opportunityChannels = { version: 'opportunity-flow-20261103-v1', recommendations: [flowOpportunity()] }
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved,
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved,
     StartKingPicksRefresh: async () => { throw new Error('报价服务暂不可用') },
   }, null, Date.parse('2026-10-28T10:30:00+08:00'))
   try {
@@ -244,7 +294,7 @@ test('the complete page renders current flow amounts, real coverage, source wind
   const saved = researchSnapshot('2026-10-28T10:30:00+08:00')
   saved.adaptive.opportunityChannels = { version: 'opportunity-flow-20261103-v1', recommendations: [flowOpportunity()], observations: [] }
   const before = JSON.stringify(saved)
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:00+08:00'))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:00+08:00'))
   try {
     await flush()
     const visible = mounted.visibleText(), all = mounted.text()
@@ -271,7 +321,7 @@ test('unselected qualified opportunities keep their real grades alongside B and 
     code: `60000${index + 2}`, name: `保留等级${index + 1}`,
     opportunity: { ...earlyOpportunity().opportunity, grade, channel: grade === 'M-A' ? 'M' : 'E' } }))
   saved.adaptive.opportunityChannels = { recommendations: [earlyOpportunity()], observations }
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:01+08:00'))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:01+08:00'))
   try {
     await flush()
     assert.match(mounted.visibleText(), /其他机会与待确认线索 · 4 只/)
@@ -286,7 +336,7 @@ test('opportunity scan history retains E/M grades and does not backfill model-se
   const saved = researchSnapshot('2026-10-28T10:30:00+08:00')
   saved.adaptive.opportunityChannels = { recommendations: [earlyOpportunity()] }
   const historyItem = { run_id: 'opportunity-run', mode: 'king_1030', result: saved.adaptive }
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved, GetKingPicksHistory: async () => ({ items: [historyItem] }) }, null, Date.parse('2026-10-28T10:30:01+08:00'))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved, GetKingPicksHistory: async () => ({ items: [historyItem] }) }, null, Date.parse('2026-10-28T10:30:01+08:00'))
   try {
     await flush()
     await mounted.state().openHistory(); await flush()
@@ -307,7 +357,7 @@ test('large opportunity observation lists show ten initially and expand without 
     opportunity: { ...earlyOpportunity().opportunity, grade: ['E-A', 'M-A', 'B', 'C'][index % 4] } }))
   saved.adaptive.opportunityChannels = { recommendations: [earlyOpportunity()], observations }
   const before = JSON.stringify(saved)
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:01+08:00'))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse('2026-10-28T10:30:01+08:00'))
   try {
     await flush()
     assert.match(mounted.visibleText(), /其他机会与待确认线索 · 300 只/)
@@ -333,6 +383,14 @@ test('large opportunity observation lists show ten initially and expand without 
     assert.equal(mounted.state().visibleOpportunityObservations.length, 10)
   } finally { mounted.dispose() }
 })
+
+// Existing modules remain reachable after opening the details and controls.
+function mountDetailedPicks(...args) {
+  const mounted = mountPicks(...args)
+  mounted.state().moreDetailsOpen = true
+  mounted.state().controlsOpen = true
+  return mounted
+}
 
 // Exercise the real setup, template, and KeepAlive lifecycle without a browser
 // or Wails. Every timer, including those used by the imported utilities, is
@@ -451,7 +509,7 @@ function mountPicks(api = {}, cached = null, now = null) {
 
 test('an old cached recommendation stays out of the visible result while the latest saved recommendation is loading', async () => {
   const pending = deferred(), cached = oldSnapshot()
-  const mounted = mountPicks({ GetDisplayedKingPicks: () => pending.promise }, cached)
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: () => pending.promise }, cached)
   try {
     await flush()
     assert.equal(mounted.state().restoring, true)
@@ -467,7 +525,7 @@ test('an old cached recommendation stays out of the visible result while the lat
 })
 
 test('a newer saved server recommendation replaces an older manually generated cache', async () => {
-  const mounted = mountPicks({}, oldSnapshot())
+  const mounted = mountDetailedPicks({}, oldSnapshot())
   try {
     await flush()
     assert.equal(mounted.state().result.generatedAt, latestSnapshot().generatedAt)
@@ -482,7 +540,7 @@ test('auction plans are visible before minute bars exist, age out at 09:35, and 
   saved.adaptive.premarketCandidates = [{ code: '600001', name: '竞价预案样本', price: 10, referencePriceKind: 'previous_close', quoteStatus: 'missing', planStatus: 'overnight_plan', baselineAsOf: '2026-10-15', baselineSource: '昨夜日线', triggerPrice: 10.2, support: 9.5, triggerCondition: '价格在支撑上方承接', invalidCondition: '跌破支撑失效' }]
   saved.adaptive.recommendationPolicy = { version: 'primary-admission-v1' }
   const before = JSON.stringify(saved)
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, oldSnapshot(), Date.parse('2026-10-16T09:22:01+08:00'))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, oldSnapshot(), Date.parse('2026-10-16T09:22:01+08:00'))
   try {
     await flush()
     assert.equal(mounted.state().premarketView.current, true)
@@ -513,7 +571,7 @@ test('the actual page leaves the primary list empty when only research or reject
   saved.adaptive.nextDayWatchlist = [{ code: '600002', name: 'Research only', nextDaySignal: { queue: 'first_board', score: 95 } }]
   saved.adaptive.nextDayContinuationWatchlist = [{ code: '600003', name: 'Continuation', nextDaySignal: { queue: 'continuation', score: 99 } }]
   const before = JSON.stringify(saved)
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved })
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved })
   try {
     await flush()
     assert.equal(mounted.state().adaptivePicks.length, 0)
@@ -534,7 +592,7 @@ test('saved polling preserves a persisted first anchor and exposes invalidation 
   const pick = { code: '600001', name: 'Anchored', primaryAdmission: { eligible: true }, firstReferenceTime: firstTime, firstReferencePrice: 10, referencePrice: 10.4, currentSignalState: 'new' }
   let saved = latestSnapshot()
   saved.adaptive = { ...saved.adaptive, recommendationPolicy: { version: 'primary-admission-v1' }, primaryObjective: 'morning_signal_to_same_session_close', candidates: [pick] }
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved })
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved })
   try {
     await flush()
     assert.equal(mounted.state().adaptiveCards[0].pick.firstReferencePrice, 10)
@@ -559,7 +617,7 @@ test('saved polling preserves a persisted first anchor and exposes invalidation 
 test('legacy candidates show their saved version without inventing admission or first-reference evidence', async () => {
   const saved = latestSnapshot()
   saved.adaptive.candidates = [{ code: '600001', name: 'Legacy', referencePrice: 15, decision_at: saved.generatedAt }]
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved })
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved })
   try {
     await flush()
     assert.equal(mounted.state().adaptivePicks.length, 1)
@@ -573,7 +631,7 @@ test('legacy candidates show their saved version without inventing admission or 
 test('returning to the keep-alive route reads the latest saved recommendation without launching a new scan', async () => {
   let reads = 0, scans = 0
   const first = oldSnapshot(), latest = latestSnapshot(), returnRead = deferred()
-  const mounted = mountPicks({
+  const mounted = mountDetailedPicks({
     GetDisplayedKingPicks: () => ++reads === 1 ? Promise.resolve(first) : returnRead.promise,
     StartKingPicksRefresh: async () => { scans++; throw new Error('unexpected scan') },
   })
@@ -595,7 +653,7 @@ test('returning to the keep-alive route reads the latest saved recommendation wi
 test('reentering the keep-alive route starts a fresh read instead of sharing an older background poll', async () => {
   const oldPoll = deferred(), reentryRead = deferred()
   let reads = 0
-  const mounted = mountPicks({ GetDisplayedKingPicks: () => {
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: () => {
     reads++
     return reads === 1 ? Promise.resolve(oldSnapshot()) : reads === 2 ? oldPoll.promise : reentryRead.promise
   } })
@@ -622,7 +680,7 @@ test('reentering the keep-alive route starts a fresh read instead of sharing an 
 test('leaving during the initial read and reopening also verifies a fresh saved result', async () => {
   const initialRead = deferred(), reentryRead = deferred()
   let reads = 0
-  const mounted = mountPicks({ GetDisplayedKingPicks: () => ++reads === 1 ? initialRead.promise : reentryRead.promise }, oldSnapshot())
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: () => ++reads === 1 ? initialRead.promise : reentryRead.promise }, oldSnapshot())
   try {
     await flush()
     mounted.active.value = false; await flush()
@@ -639,7 +697,7 @@ test('leaving during the initial read and reopening also verifies a fresh saved 
 
 test('background saved-result polling picks up a newer scheduled recommendation', async () => {
   let saved = oldSnapshot(), reads = 0, scans = 0
-  const mounted = mountPicks({
+  const mounted = mountDetailedPicks({
     GetDisplayedKingPicks: async () => { reads++; return saved },
     StartKingPicksRefresh: async () => { scans++; throw new Error('unexpected scan') },
   })
@@ -654,9 +712,9 @@ test('background saved-result polling picks up a newer scheduled recommendation'
   } finally { mounted.dispose() }
 })
 
-test('background polling makes both saved research queues visible without expanding details or launching a scan', async () => {
+test('background polling updates both saved research queues inside the expanded details without launching a scan', async () => {
   let saved = researchSnapshot('2026-10-23T09:40:00+08:00'), reads = 0, scans = 0
-  const mounted = mountPicks({
+  const mounted = mountDetailedPicks({
     GetDisplayedKingPicks: async () => { reads++; return saved },
     StartKingPicksRefresh: async () => { scans++; throw new Error('unexpected scan') },
   }, null, Date.parse('2026-10-23T09:56:00+08:00'))
@@ -692,7 +750,7 @@ test('a completed manual refresh replaces the displayed background research list
   })
   const scan = deferred()
   let scans = 0
-  const mounted = mountPicks({
+  const mounted = mountDetailedPicks({
     GetDisplayedKingPicks: async () => scheduled,
     StartKingPicksRefresh: () => { scans++; return scan.promise },
   }, null, Date.parse('2026-10-23T10:00:00+08:00'))
@@ -719,7 +777,7 @@ test('a completed manual refresh replaces the displayed background research list
 test('completed task receipt loads its saved display and the manual read button never launches another scan', async () => {
   const fresh = { ...latestSnapshot(), displayRunId: 'receipt-view', displayEvidenceMode: 'summary' }
   let reads = 0, scans = 0
-  const mounted = mountPicks({
+  const mounted = mountDetailedPicks({
     GetDisplayedKingPicks: async () => ++reads === 1 ? oldSnapshot() : fresh,
     StartKingPicksRefresh: async () => { scans++; return { task_id: 'receipt-task', status: 'pending' } },
     GetKingPicksRefreshTask: async () => ({ task_id: 'receipt-task', status: 'completed', result: null,
@@ -743,7 +801,7 @@ test('completed task receipt loads its saved display and the manual read button 
 test('partial historical recovery is visible until the next completed reconciliation and is not cached', async () => {
   let recovering = true
   const saved = latestSnapshot()
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => recovering ? { ...saved,
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => recovering ? { ...saved,
     displayRecovery: { status: 'recovering_history', remainingHeaders: 6, message: '正在分批核对历史完成记录，当前已保存结果继续展示。' } } : saved })
   try {
     await flush()
@@ -763,7 +821,7 @@ test('summary explanation distinguishes omitted evidence from missing original r
     primaryAdmission: { eligible: false, missingReasons: ['资金方向尚未确认'] } }
   saved.displayEvidenceMode = 'summary'
   saved.adaptive.evidenceInsufficient = [summary]
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved })
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved })
   try {
     await flush()
     mounted.state().showWhy(summary, true); await flush()
@@ -788,7 +846,7 @@ test('a late background read cannot restore research observations removed by a m
   const scheduled = researchSnapshot('2026-10-23T09:55:00+08:00', { continuation: [zhengyuObservation()] })
   const manual = researchSnapshot(generatedAt, { source: 'manual' })
   let reads = 0
-  const mounted = mountPicks({
+  const mounted = mountDetailedPicks({
     GetDisplayedKingPicks: () => ++reads === 1 ? Promise.resolve(scheduled) : delayedRead.promise,
     StartKingPicksRefresh: async () => ({ task_id: 'manual-empty-research', status: 'completed', result: manual }),
   }, null, Date.parse(generatedAt))
@@ -813,7 +871,7 @@ test('a saved-result read started before a successful manual scan cannot overwri
   const delayedRead = deferred(), manual = snapshot(latestSnapshot().generatedAt, 'manual')
   manual.adaptive.scanId = 'fresh-manual'
   let reads = 0
-  const mounted = mountPicks({
+  const mounted = mountDetailedPicks({
     GetDisplayedKingPicks: () => ++reads === 1 ? Promise.resolve(oldSnapshot()) : delayedRead.promise,
     StartKingPicksRefresh: async () => ({ task_id: 'manual-1', status: 'completed', result: manual }),
   })
@@ -835,7 +893,7 @@ test('a saved-result read started before a successful manual scan cannot overwri
 
 test('a failed saved-result read shows the cached recommendation with an explicit fallback notice', async () => {
   const cached = oldSnapshot()
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => { throw new Error('bridge unavailable') } }, cached)
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => { throw new Error('bridge unavailable') } }, cached)
   try {
     await flush()
     assert.equal(mounted.state().restoring, false)
@@ -848,7 +906,7 @@ test('a failed saved-result read shows the cached recommendation with an explici
 
 test('a server history-reconciliation error labels its saved result as fallback without persisting the error', async () => {
   const cached = oldSnapshot()
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => ({ ...cached, displaySyncError: 'history database unavailable' }) }, cached)
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => ({ ...cached, displaySyncError: 'history database unavailable' }) }, cached)
   try {
     await flush()
     assert.equal(mounted.state().restoring, false)
@@ -862,7 +920,7 @@ test('a server history-reconciliation error labels its saved result as fallback 
 test('an unanswered saved-result read times out, permits retry, and ignores its late reply', async () => {
   const pending = deferred(), cached = oldSnapshot()
   let reads = 0
-  const mounted = mountPicks({ GetDisplayedKingPicks: () => ++reads === 1 ? pending.promise : Promise.resolve(latestSnapshot()) }, cached)
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: () => ++reads === 1 ? pending.promise : Promise.resolve(latestSnapshot()) }, cached)
   try {
     await flush()
     await mounted.runTimer(20000)
@@ -899,7 +957,7 @@ test('daily cards render their own evidence and T+1 objective while minute readi
     historyPreparation: { message: '历史准备进行中', baselineClock: '2026-10-16T10:30:00+08:00' },
     morningReadiness: { message: '上午模型尚在准备', queues: [] } })
   const before = JSON.stringify(saved)
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
   try {
     await flush()
     assert.equal(mounted.state().isDailyPrimary, true)
@@ -936,7 +994,7 @@ test('an empty daily result explains daily gates instead of substituting the min
   Object.assign(saved.adaptive, { primarySelectionMode: 'daily_conditional', primaryObjective: 'daily_structure_to_next_session', candidates: [],
     dailyAssessment: { count: 0, message: '日线报价与风险条件未满足', excludedCounts: { quote_or_provider_price_limits_unverified: 4 } },
     admissionDiagnostics: { summary: '全部分钟缺证据', checks: [], evidenceAndRiskPassed: 0, modelAdmissionPassed: 0, selected: 0 } })
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
   try {
     await flush()
     assert.match(mounted.text(), /日线报价与风险条件未满足/)
@@ -962,7 +1020,7 @@ for (const formalCount of [0, 1]) test(`new daily observations stay separate wit
     admissionDiagnostics: { summary: formalCount ? '正式主榜已独立核验' : '市场与分钟证据不齐，本轮空榜', checks: [], selected: formalCount },
     marketEmotionPanel: { source: 'fixture', decisionAssessment: { available: false }, gaps: ['全市场数据未齐'] } })
   const before = JSON.stringify(saved)
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
   try {
     await flush()
     assert.equal(mounted.state().isDailyPrimary, false)
@@ -995,7 +1053,7 @@ test('pending history diagnostics explain session warmup without calling it miss
       evidenceAndRiskPassed: 0, modelAdmissionPassed: 0, selected: 0,
       summary: '6只正在等待开盘后的完整分钟窗口，不能据此判定历史缺失。' } })
   const before = JSON.stringify(saved)
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
   try {
     await flush()
     assert.match(mounted.text(), /0 \/ 6 只通过/)
@@ -1023,7 +1081,7 @@ test('verified weak breadth displays reduced budget warnings while observations 
     marketEmotionPanel: { source: 'fixture', asOf: saved.generatedAt, evaluatedAt: saved.generatedAt,
       decisionAssessment: breadth, features: { advancing_pct: 16.72 } } })
   const before = JSON.stringify(saved)
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
   try {
     await flush()
     assert.equal(mounted.state().adaptivePicks.length, 1)
@@ -1042,7 +1100,7 @@ test('new daily observation cards do not borrow historical first references when
   const observation = { code: '600001', name: '缺本轮参考', status: 'daily_observation', observationOnly: true,
     dailySignal: { taskId: 'daily_structure_to_next_session', firstReferenceTime: '2026-10-21T09:40:00+08:00', firstReferencePrice: 99 } }
   Object.assign(saved.adaptive, { primarySelectionMode: 'daily_observation', candidates: [], dailyCandidates: [observation] })
-  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  const mounted = mountDetailedPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
   try {
     await flush()
     assert.match(mounted.text(), /本轮日线观察 未记录/)

@@ -420,3 +420,131 @@ def test_saved_history_and_three_day_feedback_really_drive_theme_board_continuat
     ai = next(t for t in adjusted['themes'] if t['id'] == 'BK1000')
     assert ai['feedbackPenalty'] == .06 and ai['stage'] == '持续'
     assert ai['priorSelectedDays'] == 3
+
+
+def brief_scan(at=DAY, price=10, *, rule=False):
+    return {'run_id': 'brief-'+at.isoformat(), 'asOf': at.isoformat(),
+        'themeBoard': {'status': 'unavailable', 'themes': []}, 'themeResearchUniverse': [],
+        'marketBrief': {'asOf': at.isoformat(), 'source': 'ths:concept-events',
+            'focusStocks': [{'code': CODES[0], 'name': '观察股', 'price': price,
+                'sourceTime': at.isoformat(), 'source': 'tencent', 'themeId': 'ths-theme-1',
+                'themeName': '题材事件', 'eventDate': at.date().isoformat(),
+                'eventSourceTime': (at-timedelta(minutes=20)).isoformat(),
+                'status': 'conditions_met' if rule else 'watch', 'ruleRecommendation': rule,
+                'executable': False, 'pending': ['30分钟资金证据不足']}]}}
+
+
+def test_market_brief_watch_is_frozen_and_reviewed_when_full_theme_board_is_unavailable(store):
+    saved = store.save_scan(brief_scan(), DAY)
+    assert saved['marketBriefArchive']['watchCount'] == 1
+    assert store.pending_codes(DAY.replace(hour=15, minute=30)) == [CODES[0]]
+    feedback = store.review(DAY.replace(hour=15, minute=30), close_quotes())
+    brief = feedback['marketBriefFeedback']
+    assert brief['status'] == 'reviewed' and brief['sourceDay'] == DAY.date().isoformat()
+    assert brief['coverage'] == {'watchCount': 1, 'observedCount': 1, 'pct': 100}
+    row = brief['rows'][0]
+    assert row['referencePrice'] == 10 and row['closePrice'] == 9.8 and row['changePct'] == -2
+    assert row['themeIds'] == ['ths-theme-1']
+    assert row['ruleRecommendationAtDecision'] is False and row['includedInRulePerformance'] is False
+    assert 'selected' not in row and 'winRate' not in brief
+    assert brief['adjustments'] == {} and not brief['trainingEligible']
+    context = store.read_context(DAY+timedelta(days=1))
+    assert context['feedback']['marketBriefFeedback'] == brief == context['marketBriefFeedback']
+    with sqlite3.connect(store.path) as db:
+        assert db.execute('SELECT COUNT(*) FROM baselines').fetchone()[0] == 0
+        assert db.execute('SELECT COUNT(*) FROM brief_references').fetchone()[0] == 1
+        assert db.execute('SELECT COUNT(*) FROM brief_closes').fetchone()[0] == 1
+
+
+def test_market_brief_duplicate_scans_cannot_reprice_or_reclassify_original_watch(store):
+    store.save_scan(brief_scan(), DAY)
+    later = DAY+timedelta(minutes=30)
+    store.save_scan(brief_scan(later, price=15, rule=True), later)
+    result = store.review(DAY.replace(hour=15, minute=30), close_quotes())['marketBriefFeedback']
+    row = result['rows'][0]
+    assert row['referencePrice'] == 10 and row['watchStatusAtDecision'] == 'watch'
+    assert row['ruleRecommendationAtDecision'] is False and result['watchCount'] == 1
+    repeated = store.review(DAY.replace(hour=15, minute=31), close_quotes(prices=(20, 20, 20, 20)))
+    assert repeated['marketBriefFeedback']['rows'][0]['closePrice'] == 9.8
+
+
+def test_missing_watch_reference_remains_explicit_and_later_first_valid_quote_has_own_time(store):
+    store.save_scan(brief_scan(price=None), DAY)
+    early = DAY.replace(hour=15, minute=0)
+    assert store.pending_codes(early) == []
+    result = store.review(early, close_quotes())['marketBriefFeedback']
+    assert result['status'] == 'pending_data' and result['rows'][0]['referencePrice'] is None
+    # A late scan's first valid quote is not assigned to the original watch.
+    later = DAY+timedelta(hours=2)
+    store.save_scan(brief_scan(later, price=11), later)
+    result = store.review(DAY.replace(hour=15, minute=30), close_quotes())['marketBriefFeedback']
+    row = result['rows'][0]
+    assert row['firstSeenAt'] == DAY.isoformat() and row['referenceAt'] == later.isoformat()
+    assert row['referencePrice'] == 11
+    assert store.read_context(early, include_today=True)['marketBriefFeedback']['rows'][0]['referencePrice'] is None
+
+
+@pytest.mark.parametrize('field,value', [('sourceTime', None), ('sourceTime', (DAY+timedelta(seconds=1)).isoformat()),
+                                       ('source', ''), ('price', 0)])
+def test_market_brief_no_synthetic_baseline_from_news_heat_or_fetch_time(store, field, value):
+    run = brief_scan()
+    run['marketBrief']['focusStocks'][0][field] = value
+    run['marketBrief']['focusStocks'][0]['fetched_at'] = DAY.isoformat()
+    store.save_scan(run, DAY)
+    result = store.review(DAY.replace(hour=15, minute=30), close_quotes())['marketBriefFeedback']
+    assert result['status'] == 'pending_data' and result['observedCount'] == 0
+    assert result['rows'][0]['changePct'] is None and result['rows'][0]['gaps']
+    assert store.read_context(DAY+timedelta(days=1))['marketBriefFeedback']['status'] == 'pending_data'
+
+
+def test_brief_pending_queue_merges_deduplicates_and_obeys_limit(store):
+    run = scan()
+    run['marketBrief'] = brief_scan()['marketBrief']
+    store.save_scan(run, DAY)
+    pending = store.pending_codes(DAY.replace(hour=15, minute=30), limit=2)
+    assert pending == CODES[:2]
+    assert store.pending_codes(DAY.replace(hour=15, minute=30), limit=0) == []
+
+
+def test_brief_reading_old_schema_does_not_create_tables_or_modify_database(tmp_path):
+    path = tmp_path/'theme-feedback-v1.sqlite3'
+    with sqlite3.connect(path) as db:
+        db.executescript('CREATE TABLE scans(scan_id TEXT, day TEXT, decision_at TEXT, known_at TEXT, payload TEXT);'
+                        'CREATE TABLE feedback(day TEXT, as_of TEXT, payload TEXT);'
+                        'CREATE TABLE baselines(day TEXT, code TEXT, known_at TEXT, payload TEXT);'
+                        'CREATE TABLE closes(day TEXT, code TEXT, known_at TEXT, payload TEXT);')
+    before = path.read_bytes()
+    store = ThemeFeedbackStore(tmp_path, calendar)
+    assert store.read_context(DAY)['marketBriefFeedback']['status'] == 'no_history'
+    assert store.pending_codes(DAY.replace(hour=15, minute=30)) == []
+    assert path.read_bytes() == before
+
+
+def test_brief_never_reuses_previous_day_close_or_future_report(store):
+    store.save_scan(brief_scan(), DAY)
+    now = DAY.replace(hour=15, minute=30)
+    stale = close_quotes(DAY-timedelta(days=1))
+    assert store.review(now, stale)['marketBriefFeedback']['status'] == 'pending_data'
+    completed = store.review(now+timedelta(minutes=1), close_quotes())['marketBriefFeedback']
+    assert completed['status'] == 'reviewed'
+    assert store.read_context(now, include_today=True)['marketBriefFeedback']['status'] == 'pending_data'
+    assert store.read_context(now, include_today=False)['marketBriefFeedback']['status'] == 'no_history'
+    assert store.read_context(DAY+timedelta(days=8))['marketBriefFeedback']['status'] == 'expired'
+
+
+@pytest.mark.parametrize('source_minute', [30, 43])
+def test_lunch_watch_freezes_explicit_session_reference_without_retiming_it(store, source_minute):
+    now = DAY.replace(hour=12, minute=0)
+    run = brief_scan(now)
+    row = run['marketBrief']['focusStocks'][0]
+    source_at = now.replace(hour=11, minute=source_minute)
+    row.update(sourceTime=source_at.isoformat(), quoteFreshness='session_reference')
+    store.save_scan(run, now)
+    brief = store.review(now.replace(hour=15, minute=30), close_quotes())['marketBriefFeedback']
+    observed = brief['rows'][0]
+    assert observed['status'] == 'observed' and observed['changePct'] == -2
+    assert observed['referenceAt'] == now.isoformat()
+    assert observed['referenceKnownAt'] == now.isoformat()
+    assert observed['referenceQuote']['source_time'] == source_at.isoformat()
+    assert observed['quoteFreshness'] == 'session_reference'
+    assert observed['ruleRecommendationAtDecision'] is False

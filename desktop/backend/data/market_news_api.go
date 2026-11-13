@@ -1,6 +1,7 @@
 package data
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -1223,30 +1224,15 @@ func (m MarketNewsApi) ClsCalendar() []any {
 // ConceptEventList 获取同花顺每日炒作题材事件列表
 // date 格式: 2006-01-02，为空时默认当天，接口会返回该日及之前若干天的数据
 func (m MarketNewsApi) ConceptEventList(date string) *[]models.ConceptEventDay {
-	url := "https://news.10jqka.com.cn/app/concept_v2_api/open/api/concept/event/jtcsm/v1/event/list"
-	if date != "" {
-		url += "?date=" + date
+	if date == "" {
+		date = time.Now().In(themeContextTZ).Format("2006-01-02")
 	}
-	resp, err := SharedHTTPClient.SetTimeout(time.Duration(30)*time.Second).R().
-		SetHeader("Host", "news.10jqka.com.cn").
-		SetHeader("Origin", "https://news.10jqka.com.cn").
-		SetHeader("Referer", "https://news.10jqka.com.cn/").
-		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0").
-		Get(url)
+	days, _, err := FetchSharedConceptEvents(context.Background(), date)
 	if err != nil {
 		logger.SugaredLogger.Errorf("ConceptEventList err:%s", err.Error())
 		return &[]models.ConceptEventDay{}
 	}
-	respMap := struct {
-		StatusCode int    `json:"status_code"`
-		StatusMsg  string `json:"status_msg"`
-		Data       []models.ConceptEventDay
-	}{}
-	if err := json.Unmarshal(resp.Body(), &respMap); err != nil {
-		logger.SugaredLogger.Errorf("ConceptEventList unmarshal err:%s,body:%s", err.Error(), resp.Body())
-		return &[]models.ConceptEventDay{}
-	}
-	return &respMap.Data
+	return &days
 }
 
 func (m MarketNewsApi) GetGDP() *models.GDPResp {

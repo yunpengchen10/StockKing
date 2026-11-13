@@ -32,6 +32,27 @@ func TestMarketGatewayRejectsInvalidSymbols(t *testing.T) {
 	}
 }
 
+func TestMarketGatewayThemeContextRejectsUntrustedOrHistoricalRequests(t *testing.T) {
+	for _, tc := range []struct {
+		remote, token, body string
+		want                int
+	}{
+		{"127.0.0.1:1000", "", `{}`, 401},
+		{"10.0.0.1:1000", "secret", `{}`, 401},
+		{"127.0.0.1:1000", "secret", `{"date":"2000-01-01"}`, 400},
+		{"127.0.0.1:1000", "secret", `{"count":201}`, 400},
+	} {
+		request := httptest.NewRequest("POST", "/v1/theme-context", strings.NewReader(tc.body))
+		request.RemoteAddr = tc.remote
+		request.Header.Set("X-Stock-King-Market-Token", tc.token)
+		response := httptest.NewRecorder()
+		marketGatewayHandler("secret").ServeHTTP(response, request)
+		if response.Code != tc.want {
+			t.Fatalf("wanted %d got %d", tc.want, response.Code)
+		}
+	}
+}
+
 func TestMarketGatewayCompletedMinutesAndMissingAmount(t *testing.T) {
 	rows := []data.KLineData{
 		{Day: "2026-09-29 09:40", Open: "10", High: "10.2", Low: "9.9", Close: "10.1", Volume: "100", Amount: ""},
