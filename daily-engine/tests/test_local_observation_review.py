@@ -1,5 +1,6 @@
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 
@@ -12,8 +13,11 @@ class MemoryDB:
     def __init__(self, rows):
         self.rows, self.state = rows, None
 
+    def list_yao_observation_review_history(self, **kwargs):
+        return {'rows': deepcopy(self.rows), 'coverage': {'mode': 'fixture', 'complete': True}}
+
     def list_yao_runs(self, **kwargs):
-        return deepcopy(self.rows)
+        raise AssertionError('review must not load full saved scans')
 
     def get_yao_adaptive_state(self, key):
         return deepcopy(self.state)
@@ -194,3 +198,148 @@ def test_actual_fetch_completion_clock_accepts_later_source_but_not_future_or_cr
     assert reviewed["review_quote"]["source_time"] == (NOW + source_delta).isoformat()
     assert reviewed["review_quote"]["checked_at"] == (NOW + check_delta).isoformat()
     assert result["reviewed_at"] == NOW.isoformat()
+
+
+@pytest.fixture
+def projected_db(tmp_path):
+    """Exercise production SQL without initializing migrations or providers."""
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import sessionmaker
+    engine = create_engine('sqlite:///' + str(tmp_path / 'review-projection.db').replace('\\', '/'))
+    sessions = sessionmaker(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(text('CREATE TABLE yao_runs (id INTEGER PRIMARY KEY, run_id TEXT, '
+                                'mode TEXT, as_of_at TEXT, result_json TEXT)'))
+
+    class ProjectionDB(MemoryDB):
+        list_yao_observation_review_history = None
+
+        def get_session(self):
+            return sessions()
+
+        def add(self, saved, *, metadata_at=None, encoded=None):
+            at = metadata_at or datetime.fromisoformat(saved['result']['as_of'])
+            at = at.astimezone(timezone.utc).replace(tzinfo=None).isoformat(' ')
+            with engine.begin() as connection:
+                connection.execute(text('INSERT INTO yao_runs (run_id,mode,as_of_at,result_json) '
+                    'VALUES (:run_id,:mode,:at,:result)'), {'run_id': saved['run_id'], 'mode': saved['mode'],
+                    'at': at, 'result': encoded if encoded is not None else json.dumps(saved['result'])})
+
+    db = ProjectionDB([])
+    yield db
+    engine.dispose()
+
+
+def test_compact_sql_preserves_reviews_profiles_and_original_quotes(projected_db):
+    saved = row()
+    selected = saved['result']['candidates'][0]
+    selected.update(name='真实原名', precisionDecision={'profiles': {'regular': {'decision': 'observe'}}})
+    selected['quote']['raw_payload'] = 'unused quote bytes' * 100000
+    selected['minutePackets'] = ['unused minute bytes' * 100000]
+    saved['result']['snapshot'] = ['unused whole-market bytes' * 100000]
+    saved['result']['profileCandidates'] = {'regular': [selected], 'aggressive': [selected]}
+    for index, key in enumerate(('windvanes', 'precisionResearch', 'precisionWatchlist', 'evidenceInsufficient'), 2):
+        saved['result'][key] = [row(code=f'60000{index}', status='windvane' if index == 2 else 'conditional')
+                                ['result']['candidates'][0]]
+    projected_db.add(saved)
+    packet = mod.read_review_history(projected_db, NOW)
+    assert packet['coverage']['complete'] is True
+    assert packet['coverage']['projectedRunCount'] == 1
+    assert len(json.dumps(packet, ensure_ascii=False)) < 7000
+    encoded = json.dumps(packet)
+    assert 'minutePackets' not in encoded and 'raw_payload' not in encoded and 'whole-market' not in encoded
+    expected = mod.review_local_observations(MemoryDB([]), lambda code: quote(code=code), NOW, history=[saved])
+    actual = mod.review_local_observations(projected_db, lambda code: quote(code=code), NOW)
+    assert actual['observations'] == expected['observations']
+    assert actual['verified_count'] == expected['verified_count'] == 5
+    assert actual['observations'][0]['selected_profiles'] == ['regular', 'aggressive']
+
+
+@pytest.mark.parametrize('change', [
+    {'referencePrice': True}, {'referencePrice': 9}, {'decision_at': None},
+    {'quote': {'price': True}}, {'quote': {'is_stale': True}},
+    {'quote': {'source_time': NOW.isoformat()}}, {'quote': {'source': None}},
+])
+def test_compact_sql_keeps_baseline_invalidity_and_time_semantics(projected_db, change):
+    saved = row()
+    candidate = saved['result']['candidates'][0]
+    if 'quote' in change:
+        candidate['quote'].update(change['quote'])
+    else:
+        candidate.update(change)
+    projected_db.add(saved)
+    actual = mod.review_local_observations(projected_db, lambda _: quote(), NOW)
+    expected = mod.review_local_observations(MemoryDB([]), lambda _: quote(), NOW, history=[saved])
+    assert actual['observations'] == expected['observations']
+    assert actual['unknown_count'] == 1
+
+
+def test_compact_sql_filters_metadata_before_parsing_other_days_and_future(projected_db):
+    projected_db.add(row())
+    for index, at in enumerate((NOW - timedelta(days=1), NOW + timedelta(days=1))):
+        projected_db.add(row(f'other-day-{index}', decision=at), encoded='invalid giant source is never parsed')
+    other_mode = row('review-mode')
+    other_mode['mode'] = 'king_review'
+    projected_db.add(other_mode, encoded='invalid non-scan source is never parsed')
+    packet = mod.read_review_history(projected_db, NOW)
+    assert packet['coverage']['metadataCount'] == 4
+    assert packet['coverage']['eligibleRunCount'] == packet['coverage']['projectedRunCount'] == 1
+    assert packet['coverage']['complete'] is True
+
+
+def test_compact_row_limit_is_explicit_and_does_not_erase_prior_daily_reminders(projected_db, monkeypatch):
+    projected_db.add(row('first'))
+    projected_db.add(row('second'))
+    monkeypatch.setattr(mod, 'MAX_REVIEW_ROWS', 1)
+    prior = {'observations': {'600001': 7}, 'missing': {'600001': 5}, 'windvanes': {'600001': 2}}
+    projected_db.state = {'days': {NOW.date().isoformat(): deepcopy(prior)}}
+    result = mod.review_local_observations(projected_db, lambda _: quote(), NOW)
+    assert result['status'] == 'partial'
+    assert result['historyCoverage']['eligibleRunCount'] == 2
+    assert result['historyCoverage']['omittedRunCount'] == 1
+    assert result['historyCoverage']['complete'] is False
+    assert 'compact_review_run_limit' in result['historyCoverage']['gaps']
+    assert result['remindersUpdateStatus'] == 'deferred_until_complete_history'
+    assert projected_db.state['days'][NOW.date().isoformat()] == prior
+
+
+def test_compact_history_deadline_and_source_limit_are_explicit_and_restore_connection(projected_db, monkeypatch):
+    projected_db.add(row())
+    ticks = iter((0, 1))
+    monkeypatch.setattr(mod, 'monotonic', lambda: next(ticks))
+    packet = mod.read_review_history(projected_db, NOW, budget_seconds=.01)
+    assert packet['rows'] == [] and packet['coverage']['omittedRunCount'] == 1
+    assert packet['coverage']['gaps'] == ['compact_review_history_budget_exhausted']
+    monkeypatch.undo()
+    monkeypatch.setattr(mod, 'MAX_REVIEW_SOURCE_BYTES', 200)
+    limited = mod.read_review_history(projected_db, NOW)
+    assert limited['coverage']['complete'] is False and limited['rows'] == []
+    monkeypatch.undo()
+    assert mod.read_review_history(projected_db, NOW)['coverage']['complete'] is True
+
+
+def test_compact_candidate_limit_never_claims_complete_profile_membership(projected_db, monkeypatch):
+    saved = row()
+    saved['result']['profileCandidates'] = {'regular': saved['result']['candidates']}
+    projected_db.add(saved)
+    monkeypatch.setattr(mod, 'MAX_REVIEW_CANDIDATES', 1)
+    packet = mod.read_review_history(projected_db, NOW)
+    assert packet['rows'] == []
+    assert packet['coverage']['omittedRunCount'] == 1
+    assert 'compact_review_candidate_limit' in packet['coverage']['gaps']
+
+
+def test_older_sqlite_projects_text_json_without_loading_whole_report(projected_db, monkeypatch):
+    projected_db.add(row())
+    expected = mod.read_review_history(projected_db, NOW)
+    monkeypatch.setattr(mod.sqlite3, 'sqlite_version_info', (3, 44, 0))
+    assert mod.read_review_history(projected_db, NOW) == expected
+
+
+def test_review_not_due_never_reads_history_or_fetches_quotes():
+    class NoHistory:
+        def get_session(self):
+            raise AssertionError('not-due review must not query history')
+    result = mod.review_local_observations(NoHistory(), lambda _: pytest.fail('quote not due'),
+                                         NOW.replace(hour=14, minute=59))
+    assert result['status'] == 'not_due'

@@ -6,14 +6,134 @@ training labels. Repeated data gaps become verification reminders only.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
+import json
 import math
 import re
+import sqlite3
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
 STATE_KEY = "king-local-observation-review-v1"
 SCAN_MODES = {"king_live", "king_0920", "king_0922", "king_0940", "king_0955", "king_1030", "king_1455"}
+MAX_REVIEW_SOURCE_BYTES = 256 * 1024 * 1024
+MAX_REVIEW_ROWS = 20
+MAX_REVIEW_CANDIDATES = 2000
+
+
+def read_review_history(db, now, *, limit=100, budget_seconds=10.0):
+    """Project only review evidence, never decode a complete saved scan.
+
+    Metadata still covers the latest 100 runs. Large scan JSON is parsed by
+    SQLite one run at a time, with a source-size limit, row limit and deadline.
+    Missing/truncated runs remain explicit coverage gaps, not empty successes.
+    """
+    if now.tzinfo is None:
+        raise ValueError("复盘时钟必须包含时区")
+    now = now.astimezone(TZ)
+    injected = getattr(db, 'list_yao_observation_review_history', None)
+    if callable(injected):
+        return injected(now=now, limit=limit, budget_seconds=budget_seconds)
+    coverage = {'mode': 'sqlite_review_projection', 'metadataLimit': min(100, max(1, int(limit))),
+        'metadataCount': 0, 'eligibleRunCount': 0, 'projectedRunCount': 0,
+        'omittedRunCount': 0, 'maximumProjectedRuns': MAX_REVIEW_ROWS,
+        'maximumCandidatesPerRun': MAX_REVIEW_CANDIDATES, 'complete': False, 'gaps': []}
+    packet = {'rows': [], 'coverage': coverage}
+    if not callable(getattr(db, 'get_session', None)):
+        coverage['gaps'].append('compact_review_history_unavailable')
+        return packet
+    from sqlalchemy import text
+    from sqlalchemy.exc import SQLAlchemyError
+    deadline = monotonic() + max(.01, min(10.0, float(budget_seconds)))
+    # All paths are fixed. json_each values stay inside SQLite; only this small
+    # JSON object reaches Python. In particular quote raw payloads, minutes,
+    # snapshot rows, factor archives and the other candidate fields are omitted.
+    def fields(prefix, names):
+        # -> keeps JSON booleans as booleans: true must never turn into a
+        # numeric reference price of 1 after crossing the SQL boundary.
+        return ','.join("'" + name + "',json(value -> '$." + prefix + name + "')"
+                        for name in names)
+    quote = fields('quote.', ('code', 'source', 'source_time', 'provider_timestamp', 'price', 'is_stale'))
+    candidate = fields('', ('code', 'name', 'status', 'decision_at', 'referencePrice'))
+    candidate += ", 'quote',json_object(" + quote + ')'
+    candidate += (", 'precisionDecision',json_object('profiles',CASE WHEN "
+        "json_type(value,'$.precisionDecision.profiles') IS NULL THEN json('{}') "
+        "ELSE json_extract(value,'$.precisionDecision.profiles') END)")
+    candidate += ", '_reviewProfile',profile"
+    branches = ["SELECT value,NULL AS profile FROM json_each(r.doc,'$." + key + "') WHERE type='object'"
+                for key in ('candidates', 'windvanes', 'precisionResearch', 'precisionWatchlist', 'evidenceInsufficient')]
+    branches.append("SELECT m.value,p.key AS profile FROM json_each(r.doc,'$.profileCandidates') p "
+                    "JOIN json_each(p.value) m WHERE p.type='array' AND m.type='object'")
+    # Older supported Python builds may ship pre-3.45 SQLite without JSONB.
+    # They still project in SQL; no fallback ever deserializes the full report.
+    document = 'jsonb(result_json)' if sqlite3.sqlite_version_info >= (3, 45, 0) else 'result_json'
+    projection = text("WITH source AS MATERIALIZED (SELECT " + document + " AS doc FROM yao_runs WHERE id=:row_id) "
+        "SELECT json_extract(r.doc,'$.as_of'), "
+        "(SELECT json_group_array(json_object(" + candidate + ")) FROM (" + ' UNION ALL '.join(branches) +
+        " LIMIT :candidate_limit)) FROM source r")
+    projected, gaps = packet['rows'], coverage['gaps']
+    try:
+        with db.get_session() as session:
+            driver = session.connection().connection.driver_connection
+            if not isinstance(driver, sqlite3.Connection):
+                gaps.append('compact_review_requires_sqlite')
+                return packet
+            # created_at/result_json are deliberately absent: their large text
+            # overflow pages are not needed to select the small run headers.
+            headers = session.execute(text('SELECT id,run_id,mode,as_of_at FROM yao_runs '
+                'ORDER BY as_of_at DESC,id DESC LIMIT :limit'), {'limit': coverage['metadataLimit']}).all()
+            coverage['metadataCount'] = len(headers)
+            eligible = []
+            for row_id, run_id, mode, raw_at in headers:
+                try:
+                    at = raw_at if isinstance(raw_at, datetime) else datetime.fromisoformat(raw_at)
+                    at = (at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at).astimezone(TZ)
+                except (TypeError, ValueError):
+                    continue
+                if mode in SCAN_MODES and at.date() == now.date() and at <= now:
+                    eligible.append((row_id, run_id, mode, at.isoformat()))
+            coverage['eligibleRunCount'] = len(eligible)
+            old_limit = driver.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_REVIEW_SOURCE_BYTES)
+            driver.set_progress_handler(lambda: int(monotonic() >= deadline), 1000)
+            try:
+                for row_id, run_id, mode, at in eligible[:MAX_REVIEW_ROWS]:
+                    if monotonic() >= deadline:
+                        gaps.append('compact_review_history_budget_exhausted')
+                        break
+                    try:
+                        saved_at, encoded = session.execute(projection, {'row_id': row_id,
+                            'candidate_limit': MAX_REVIEW_CANDIDATES + 1}).one()
+                        members = json.loads(encoded or '[]')
+                    except (SQLAlchemyError, ValueError) as error:
+                        gaps.append('compact_review_history_budget_exhausted' if monotonic() >= deadline
+                                    else 'compact_review_projection_' + type(error).__name__)
+                        continue
+                    if len(members) > MAX_REVIEW_CANDIDATES:
+                        gaps.append('compact_review_candidate_limit')
+                        # A truncated group can lose selected-profile membership;
+                        # omit this run rather than report a misleading review.
+                        continue
+                    result = {'as_of': saved_at, 'candidates': [], 'profileCandidates': {}}
+                    for member in members:
+                        profile = member.pop('_reviewProfile', None)
+                        if profile is None:
+                            result['candidates'].append(member)
+                        else:
+                            result['profileCandidates'].setdefault(profile, []).append(member)
+                    projected.append({'run_id': run_id, 'mode': mode, 'as_of': at, 'result': result})
+            finally:
+                driver.set_progress_handler(None, 0)
+                driver.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, old_limit)
+    except (SQLAlchemyError, sqlite3.Error, RuntimeError):
+        gaps.append('compact_review_history_unavailable')
+    coverage['projectedRunCount'] = len(projected)
+    coverage['omittedRunCount'] = coverage['eligibleRunCount'] - len(projected)
+    if coverage['eligibleRunCount'] > MAX_REVIEW_ROWS:
+        gaps.append('compact_review_run_limit')
+    coverage['gaps'] = list(dict.fromkeys(gaps))
+    coverage['complete'] = not coverage['gaps'] and not coverage['omittedRunCount']
+    return packet
 
 
 def _stamp(value):
@@ -95,7 +215,10 @@ def review_local_observations(db, quote_fetcher, now, history=None, *, clock=Non
     clock = clock or (lambda: now)
     if now.time() < time(15, 0):
         return {"status": "not_due", "message": "收盘后才生成当日观察复盘"}
-    rows = history if history is not None else db.list_yao_runs(limit=100, include_result=True)
+    history_packet = ({'rows': history, 'coverage': {'mode': 'provided_history', 'complete': True}}
+                      if history is not None else read_review_history(db, now))
+    rows = history_packet['rows']
+    history_coverage = history_packet['coverage']
     observations, seen, quotes = [], set(), {}
     code_counts, gap_counts, windvane_counts = Counter(), Counter(), Counter()
     for row in rows:
@@ -161,10 +284,13 @@ def review_local_observations(db, quote_fetcher, now, history=None, *, clock=Non
                 "observation_change_pct": round((review_quote["price"] / reference - 1) * 100, 4) if not gaps else None,
                 "status": "unknown" if gaps else "observed", "gaps": gaps})
     reviewed = sum(item["status"] == "observed" for item in observations)
-    review = {"version": STATE_KEY, "status": "reviewed" if observations else "no_observations",
+    review = {"version": STATE_KEY, "status": ("partial" if not history_coverage['complete'] else
+                                              "reviewed" if observations else "no_observations"),
         "reviewed_at": now.isoformat(), "observation_count": len(observations),
         "verified_count": reviewed, "unknown_count": len(observations) - reviewed,
-        "coverage": "最近100轮内当日已保存扫描；无法衡量未保存或未扫描股票的漏选",
+        "coverage": ("最近100轮内当日已保存扫描；无法衡量未保存或未扫描股票的漏选" if history_coverage['complete'] else
+                     "最近100轮元数据中的部分当日扫描；有界读取存在遗漏，详见历史覆盖"),
+        "historyCoverage": history_coverage,
         "meaning": "原观察报价至复盘报价的价格变化；非成交收益、非策略胜率",
         "weights_changed": False, "training_eligible": False,
         "summary": f"当日 {len(observations)} 条观察，{reviewed} 条报价可比，{len(observations)-reviewed} 条待补证据。",
@@ -172,8 +298,12 @@ def review_local_observations(db, quote_fetcher, now, history=None, *, clock=Non
     state = _load_state(db)
     days = {day: value for day, value in (state.get("days") or {}).items()
             if (now.date() - timedelta(days=40)).isoformat() <= day <= now.date().isoformat()}
-    days[now.date().isoformat()] = {"observations": dict(code_counts), "missing": dict(gap_counts),
-                                  "windvanes": dict(windvane_counts)}
+    if history_coverage['complete']:
+        days[now.date().isoformat()] = {"observations": dict(code_counts), "missing": dict(gap_counts),
+                                      "windvanes": dict(windvane_counts)}
+    else:
+        # Partial history must not overwrite an existing complete daily count.
+        review['remindersUpdateStatus'] = 'deferred_until_complete_history'
     days = dict(sorted(days.items())[-20:])
     db.save_yao_adaptive_state(STATE_KEY, {"version": STATE_KEY, "reviewed_at": now.isoformat(),
                                          "days": days, "latest_review": review})

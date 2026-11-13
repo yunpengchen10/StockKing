@@ -2622,6 +2622,113 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             ).scalar_one_or_none()
             return self._yao_run_to_dict(row, include_result=True) if row else None
 
+    def list_yao_scan_history(self, *, now: datetime, previous_day: date,
+                              limit: int = 100, result_limit: int = 4,
+                              budget_seconds: float = 5.0) -> Dict[str, Any]:
+        """Bound local scan history without loading full research JSON in Python.
+
+        Headers measure date coverage independently of the four small result
+        projections. Reserve two slots for the previous session so repeated
+        intraday refreshes cannot displace overnight seeds. All SQL is read-only.
+        """
+        if now.tzinfo is None:
+            raise ValueError('scan history requires a timezone-aware clock')
+        started = time.monotonic()
+        cap = max(1, min(int(result_limit), 4))
+        seconds = max(.1, min(float(budget_seconds), 5.0))
+        scan_modes = ('king_live', 'king_0920', 'king_0922', 'king_0940',
+                      'king_0955', 'king_1030', 'king_1455')
+        # Construct only static JSON paths; no caller text becomes SQL.
+        def scalar(path):
+            return "json_extract(yao_runs.result_json, '$." + path + "')"
+        def array(path, opportunity=False):
+            fields = "'code',json_extract(value,'$.code'),'name',json_extract(value,'$.name')"
+            if opportunity:
+                fields += ", 'opportunity',json_object(" + ','.join(
+                    "'" + key + "',json_extract(value,'$.opportunity." + key + "')"
+                    for key in ('version', 'grade', 'firstDetectionAt', 'firstDetectionPrice', 'detectedAt')) + ')'
+            else:
+                fields += ',' + ','.join("'" + key + "',json_extract(value,'$." + key + "')"
+                    for key in ('referencePrice', 'decision_at', 'amount', 'volume_ratio', 'turnover_rate', 'price', 'open'))
+            return ("(SELECT json_group_array(json_object(" + fields + ")) FROM "
+                    "(SELECT value FROM json_each(yao_runs.result_json,'$." + path + "') "
+                    "WHERE type='object' LIMIT 1000))")
+        top = ('generatedAt', 'as_of', 'cutoff_at', 'status', 'scanSlot')
+        parts = ["'" + key + "'," + scalar(key) for key in top]
+        parts.append("'delivery',json_object('received_at'," + scalar('delivery.received_at') + ')')
+        parts += ["'" + key + "',json(" + array(key) + ")" for key in
+                  ('candidates', 'nextDayWatchlist', 'nextDayContinuationWatchlist')]
+        channels = ["'version'," + scalar('opportunityChannels.version'),
+                    "'asOf'," + scalar('opportunityChannels.asOf')]
+        channels += ["'" + key + "',json(" + array('opportunityChannels.' + key, True) + ")"
+                     for key in ('recommendations', 'observations', 'researchCandidates')]
+        parts.append("'opportunityChannels',json_object(" + ','.join(channels) + ')')
+        parts.append("'_hasChannels',EXISTS(SELECT 1 FROM json_each(yao_runs.result_json,'$.opportunityChannels') LIMIT 1)")
+        with self.get_session() as session:
+            sqlite_version = str(session.execute(text('SELECT sqlite_version()')).scalar_one())
+            use_jsonb = tuple(int(part) for part in sqlite_version.split('.')[:3]) >= (3, 45, 0)
+            # Parse the large legacy document once, then traverse binary JSON.
+            # Repeated text JSON scans can retain several large parser trees.
+            document = 'jsonb(result_json)' if use_jsonb else 'result_json'
+            projection = ','.join(parts).replace('yao_runs.result_json', 'doc')
+            query = text('WITH compact_source AS MATERIALIZED (SELECT ' + document
+                         + ' AS doc FROM yao_runs WHERE id=:row_id) SELECT json_object('
+                         + projection + ') FROM compact_source')
+            rows = session.execute(select(YaoRun.id, YaoRun.run_id, YaoRun.mode,
+                YaoRun.status, YaoRun.as_of_at).where(YaoRun.mode.like('king\\_%', escape='\\'),
+                    YaoRun.as_of_at <= now.astimezone(timezone.utc).replace(tzinfo=None))
+                .order_by(desc(YaoRun.as_of_at), desc(YaoRun.id))
+                .limit(max(1, min(int(limit), 100)))).all()
+            def header(row):
+                return {'id': row.id, 'run_id': row.run_id, 'mode': row.mode,
+                        'status': row.status, 'as_of': row.as_of_at.isoformat(),
+                        'marketDay': row.as_of_at.replace(tzinfo=timezone.utc).astimezone(now.tzinfo).date().isoformat()}
+            headers = [header(row) for row in rows]
+            failed = {'failed', 'error', 'missed_slot', 'missed', 'not_due', 'unavailable', 'expired'}
+            eligible = [row for row in headers if row['mode'] in scan_modes and row['status'] not in failed]
+            selected = []
+            # The previous session can lie beyond 100 intraday refresh headers.
+            # Its independent indexed metadata lookup still reads no payloads.
+            previous_start = datetime.fromisoformat(str(previous_day)[:10]).replace(tzinfo=now.tzinfo)
+            prior_rows = session.execute(select(YaoRun.id, YaoRun.run_id, YaoRun.mode,
+                YaoRun.status, YaoRun.as_of_at).where(YaoRun.mode.in_(scan_modes), ~YaoRun.status.in_(failed),
+                    YaoRun.as_of_at >= previous_start.astimezone(timezone.utc).replace(tzinfo=None),
+                    YaoRun.as_of_at < (previous_start+timedelta(days=1)).astimezone(timezone.utc).replace(tzinfo=None))
+                .order_by(desc(YaoRun.as_of_at), desc(YaoRun.id)).limit(2)).all()
+            # Interleave dates so even a tight I/O budget retains a prior-day seed.
+            groups = [[row for row in eligible if row['marketDay'] == now.date().isoformat()],
+                      [header(row) for row in prior_rows]]
+            for index in range(2):
+                for group in groups:
+                    if index < len(group) and len(selected) < cap:
+                        selected.append(group[index])
+            projected, gaps, longest_query = [], [], 0.0
+            for row in selected:
+                if time.monotonic()-started >= seconds:
+                    gaps.append('compact_history_budget_exhausted')
+                    break
+                query_started = time.monotonic()
+                driver = session.connection().connection.driver_connection
+                driver.set_progress_handler(lambda: int(time.monotonic()-started >= seconds), 1000)
+                try:
+                    encoded = session.execute(query, {'row_id': row['id']}).scalar_one_or_none()
+                    result = json.loads(encoded) if encoded else {}
+                except (ValueError, OperationalError):
+                    gaps.append('compact_history_budget_exhausted' if time.monotonic()-started >= seconds
+                                else 'compact_history_projection_unavailable')
+                    continue
+                finally:
+                    driver.set_progress_handler(None, 0)
+                    longest_query = max(longest_query, time.monotonic()-query_started)
+                if not result.pop('_hasChannels', False):
+                    result.pop('opportunityChannels', None)
+                projected.append({**row, 'result': result})
+            projected.sort(key=lambda row: (row['as_of'], row['id']), reverse=True)
+        return {'headers': headers, 'rows': projected,
+                'gaps': list(dict.fromkeys(gaps)), 'resultLimit': cap,
+                'longestQueryMs': round(longest_query*1000),
+                'elapsedMs': round((time.monotonic()-started)*1000)}
+
     def list_yao_run_headers(
         self, *, modes: Sequence[str], statuses: Sequence[str], limit: int = 100,
     ) -> List[Dict[str, Any]]:

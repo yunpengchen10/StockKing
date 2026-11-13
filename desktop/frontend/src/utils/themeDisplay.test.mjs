@@ -47,6 +47,18 @@ test('condition claims require matching original recommendations and current evi
   assert.equal(marketBriefDisplay(raw, now + 3600000).focusStocks[0].conditionsMet, false)
 })
 
+test('a freshly updated lunch reference remains non-realtime and cannot claim current conditions', () => {
+  const lunchNow = Date.parse('2026-11-13T12:00:00+08:00')
+  const raw = brief()
+  Object.assign(raw.focusStocks[0], { sourceTime: '2026-11-13T11:59:50+08:00', quoteFreshness: 'session_reference',
+    status: 'conditions_met', ruleRecommendation: true })
+  const shown = marketBriefDisplay(raw, lunchNow, false, [{ pick: { code: '600001' }, isFlowStrategy: true, current: true }])
+  assert.equal(shown.currentQuotes, false)
+  assert.equal(shown.focusStocks[0].current, false)
+  assert.equal(shown.focusStocks[0].conditionsMet, false)
+  assert.equal(shown.focusStocks[0].quoteLabel, '已保存交易时段参考价 · 非实时')
+})
+
 test('market brief rejects invalid and future quotes rather than filling prices or borrowing legacy recommendations', () => {
   const raw = brief(), valid = raw.focusStocks[0]
   raw.focusStocks = [{ ...valid, code: '600002', price: null }, { ...valid, code: '600003', source: '' },

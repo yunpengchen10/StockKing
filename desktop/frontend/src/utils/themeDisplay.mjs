@@ -144,7 +144,7 @@ export function marketBriefDisplay(brief, now, historical = false, opportunityCa
     if (usingBrief && !quoteVerified) { invalidCount++; return [] }
     seen.add(key)
     const existing = known.get(key)
-    const current = !historical && quoteVerified && age <= 30000
+    const current = !historical && quoteVerified && age <= 30000 && row.quoteFreshness !== 'session_reference'
     const conditionsMet = row.status === 'conditions_met' && row.ruleRecommendation === true && existing?.current === true && current
     const savedConditions = row.status === 'conditions_met' && row.ruleRecommendation === true && existing?.isFlowStrategy === true
     return [{ ...row, code, name: text(row.name) || code, price: quoteVerified ? price : null,

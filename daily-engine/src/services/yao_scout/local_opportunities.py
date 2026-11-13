@@ -59,6 +59,30 @@ class LocalOpportunityService(DailyOpportunityService):
         if self.progress_callback:
             self.progress_callback(progress, message)
 
+    def _history(self):
+        """Local scans consume bounded seeds, never a hundred full market runs."""
+        from .premarket import previous_session
+        now = self.clock()
+        reader = getattr(self.db, 'list_yao_scan_history', None)
+        if callable(reader):
+            packet = reader(now=now, previous_day=previous_session(now), limit=100,
+                            result_limit=4, budget_seconds=5)
+            headers, rows = packet['headers'], packet['rows']
+            gaps = packet.get('gaps') or []
+        else:
+            # Small legacy adapters/test doubles lack the projection API. Never
+            # issue the historical 100-result query through this fallback.
+            headers = self.db.list_yao_runs(limit=100, include_result=False)
+            rows = self.db.list_yao_runs(limit=4, include_result=True)
+            rows = [row for row in rows if str(row.get('mode', '')).startswith('king_')]
+            gaps = ['legacy_history_adapter_limited_to_four_results']
+        days = {row.get('marketDay') or str(row.get('as_of') or '')[:10]
+                for row in headers if str(row.get('mode', '')).startswith('king_') and row.get('as_of')}
+        return rows, {'targetTradingDays': 20, 'availableTradingDays': min(20, len(days)),
+            'coverage': '最近100轮仅统计日期；当日与前交易日各至多2轮紧凑种子，不读取完整研究证据',
+            'status': 'ready' if len(days) >= 20 else 'insufficient_history',
+            'projectedRunCount': len(rows), 'maximumProjectedRuns': 4, 'gaps': gaps}
+
     def _observe_market_emotion(self, frame, received_at):
         from .research_factors import MarketEmotionArchive
         try:
