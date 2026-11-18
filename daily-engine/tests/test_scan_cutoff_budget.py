@@ -151,6 +151,40 @@ def test_next_day_model_rejection_cannot_be_filled_by_rule_winner(monkeypatch, t
     assert all(not row.get('nextDaySignal',{}).get('selected') for row in result['controls'])
 
 
+@pytest.mark.parametrize('opened,delay,selected', [(False, 0, True), (True, 0, True),
+                                                     (False, 3, False), (True, 31, False)])
+def test_next_day_scan_freezes_queue_and_book_at_publication(monkeypatch, tmp_path, opened, delay, selected):
+    from src.services.yao_scout import primary_readiness
+    service, tick, _, saved = make_service(monkeypatch, NOW, tmp_path)
+    original_quote = service.quote_fetcher
+    def quote(code):
+        item = original_quote(code)
+        item['order_book']['source_time'] = (tick[0]-timedelta(seconds=29)).isoformat()
+        if opened:
+            item.update(price=10.69, high=10.78, change_pct=(10.69/9.8-1)*100)
+            item['order_book']['asks'] = [{'price': 10.70, 'volume_shares': 1000}]
+        return item
+    service.quote_fetcher = quote
+    readiness = primary_readiness.read_primary_readiness
+    def slow_tail(*args, **kwargs):
+        result = readiness(*args, **kwargs)
+        tick[0] = NOW+timedelta(seconds=delay)
+        return result
+    monkeypatch.setattr(primary_readiness, 'read_primary_readiness', slow_tail)
+    result = service.run('live', official=False)
+    key = 'nextDayContinuationWatchlist' if opened else 'nextDayWatchlist'
+    other = 'nextDayWatchlist' if opened else 'nextDayContinuationWatchlist'
+    assert bool(result[key]) is selected
+    assert not result[other]
+    signal = result['controls'][0]['nextDaySignal']
+    assert signal['publishedAt'] == result['generatedAt']
+    assert signal['sourceUsableAtCompletion'] is selected
+    assert signal['selected'] is selected
+    if selected:
+        assert result[key][0]['nextDaySignal']['limitEntry']['status'] == ('touched_limit' if opened else 'pre_limit')
+    assert saved[-1][key] == result[key]
+
+
 def _identity_bars(code, at, *, full_day=False):
     identity = {'status':'provider_reply_checked','requested_code':code,'response_code':code,
         'requested_market':1,'response_market':1,'period':'1','page_cursor_checked':True}

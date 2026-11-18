@@ -7,6 +7,7 @@ the 60-session history required for the separate emotion percentile factor.
 from datetime import datetime
 
 from .daily_opportunities import finite
+from .limit_entry import assess_limit_entry
 from .research_policy import DEFAULT_PARAMETERS
 
 VERSION = 'primary-evidence-20261015-v2'
@@ -17,7 +18,7 @@ def policy_contract():
             'requires': ['verified_minute_lineage', 'fresh_aligned_minute_sector_fund',
                          'minute_structure', 'relative_volume', 'sector_resonance',
                          'fund_direction', 'fresh_whole_market_breadth',
-                         'market_risk_budget', 'profile_risk_pass'],
+                         'market_risk_budget', 'profile_risk_pass', 'verified_pre_limit_offer'],
             'modelAdmission': {'requiredTask': 'entry_today_exit_next_session',
                                'requiresValidatedNetProfitHead': True, 'morningDirectionRole': 'research_only'},
             'weakMarketAdvancingPctThreshold': 50,
@@ -60,6 +61,10 @@ def evaluate_primary_admission(candidate, now=None):
         elif checks.get(check) is not True:
             adverse.append(check + '_not_confirmed')
     quote = candidate.get('quote') or {}
+    entry = assess_limit_entry(candidate.get('code'), quote, now)
+    if not entry['eligible']:
+        reasons = adverse if entry['status'] in ('at_limit', 'touched_limit') else missing
+        reasons.append('pre_limit_entry_' + entry['status'])
     active = finite(quote.get('active_buy_share_pct'))
     if (not quote.get('active_flow_source') or
             not fresh(_at(quote.get('active_flow_as_of')), DEFAULT_PARAMETERS['freshness']['quoteSeconds']) or
@@ -92,7 +97,7 @@ def evaluate_primary_admission(candidate, now=None):
     else:
         market_risk = 'hot' if market.get('regime') == 'hot' else 'normal'
     return {'version': VERSION, 'eligible': not missing and not adverse,
-            'reasons': adverse, 'missingReasons': missing,
+            'reasons': adverse, 'missingReasons': missing, 'limitEntry': entry,
             'marketRiskState': market_risk, 'warnings': warnings,
             'evaluatedAt': now.isoformat() if now else None,
             'marketAdvancingPct': breadth, 'validationStatus': 'rules_unvalidated'}

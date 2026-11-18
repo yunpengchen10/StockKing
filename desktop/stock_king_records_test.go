@@ -16,13 +16,13 @@ func (f recordReadTransport) RoundTrip(request *http.Request) (*http.Response, e
 	return f(request)
 }
 
-func TestRecommendationReadIsCompactAndHasShortDeadline(t *testing.T) {
+func TestRecommendationReadExcludesControlsAndHasShortDeadline(t *testing.T) {
 	for _, includeControls := range []bool{false, true} {
 		app := &App{ctx: context.Background(), sidecar: &SidecarManager{
 			status: EngineStatus{Ready: true}, port: 12345, token: "test-token",
 			client: &http.Client{Transport: recordReadTransport(func(request *http.Request) (*http.Response, error) {
 				query := request.URL.Query()
-				if query.Get("compact") != "true" || query.Get("include_controls") != map[bool]string{false: "false", true: "true"}[includeControls] {
+				if query.Has("include_controls") || query.Has("scope") {
 					t.Fatalf("invalid record query: %v", query)
 				}
 				if query.Get("version") != "v1.2 + fixed" || query.Get("symbol") != "600001" || query.Get("date") != "2026-10-12" || query.Get("run_id") != "king-live-test" {
@@ -58,5 +58,25 @@ func TestRecordReadsRespectParentCancellation(t *testing.T) {
 		t.Fatal("cancelled review read should return an error")
 	} else if _, ok := err.(*url.Error); !ok {
 		t.Fatalf("unexpected transport error: %T", err)
+	}
+}
+
+func TestDisplayedPicksAllowsColdSnapshotRecovery(t *testing.T) {
+	app := &App{ctx: context.Background(), sidecar: &SidecarManager{
+		status: EngineStatus{Ready: true}, port: 12345, token: "test-token",
+		client: &http.Client{Transport: recordReadTransport(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodGet || request.URL.Path != "/api/v1/stock-king/picks/display" {
+				t.Fatalf("unexpected display request: %s %s", request.Method, request.URL.Path)
+			}
+			deadline, ok := request.Context().Deadline()
+			if !ok || time.Until(deadline) > 45*time.Second || time.Until(deadline) < 44*time.Second {
+				t.Fatal("display read must allow 45 seconds for cold snapshot recovery")
+			}
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"displayRunId":"scheduled-latest"}`))}, nil
+		})},
+	}}
+	result, err := app.GetDisplayedKingPicks()
+	if err != nil || result["displayRunId"] != "scheduled-latest" {
+		t.Fatalf("display read failed: %v %v", result, err)
 	}
 }

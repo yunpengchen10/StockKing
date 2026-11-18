@@ -548,3 +548,63 @@ def test_lunch_watch_freezes_explicit_session_reference_without_retiming_it(stor
     assert observed['referenceQuote']['source_time'] == source_at.isoformat()
     assert observed['quoteFreshness'] == 'session_reference'
     assert observed['ruleRecommendationAtDecision'] is False
+
+
+def test_post_close_retry_uses_frozen_day_and_records_actual_knowledge_time(store):
+    store.save_scan(brief_scan(), DAY)
+    original = DAY.replace(hour=15, minute=30)
+    # The final closing auction has not finished at 14:59.
+    partial = store.review(original, {CODES[0]: quote(CODES[0], DAY.replace(hour=14, minute=59), 12)})
+    assert partial['marketBriefFeedback']['observedCount'] == 0
+    later = DAY + timedelta(days=1)
+    store.save_scan(brief_scan(later), later)
+    day = DAY.date().isoformat()
+    def history(code, days, cutoff):
+        assert code == CODES[0] and days == {day} and cutoff == later
+        return {day: dict(kind='daily_ohlc', code=code, day=day, source='unadjusted fixture',
+                          price_basis='unadjusted', complete=True, observed_at=later.isoformat(),
+                          open=10, high=12, low=9, close=11)}
+    finished = later + timedelta(seconds=2)
+    report, = store.retry_daily_closes(later, clock=lambda: finished, daily_fetcher=history)
+    brief = report['marketBriefFeedback']
+    row, = brief['rows']
+    assert brief['sourceDay'] == day and brief['asOf'] == finished.isoformat()
+    assert row['referencePrice'] == 10 and row['closePrice'] == 11 and row['changePct'] == 10
+    assert row['closeQuote']['source_time'] is None
+    assert row['closeQuote']['observed_at'] == later.isoformat()
+    assert row['closeQuote']['close_at'] == DAY.replace(hour=15, minute=0).isoformat()
+    assert store.read_context(later, include_today=True)['marketBriefFeedback']['observedCount'] == 0
+    assert store.read_context(finished)['marketBriefFeedback']['observedCount'] == 1
+    assert store.retry_daily_closes(finished, clock=lambda: finished, daily_fetcher=history) == []
+
+
+@pytest.mark.parametrize('patch', [{'complete': False}, {'day': '2026-11-10'}, {'code': CODES[1]},
+    {'price_basis': 'forward_adjusted'}, {'corporate_action': True}, {'low': 20}, {'observed_at': DAY.isoformat()},
+    {'observed_at': (DAY+timedelta(days=3)).isoformat()}, {'kind': 'unknown'}])
+def test_retry_rejects_unverified_daily_evidence(store, patch):
+    store.save_scan(brief_scan(), DAY)
+    day = DAY.date().isoformat()
+    checked = DAY + timedelta(days=1)
+    anchor = dict(kind='daily_ohlc', code=CODES[0], day=day, source='fixture', complete=True,
+                  price_basis='unadjusted', observed_at=checked.isoformat(), open=10, high=12, low=9, close=11)
+    report, = store.retry_daily_closes(checked, clock=lambda: checked,
+        daily_fetcher=lambda *args: {day: {**anchor, **patch}})
+    row, = report['marketBriefFeedback']['rows']
+    assert row['closeQuote'] is None and row['gaps']
+    assert store.pending_codes(checked, session=DAY.date()) == [CODES[0]]
+
+
+def test_ledger_reads_only_its_observation_day_close_known_at_request_time(store):
+    store.save_scan(brief_scan(), DAY)
+    checked = DAY.replace(hour=15, minute=30)
+    store.review(checked, close_quotes())
+    other_day = DAY + timedelta(days=1)
+    rows = [{'code': CODES[0], 'marketBriefFocus': True} for _ in range(2)]
+    records = {'items': [{'tradingDay': at.date().isoformat(), 'signals': [row]}
+                         for at, row in zip((DAY, other_day), rows)]}
+    store.record_close_reviews(records, checked - timedelta(seconds=1))
+    assert all('focusCloseReview' not in row for row in rows)
+    store.record_close_reviews(records, other_day)
+    assert rows[0]['focusCloseReview']['closePrice'] == 9.8
+    assert rows[0]['focusCloseReview']['reviewedAt'] == checked.isoformat()
+    assert 'focusCloseReview' not in rows[1]

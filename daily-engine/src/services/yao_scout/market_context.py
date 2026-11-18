@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta
 import re
 
+from .limit_entry import assess_limit_entry
 from .theme_rotation import _at, _number, _invalid_quote_evidence
 
 VERSION = 'market-brief-v1'
@@ -153,7 +154,8 @@ def _quote(raw, code, now):
         return None
     return {'code': code, 'name': str(quote.get('name') or raw.get('name') or ''), 'price': price,
             'changePct': change, 'sourceTime': stamp.isoformat(), 'source': quote['source'],
-            'quoteFreshness': 'live' if current else 'session_reference'}
+            'quoteFreshness': 'live' if current else 'session_reference',
+            'limitEntry': assess_limit_entry(code, quote, now)}
 
 
 def _funds(packet, names, now):
@@ -202,6 +204,12 @@ def build_market_brief(packet, quotes, now, *, opportunities=None, previous_day=
     channels = opportunities or {}
     recommended = {row['code']: row for row in channels.get('recommendations') or []}
     assessments = {row['code']: row for row in channels.get('researchCandidates') or []}
+    def focus_priority(row):
+        state = row['limitEntry']
+        if state.get('eligible'):
+            return 0 if row['code'] in recommended else 1
+        return 3 if state.get('status') in ('at_limit', 'touched_limit') else 2
+
     choices = []
     for event in events:
         themes = [row for row in event.get('themes') or [] if isinstance(row, dict)]
@@ -221,7 +229,9 @@ def build_market_brief(packet, quotes, now, *, opportunities=None, previous_day=
             if quote and not re.search(r'ST|退|整理|停牌', quote['name'], re.I):
                 linked.append({**quote, 'name': quote['name'] or stock.get('stockName') or code,
                                'reason': str(stock.get('reason') or event['title'])})
-        linked.sort(key=lambda row: (-row['changePct'], row['code']))
+        # Select researchable names before market leaders. Keep the source event's
+        # ordering within each class; a larger gain alone is no entry signal.
+        linked.sort(key=focus_priority)
         positive = [row for row in linked if row['changePct'] > 0]
         if not positive:
             continue
@@ -235,7 +245,7 @@ def build_market_brief(packet, quotes, now, *, opportunities=None, previous_day=
             'quoteCoverage': {'validCount': len(linked), 'expectedCount': len(seen)},
             'funds': _funds(packet, names, now), 'news': _news(packet, [*names, *(row['name'] for row in linked)], now)}
         choices.append((mainline, positive))
-    choices.sort(key=lambda pair: (-len(pair[1]), -(pair[0]['heat'] or 0), -pair[1][0]['changePct'], pair[0]['id']))
+    choices.sort(key=lambda pair: (-len(pair[1]), -(pair[0]['heat'] or 0), pair[0]['id']))
     used, signatures = set(), set()
     for mainline, linked in choices:
         fingerprint = tuple(sorted(mainline['leaders']))
@@ -245,14 +255,12 @@ def build_market_brief(packet, quotes, now, *, opportunities=None, previous_day=
         mainline['rank'] = len(result['mainlines'])+1
         result['mainlines'].append(mainline)
         for row in [row for row in linked if row['code'] not in used][:2]:
-            if len(result['focusStocks']) >= 5:
-                break
             used.add(row['code'])
             assessment = (assessments.get(row['code']) or {}).get('opportunity') or {}
             recommendation = recommended.get(row['code']) or {}
             entry = recommendation.get('opportunity') or {}
             assessed_at = _at(channels.get('asOf'))
-            satisfied = (recommendation.get('ruleRecommendation') is True and entry.get('grade') == 'F-A'
+            satisfied = (row['limitEntry'].get('eligible') is True and recommendation.get('ruleRecommendation') is True and entry.get('grade') == 'F-A'
                          and not entry.get('hardVetoes') and not entry.get('failedConditions')
                          and assessed_at is not None and 0 <= (now-assessed_at).total_seconds() <= 30
                          and row['quoteFreshness'] == 'live' and now.weekday() < 5
@@ -260,6 +268,8 @@ def build_market_brief(packet, quotes, now, *, opportunities=None, previous_day=
             pending = list(assessment.get('missing') or [])[:3]
             if not satisfied and not pending:
                 pending = ['资金持续性与买点仍待确认']
+            if row['limitEntry']['status'] == 'unavailable':
+                pending.insert(0, row['limitEntry']['reason'])
             risks = list(dict.fromkeys([*(assessment.get('hardVetoes') or []), *(assessment.get('counterEvidence') or [])]))[:3]
             if row['changePct'] >= 8:
                 risks.insert(0, '当日涨幅较大，等待回落或量价确认，不追高')
@@ -273,6 +283,7 @@ def build_market_brief(packet, quotes, now, *, opportunities=None, previous_day=
         if len(result['mainlines']) >= 3:
             break
     if result['focusStocks']:
+        result['focusStocks'] = sorted(result['focusStocks'], key=focus_priority)[:5]
         result['status'] = 'observed'
         result['summary'] = f"跟踪{len(result['mainlines'])}条题材线索、{len(result['focusStocks'])}只重点股票；逐股列出依据、待确认条件和风险。"
     if not events:

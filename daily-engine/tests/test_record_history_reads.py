@@ -86,3 +86,35 @@ def test_compact_lists_share_one_scan_read_and_keep_unknown_nested_evidence(tmp_
     scan_reads = [sql for sql in calls if 'scan_json' in sql]
     assert len(scan_reads) == 1, 'one page row must not repeatedly read/parse its large universe snapshot'
     assert service.db_path.read_bytes() == before
+
+
+def test_backfilled_and_new_records_have_identical_search_and_compact_evidence(tmp_path):
+    service = SignalLearningService(tmp_path)
+    with service._connect() as db:
+        insert_run(db, 'old', '2026-10-27', {'runId': 'same', 'marketBrief': {
+            'asOf': '2026-10-27T10:30:00+08:00', 'focusStocks': [{'code': '600003', 'price': 3.1}]}})
+        insert_run(db, 'new', '2026-10-28', {'run_id': 'same',
+            'nextDayWatchlist': [{'code': '600003', 'referencePrice': 2.5,
+                                 'nextDaySignal': {'selected': True, 'unverified': None}}]})
+        originals = list(db.execute('SELECT run_id,scan_json FROM signal_runs ORDER BY run_id'))
+    base = {'compact': True, 'include_controls': False}
+    queries = [{**base, **args} for args in ({}, {'run_id': 'same'}, {'symbol': '600003'},
+            {'run_id': 'same', 'symbol': '600009'}, {'run_id': 'old', 'date': '2026-10-27'})]
+    expected = [service.history(query) for query in queries]
+    assert service.backfill_record_history(limit=1) == {'indexed': 1, 'failed': []}
+    assert [service.history(query) for query in queries] == expected  # index and legacy runs coexist
+    assert service.backfill_record_history() == {'indexed': 1, 'failed': []}
+    assert service.backfill_record_history() == {'indexed': 0, 'failed': []}
+    read = readonly_service(service.db_path)
+    connect, calls = read._connect, []
+    def traced():
+        db = connect()
+        db.set_trace_callback(calls.append)
+        return db
+    read._connect = traced
+    assert [read.history(query) for query in queries] == expected
+    assert not any('scan_json' in sql for sql in calls)
+    with service._connect() as db:
+        assert list(db.execute('SELECT run_id,scan_json FROM signal_runs ORDER BY run_id')) == originals
+        db.execute("UPDATE signal_runs SET scan_json='{}' WHERE run_id='old'")
+    assert [r['runId'] for r in service.history({**base, 'run_id': 'same'})['items']] == ['new']

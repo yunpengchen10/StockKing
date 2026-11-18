@@ -119,6 +119,18 @@ export function signalPriceComparison(signal = {}, quote = null) {
   const delta = Math.abs(difference) < 1e-10 ? 0 : difference
   return { ...result, available: true, delta, percent: delta / baseline, direction: delta > 0 ? 'up' : delta < 0 ? 'down' : 'flat' }
 }
+export function publicationPriceComparison(stock = {}, publication = {}, quote = null) {
+  // Prices belong to their provider timestamp. Saving or restoring a publication
+  // later does not move that price's comparison baseline.
+  let referenceAt = stock.sourceTime
+  if (evidenceTime(referenceAt) === null) {
+    // A dated completed-session close is usable from that session's close.
+    // This boundary is used only for comparison, never presented as quote time.
+    referenceAt = /^\d{4}-\d{2}-\d{2}$/.test(stock.sourceTime || '') && /收盘/.test(stock.basisLabel || '')
+      ? stock.sourceTime + 'T15:00:00+08:00' : publication.asOf
+  }
+  return signalPriceComparison({ code: stock.code, signalPrice: stock.price, decisionAt: referenceAt }, quote)
+}
 export function ledgerSigned(value, digits = 2) {
   if (!present(value) || !Number.isFinite(Number(value))) return '—'
   const rounded = Number(Number(value).toFixed(digits))
@@ -196,12 +208,42 @@ export function isOpportunitySelection(signal = {}) {
 }
 // The current view is tied to the displayed, persisted scan. A missing run must
 // never silently fall back to unrelated history, including an empty opportunity list.
-export function recordDisplayPayload(payload = {}, { scope = 'history', runId = '', opportunityOnly = false } = {}) {
+export function recordDisplayPayload(payload = {}, { scope = 'history', runId = '', opportunityOnly = false, displayedStocks = null } = {}) {
   if (scope !== 'current') return payload
   if (!runId) return { ...payload, items: [] }
-  return { ...payload, items: flattenSignals(payload).filter(signal => (signal.displayRunId || signal.runId) === runId
-    && (!opportunityOnly || isOpportunitySelection(signal))) }
+  const matching = flattenSignals(payload).filter(signal => (signal.displayRunId || signal.runId) === runId)
+  if (!Array.isArray(displayedStocks)) return { ...payload, items: matching.filter(signal => !opportunityOnly || isOpportunitySelection(signal)) }
+  const displayed = new Map(displayedStocks.map(row => [row.code, row]))
+  return { ...payload, items: matching.filter(signal => {
+    const kinds = displayed.get(recordQuoteCode(signal.code))?.kinds || []
+    return (kinds.includes('focus') && isFocusObservation(signal))
+      || (kinds.includes('first_board') && isNextDaySelection(signal) && nextDaySignalOf(signal)?.queue === 'first_board')
+      || (kinds.includes('opportunity') && isOpportunitySelection(signal))
+      || (kinds.includes('primary') && (signal.selected === true || isDailySelection(signal)))
+  }).map(signal => ({ ...signal, displayEntry: displayed.get(recordQuoteCode(signal.code))?.limitEntry })) }
 }
+export function isFocusObservation(signal = {}) {
+  return signal.marketBriefFocus === true || signal.recommendationKinds?.includes('market_brief_focus') === true
+}
+
+export function displayedRecordStocks(focusStocks, opportunityCards, primaryPicks, firstBoardPicks = []) {
+  const stocks = new Map()
+  function add(pick, kind) {
+    const code = recordQuoteCode(pick?.symbol?.code || pick?.code)
+    if (!code) return
+    if (!stocks.has(code)) stocks.set(code, { code, name: pick.symbol?.name || pick.name || code, kinds: [] })
+    const evidence = pick.limitEntry || pick.nextDaySignal?.limitEntry
+    if (evidence) stocks.get(code).limitEntry = evidence
+    const kinds = stocks.get(code).kinds
+    if (!kinds.includes(kind)) kinds.push(kind)
+  }
+  for (const stock of focusStocks) add(stock, 'focus')
+  for (const pick of firstBoardPicks) add(pick, 'first_board')
+  for (const card of opportunityCards) add(card.pick, 'opportunity')
+  for (const pick of primaryPicks) add(pick, 'primary')
+  return [...stocks.values()]
+}
+
 export function nextDayQueueLabel(signal = {}) {
   return signal.queue === 'first_board' ? '未触板潜伏' : signal.queue === 'continuation' ? '已触板延续' : '次日观察（旧版未分队列）'
 }
@@ -304,7 +346,15 @@ export function signalSelectionLabel(signal = {}) {
     : candidate.opportunity?.channel === 'M' ? '主升确认 · 机会研究' : '机会研究推荐'
   const state = isDailyPrimaryPick(candidate) ? candidate.dailyCurrentSignalState || candidate.dailySignal?.currentSignalState : candidate.currentSignalState
   if (['invalidated', 'withdrawn'].includes(state)) return primaryRecommendationState(candidate)
+  if (isFocusObservation(signal) && !signal.selected && !isDailySelection(signal)) {
+    const limit = signal.displayEntry || candidate.marketBriefFocus?.limitEntry
+    if (limit?.status === 'at_limit') return '已涨停 · 题材风向标'
+    if (limit?.status === 'touched_limit') return '曾触板 · 题材风向标'
+    if (nextDay?.queue !== 'first_board' || !isNextDaySelection(signal)) return '重点观察'
+  }
   if (isDailyObservationPick(candidate)) return '日线观察'
+  if (nextDay?.queue === 'first_board' && isNextDaySelection(signal) && !isDailySelection(signal)
+      && !signal.selected && (nextDay.limitEntry || signal.displayEntry)?.eligible === true) return '涨停前观察'
   return isDailySelection(signal) ? '日线条件推荐' : signal.selected === true ? '交易条件候选' : isNextDaySelection(signal)
     ? nextDay?.queue ? `${nextDayQueueLabel(nextDay)}观察` : '次日观察' : '对照'
 }
@@ -318,7 +368,7 @@ export function groupSignals(payload, { includeControls = false } = {}) {
   for (const signal of flattenSignals(payload)) {
     const candidate = signal.snapshot || signal.features?.candidate || signal.candidate || signal.features || signal
     const wasPrimary = ['invalidated', 'withdrawn'].includes(candidate.currentSignalState || candidate.dailyCurrentSignalState || candidate.dailySignal?.currentSignalState)
-    if (!includeControls && signal.selected !== true && !isOpportunitySelection(signal) && !isDailySelection(signal) && !isNextDaySelection(signal) && !wasPrimary) continue
+    if (!includeControls && !isFocusObservation(signal) && signal.selected !== true && !isOpportunitySelection(signal) && !isDailySelection(signal) && !isNextDaySelection(signal) && !wasPrimary) continue
     const signalId = signal.signalId || signal.signal_id
     if (signalId && seen.has(signalId)) continue
     if (signalId) seen.add(signalId)

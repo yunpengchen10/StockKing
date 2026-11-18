@@ -91,11 +91,30 @@ def _quote(raw, code, now, *, close=False):
                 else now - timedelta(seconds=300))
     quote, gaps = validate_quote(raw, code, now, earliest, post_close_reference=close)
     stamp = _stamp(quote.get('source_time'))
-    if close and stamp and not time(14, 57) <= stamp.time() <= time(15, 5):
-        gaps.append('收盘源时间不在14:57至15:05')
+    if close and stamp and not time(15) <= stamp.time() <= time(15, 5):
+        gaps.append('缺少15:00至15:05的收盘报价')
     if raw.get('conflict') is True:
         gaps.append('来源标记冲突')
     return {**quote, 'code': code}, list(dict.fromkeys(gaps))
+
+
+def _close_evidence(raw, code, day, now):
+    """Distinguish the trading session end from a provider's actual quote time."""
+    end = datetime.combine(day, time(15), TZ)
+    if isinstance(raw, dict) and raw.get('kind') == 'daily_ohlc':
+        if raw.get('missing') is True:
+            return {}, ['本次查询未取得对应交易日的未复权日K']
+        from .history_preparation import validated_daily_anchor
+        if validated_daily_anchor(raw, code, day, now):
+            return {'code': code, 'price': float(raw['close']), 'source': raw['source'],
+                    'source_time': raw.get('source_time'), 'close_at': end.isoformat(),
+                    'observed_at': raw['observed_at'], 'evidence': 'completed_unadjusted_daily_bar',
+                    'day': day.isoformat()}, []
+        return {}, ['日K代码、日期、复权口径、价格或采集时间未通过核验']
+    # Bound live quotes by the observation's session, even when retrying later.
+    session_end = min(now, datetime.combine(day, time(23, 59, 59), TZ))
+    quote, gaps = _quote(raw, code, session_end, close=True)
+    return {**quote, 'close_at': quote['source_time'], 'evidence': 'post_close_quote'}, gaps
 
 
 class ThemeFeedbackStore:
@@ -210,8 +229,8 @@ class ThemeFeedbackStore:
             count += 1
         return {'status': 'saved', 'watchCount': count}
 
-    def _review_brief(self, db, now, quotes):
-        day, at = now.date().isoformat(), now.isoformat()
+    def _review_brief(self, db, now, quotes, session):
+        day, at = session.isoformat(), now.isoformat()
         references = [json.loads(row['payload']) for row in db.execute(
             'SELECT payload FROM brief_references WHERE day=? AND known_at<=? ORDER BY code', (day, at))]
         if not references:
@@ -221,8 +240,8 @@ class ThemeFeedbackStore:
             code = row['code']
             known = _stamp(row.get('referenceKnownAt'))
             reference = row.get('referenceQuote') if known and known <= now else None
-            close, gaps = _quote(quotes.get(code), code, now, close=True)
-            if reference and not gaps and _stamp(close['source_time']) >= _stamp(row['referenceAt']):
+            close, gaps = _close_evidence(quotes.get(code), code, session, now)
+            if reference and not gaps and _stamp(close['close_at']) >= _stamp(row['referenceAt']):
                 db.execute('INSERT OR IGNORE INTO brief_closes VALUES(?,?,?,?)', (day, code, at, _json(close)))
             settled = db.execute('SELECT payload FROM brief_closes WHERE day=? AND code=? AND known_at<=?', (day, code, at)).fetchone()
             close = json.loads(settled['payload']) if settled and reference else None
@@ -244,6 +263,33 @@ class ThemeFeedbackStore:
             summary=f'市场重点观察{len(items)}只，已核验{observed}只收盘价格变化，{len(items)-observed}只待补证据；不计入规则精选收益。')
         db.execute('INSERT OR REPLACE INTO brief_feedback VALUES(?,?,?)', (day, at, _json(result)))
         return result
+
+    def record_close_reviews(self, records, now):
+        """Attach saved daily feedback to the matching observation day and code."""
+        targets = defaultdict(list)
+        for run in records.get('items', []):
+            for signal in run.get('signals', []):
+                if signal.get('marketBriefFocus') and run.get('tradingDay'):
+                    targets[run['tradingDay']].append(signal)
+        if not targets or not self.path.is_file():
+            return
+        try:
+            with self._db(write=False) as db:
+                if not self._has_brief_tables(db):
+                    return
+                for day, signals in targets.items():
+                    saved = db.execute('SELECT as_of,payload FROM brief_feedback WHERE day=? AND as_of<=? '
+                                       'ORDER BY as_of DESC LIMIT 1', (day, _now(now).isoformat())).fetchone()
+                    if not saved:
+                        continue
+                    rows = {row['code']: row for row in json.loads(saved['payload']).get('rows', [])}
+                    for signal in signals:
+                        if row := rows.get(signal['code']):
+                            signal['focusCloseReview'] = {key: row.get(key) for key in
+                                ('status', 'gaps', 'closeQuote', 'closePrice', 'referencePrice', 'referenceAt', 'changePct')}
+                            signal['focusCloseReview']['reviewedAt'] = saved['as_of']
+        except (sqlite3.Error, ValueError, KeyError):
+            records['focusReviewError'] = '重点观察的收盘核验暂时无法读取'
 
     def _read_brief(self, db, now, include_today):
         if not self._has_brief_tables(db):
@@ -334,10 +380,12 @@ class ThemeFeedbackStore:
                 'universeCount': len(frozen), 'validReferenceCount': sum(not r['gaps'] for r in frozen),
                 'marketBriefArchive': brief_archive, 'gaps': gaps}
 
-    def pending_codes(self, now, limit=500):
-        """Only today's references can settle with today's current quotes."""
+    def pending_codes(self, now, limit=500, *, session=None):
+        """Look up unresolved frozen references for one already closed session."""
         now = _now(now)
-        if not self.path.is_file() or now.date() not in self._sessions(now.date(), now.date()) or now.time() < time(15):
+        session = session or now.date()
+        if (not self.path.is_file() or now < datetime.combine(session, time(15), TZ)
+                or session not in self._sessions(session, session)):
             return []
         with self._db(write=False) as db:
             brief_codes = []
@@ -345,7 +393,7 @@ class ThemeFeedbackStore:
                 pending = db.execute('''SELECT b.code,b.payload FROM brief_references b LEFT JOIN brief_closes c
                     ON c.day=b.day AND c.code=b.code AND c.known_at<=? WHERE b.day=? AND b.known_at<=?
                     AND c.code IS NULL ORDER BY b.code LIMIT ?''',
-                    (now.isoformat(), now.date().isoformat(), now.isoformat(), min(2000, max(0, int(limit))))).fetchall()
+                    (now.isoformat(), session.isoformat(), now.isoformat(), min(2000, max(0, int(limit))))).fetchall()
                 for row in pending:
                     reference = json.loads(row['payload'])
                     known = _stamp(reference.get('referenceKnownAt'))
@@ -354,8 +402,37 @@ class ThemeFeedbackStore:
             rows = db.execute('''SELECT b.code FROM baselines b LEFT JOIN closes c
                 ON c.day=b.day AND c.code=b.code AND c.known_at<=? WHERE b.day=? AND b.known_at<=?
                 AND c.code IS NULL ORDER BY b.code LIMIT ?''',
-                (now.isoformat(), now.date().isoformat(), now.isoformat(), min(2000, max(0, int(limit))))).fetchall()
+                (now.isoformat(), session.isoformat(), now.isoformat(), min(2000, max(0, int(limit))))).fetchall()
         return list(dict.fromkeys([*brief_codes, *(r['code'] for r in rows)]))[:min(2000, max(0, int(limit)))]
+
+    def retry_daily_closes(self, now, *, clock, daily_fetcher=None, timeout=20):
+        """Retry unresolved same-session closes without rewriting past scan evidence."""
+        from .history_preparation import fetch_daily_anchors
+        from .minute_history import bounded_fetch_map
+        now = _now(now)
+        if not self.path.is_file():
+            return []
+        with self._db(write=False) as db:
+            days = [date.fromisoformat(r[0]) for r in db.execute(
+                'SELECT DISTINCT day FROM scans WHERE day<=? ORDER BY day DESC', (now.date().isoformat(),))]
+        requests = defaultdict(set)
+        for day in days:
+            for code in self.pending_codes(now, limit=2000, session=day):
+                requests[code].add(day.isoformat())
+        def fetch(code):
+            anchors = (daily_fetcher or fetch_daily_anchors)(code, requests[code], now)
+            return code, anchors
+        results, _ = bounded_fetch_map(fetch, requests, workers=6, timeout=timeout)
+        checked_at = _now(clock())
+        by_code = dict(results)
+        by_day = defaultdict(dict)
+        for code, requested_days in requests.items():
+            anchors = by_code.get(code) or {}
+            for day in requested_days:
+                raw = anchors.get(day) if isinstance(anchors, dict) else None
+                by_day[day][code] = raw if isinstance(raw, dict) and raw.get('kind') == 'daily_ohlc' else {
+                    'kind': 'daily_ohlc', 'missing': True}
+        return [self.review(checked_at, by_day[day], session=date.fromisoformat(day)) for day in sorted(by_day)]
 
     def _adjustments(self, db, now, *, before_day=None):
         rows = db.execute('SELECT day,as_of,payload FROM feedback WHERE as_of<=? AND day>=? ORDER BY day DESC,as_of DESC',
@@ -375,10 +452,11 @@ class ThemeFeedbackStore:
         return ({key: round(min(.1, .02*sum(v[1] for v in values)), 4) for key, values in eligible.items()},
                 {key: [v[0] for v in values] for key, values in eligible.items()})
 
-    def review(self, now, quotes, theme_board=None):
+    def review(self, now, quotes, theme_board=None, *, session=None):
         now = _now(now)
-        day, at = now.date().isoformat(), now.isoformat()
-        if now.date() not in self._sessions(now.date(), now.date()) or now.time() < time(15):
+        session = session or now.date()
+        day, at = session.isoformat(), now.isoformat()
+        if session not in self._sessions(session, session) or now < datetime.combine(session, time(15), TZ):
             return {**_empty(now, 'unavailable', ['尚未收盘或非核验交易日']),
                     'marketBriefFeedback': _empty_brief(now, 'unavailable', ['尚未收盘或非核验交易日'])}
         if not self.path.is_file():
@@ -386,7 +464,7 @@ class ThemeFeedbackStore:
         quotes = quotes if isinstance(quotes, dict) else {}
         with self._db() as db:
             db.execute('BEGIN IMMEDIATE')
-            brief_feedback = self._review_brief(db, now, quotes)
+            brief_feedback = self._review_brief(db, now, quotes, session)
             scans = [json.loads(r[0]) for r in db.execute(
                 'SELECT payload FROM scans WHERE day=? AND known_at<=? ORDER BY known_at,decision_at,scan_id', (day, at))]
             if not scans:
@@ -395,8 +473,8 @@ class ThemeFeedbackStore:
                 'SELECT payload FROM baselines WHERE day=? AND known_at<=? ORDER BY code', (day, at))]
             for row in baselines:
                 code = row['code']
-                quote, gaps = _quote(quotes.get(code), code, now, close=True)
-                if not gaps and _stamp(quote['source_time']) >= _stamp(row['decisionAt']):
+                quote, gaps = _close_evidence(quotes.get(code), code, session, now)
+                if not gaps and _stamp(quote['close_at']) >= _stamp(row['decisionAt']):
                     db.execute('INSERT OR IGNORE INTO closes VALUES(?,?,?,?)', (day, code, at, _json(quote)))
             closes = {r['code']: json.loads(r['payload']) for r in db.execute(
                 'SELECT code,payload FROM closes WHERE day=? AND known_at<=?', (day, at))}
@@ -405,15 +483,16 @@ class ThemeFeedbackStore:
                 close = closes.get(row['code'])
                 observations[row['code']] = {**row, 'closeQuote': close,
                     'observationChangePct': round((close['price']/row['quote']['price']-1)*100, 6) if close else None}
-            feedback = self._describe(scans, observations, now, theme_board)
+            feedback = self._describe(scans, observations, now, theme_board, session)
             feedback['marketBriefFeedback'] = brief_feedback
             db.execute('INSERT OR REPLACE INTO feedback VALUES(?,?,?)', (day, at, _json(feedback)))
-            feedback['adjustments'], feedback['adjustmentSourceDays'] = self._adjustments(db, now)
+            feedback['adjustments'], feedback['adjustmentSourceDays'] = self._adjustments(
+                db, now, before_day=(session + timedelta(days=1)).isoformat())
             db.execute('UPDATE feedback SET payload=? WHERE day=? AND as_of=?', (_json(feedback), day, at))
         return feedback
 
     @staticmethod
-    def _describe(scans, observations, now, close_board):
+    def _describe(scans, observations, now, close_board, session):
         themes, first_board, missed = [], {}, []
         ever_selected = {r['code'] for scan in scans for r in scan['universe'] if r['selected']}
         for scan in scans:
@@ -468,7 +547,7 @@ class ThemeFeedbackStore:
                         attribution.append({'code': 'missed_leader', 'label': '漏选强股（已冻结候选池内）', 'stockCode': row['code']})
             close = close_themes.get(theme_id) or {}
             close_time = _stamp(close.get('sourceTime'))
-            close_valid = bool(close_time and close_time.date() == now.date() and close_time <= now
+            close_valid = bool(close_time and close_time.date() == session and close_time <= now
                                and time(14, 57) <= close_time.time() <= time(15, 5))
             themes.append({'id': theme_id, 'name': theme.get('name'), 'selected': theme.get('selected') is True,
                 'status': 'observed' if valid else 'insufficient' if selected else 'sample_only', 'referenceAt': scan['asOf'],
@@ -495,7 +574,7 @@ class ThemeFeedbackStore:
         if any(t['status'] == 'insufficient' for t in themes):
             gaps.append('部分已选主题缺完整成员证据、同窗成员不足3只或覆盖不足80%，不用于调整')
         result = _empty(now, 'reviewed' if verified and not missing_codes else 'partial' if verified else 'pending_data', gaps)
-        result.update(sourceDay=now.date().isoformat(), themes=themes,
+        result.update(sourceDay=session.isoformat(), themes=themes,
             missedLeaders=sorted(missed, key=lambda r: (-r['observationChangePct'], r['code'], r['themeId'])),
             observedCount=verified, universeCount=len(all_codes), missingCodes=missing_codes,
             summary=f'已核验{verified}/{len(all_codes)}只价格观察；{sum(t["weakened"] for t in themes)}个题材走弱，{len(missed)}条候选池内漏选强股记录。')

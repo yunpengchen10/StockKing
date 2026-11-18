@@ -295,10 +295,15 @@ func (a *App) GetKingPicksRefreshTask(taskID string) (map[string]any, error) {
 // GetDisplayedKingPicks reads the newest completed saved scan, including
 // scheduled scans. This read never starts a new scan.
 func (a *App) GetDisplayedKingPicks() (map[string]any, error) {
-	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/display", nil)
+	// A first read after an upgrade may restore and project an archived scan.
+	return a.kingPicksControlTimeout(http.MethodGet, "/api/v1/stock-king/picks/display", nil, 45*time.Second)
 }
 
 func (a *App) kingPicksControl(method, path string, input any) (map[string]any, error) {
+	return a.kingPicksControlTimeout(method, path, input, 15*time.Second)
+}
+
+func (a *App) kingPicksControlTimeout(method, path string, input any, timeout time.Duration) (map[string]any, error) {
 	if a.sidecar == nil {
 		return nil, fmt.Errorf("Daily engine manager is unavailable")
 	}
@@ -306,7 +311,7 @@ func (a *App) kingPicksControl(method, path string, input any) (map[string]any, 
 	if parent == nil {
 		parent = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	var output map[string]any
 	if err := a.sidecar.Request(ctx, method, path, input, &output); err != nil {
@@ -349,11 +354,19 @@ func (a *App) GetKingPicksHistory(limit int) (map[string]any, error) {
 	return a.kingPicksControl(http.MethodGet, fmt.Sprintf("/api/v1/stock-king/picks/history?limit=%d", limit), nil)
 }
 
+func (a *App) GetKingPicksSnapshot(runID string) (map[string]any, error) {
+	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/history/"+url.PathEscape(runID), nil)
+}
+
 func (a *App) GetStockKingRecommendationHistory(date, symbol, version string, includeControls bool, runId string) (map[string]any, error) {
-	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/records?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}, "run_id": {runId}, "compact": {"true"}, "include_controls": {strconv.FormatBool(includeControls)}}.Encode(), nil)
+	params := url.Values{"date": {date}, "symbol": {symbol}, "version": {version}, "run_id": {runId}}
+	if runId == "" {
+		params.Set("scope", "history")
+	}
+	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/records?"+params.Encode(), nil)
 }
 func (a *App) GetStockKingDelayedReviews(date, symbol, version string) (map[string]any, error) {
-	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/reviews?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}}.Encode(), nil)
+	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/reviews?"+url.Values{"date": {date}, "symbol": {symbol}, "version": {version}, "compact": {"true"}}.Encode(), nil)
 }
 func (a *App) GetStockKingLearningState() (map[string]any, error) {
 	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/learning", nil)

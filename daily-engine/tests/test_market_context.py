@@ -123,10 +123,53 @@ def test_related_news_is_same_day_and_not_future():
 
 
 def test_only_independent_assessment_can_supply_conditions_met():
-    result = brief(opportunities={'asOf': NOW.isoformat(), 'recommendations': [{'code': '600001',
+    prices = quotes()
+    add_entry_evidence(prices['600001'])
+    result = brief(prices=prices, opportunities={'asOf': NOW.isoformat(), 'recommendations': [{'code': '600001',
         'ruleRecommendation': True, 'opportunity': {'grade': 'F-A', 'hardVetoes': [], 'failedConditions': []}}]})
     assert result['focusStocks'][0]['status'] == 'conditions_met'
     assert result['focusStocks'][1]['status'] == 'watch'
+
+
+def add_entry_evidence(quote):
+    quote.update(high=quote['price'], limit_up=11, order_book={
+        'source_time': quote['source_time'], 'asks': [{'price': quote['price'] + .01, 'volume_shares': 1200}]})
+
+
+@pytest.mark.parametrize('last, status', [(11, 'at_limit'), (10.8, 'touched_limit')])
+def test_unreached_stock_precedes_sealed_or_reopened_theme_leader(last, status):
+    prices = quotes()
+    prices['600001'].update(price=last, high=11, limit_up=11, change_pct=(last/10 - 1)*100)
+    add_entry_evidence(prices['600002'])
+    channels = {'asOf': NOW.isoformat(), 'recommendations': [{'code': '600001', 'ruleRecommendation': True,
+                'opportunity': {'grade': 'F-A', 'hardVetoes': [], 'failedConditions': []}}]}
+    rows = brief(prices=prices, opportunities=channels)['focusStocks']
+    assert [(row['code'], row['limitEntry']['status']) for row in rows] == [('600002', 'pre_limit'), ('600001', status)]
+    assert rows[1]['status'] == 'watch' and not rows[1]['ruleRecommendation']
+
+
+def test_legacy_projection_uses_only_matching_archived_evidence_without_mutating_snapshot():
+    prices = quotes()
+    add_entry_evidence(prices['600002'])
+    prices['600001'].update(price=11, high=11, limit_up=11, change_pct=10)
+    source = prices['600002']
+    signal = {'queue': 'first_board', 'sourceTime': source['source_time'], 'referencePrice': source['price']}
+    old = brief(prices=prices)
+    for row in old['focusStocks']:
+        row.pop('limitEntry')
+    run = {'generatedAt': NOW.isoformat(), 'marketBrief': old, 'controls': [{'code': '600001', 'quote': prices['600001']}],
+           'dailyObservationQuotes': {'600001': {**prices['600001'], 'source': 'another-feed'}},
+           'nextDayWatchlist': [{'code': '600002', 'quote': source, 'nextDaySignal': signal},
+                                {'code': '600002', 'quote': source, 'nextDaySignal': {**signal, 'referencePrice': 9}}]}
+    before = deepcopy(run)
+    shown = _display_response({'adaptive': run})['adaptive']
+    by_code = {row['code']: row for row in shown['marketBrief']['focusStocks']}
+    assert by_code['600001']['limitEntry']['status'] == 'at_limit'
+    assert 'limitEntry' not in by_code['600002']
+    first, mismatch = shown['nextDayWatchlist']
+    assert first['nextDaySignal']['limitEntry']['askVolumeShares'] == 1200
+    assert 'limitEntry' not in mismatch['nextDaySignal']
+    assert run == before
 
 
 @pytest.mark.parametrize('mutation', ['bare_code', 'old_assessment', 'future_assessment', 'no_assessment_time',

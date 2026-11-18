@@ -329,3 +329,75 @@ test('an expired task recovery allows its completed receipt display read to fini
   assert.equal(controller.getState().loading, false)
   assert.equal(clock.pending, 0)
 })
+
+test('one explicit refresh replaces a task lost during an engine restart', async () => {
+  const storage = memoryStorage(), clock = fakeClock(), results = [], lookedUp = []
+  storage.setItem(REFRESH_TASK_KEY, JSON.stringify({ task_id: 'lost-before-restart', startedAt: 0 }))
+  let starts = 0
+  const controller = createPicksRefreshController({ ...clock, storage,
+    startTask: async max => { assert.equal(max, 5); starts++; return { task_id: 'new-after-restart', status: 'pending' } },
+    getTask: async id => {
+      lookedUp.push(id)
+      if (id === 'lost-before-restart') throw new Error('HTTP 404: task not found')
+      return { status: 'completed', result: snapshot() }
+    }, onResult: value => results.push(value),
+  })
+  await controller.start(5); await clock.advance(0)
+  assert.equal(starts, 1)
+  assert.deepEqual(lookedUp, ['lost-before-restart', 'new-after-restart'])
+  assert.equal(results.length, 1)
+  assert.equal(controller.getState().loading, false)
+  assert.equal(controller.getState().error, '')
+  assert.equal(storage.getItem(REFRESH_TASK_KEY), null)
+  assert.equal(clock.pending, 0)
+})
+
+test('explicit recovery gives a still-running old task a fresh bounded wait without another POST', async () => {
+  const storage = memoryStorage(), clock = fakeClock(), results = []
+  storage.setItem(REFRESH_TASK_KEY, JSON.stringify({ task_id: 'long-running', startedAt: 0 }))
+  let polls = 0
+  const controller = createPicksRefreshController({ ...clock, storage, timeoutMs: 3000,
+    startTask: async () => assert.fail('a living task must not be duplicated'),
+    getTask: async () => ++polls === 1 ? { status: 'processing', progress: 95 } : { status: 'completed', result: snapshot() },
+    onResult: value => results.push(value),
+  })
+  await controller.start(5); await flush()
+  assert.equal(controller.getState().loading, true)
+  assert.equal(controller.getState().elapsedSeconds, 10)
+  await clock.advance(1000)
+  assert.equal(results.length, 1)
+  assert.equal(controller.getState().error, '')
+  assert.equal(clock.pending, 0)
+})
+
+test('a temporary recovery connection error does not discard the cached task or submit a duplicate', async () => {
+  const storage = memoryStorage(), clock = fakeClock()
+  storage.setItem(REFRESH_TASK_KEY, JSON.stringify({ task_id: 'possibly-running', startedAt: 0 }))
+  const controller = createPicksRefreshController({ ...clock, storage, timeoutMs: 3000, pollMs: 100,
+    startTask: async () => assert.fail('a connection failure does not prove the task is missing'),
+    getTask: async () => { throw new Error('context deadline exceeded') },
+  })
+  await controller.start(5); await clock.advance(3000)
+  assert.equal(controller.getState().loading, false)
+  assert.match(controller.getState().error, /停止等待/)
+  assert.equal(JSON.parse(storage.getItem(REFRESH_TASK_KEY)).task_id, 'possibly-running')
+  assert.equal(clock.pending, 0)
+})
+
+test('receipt display migration can exceed the short task-control deadline and still finish once', async () => {
+  const storage = memoryStorage(), clock = fakeClock(), results = []
+  let completeDisplay, reads = 0
+  const controller = createPicksRefreshController({ ...clock, storage,
+    startTask: async () => ({ task_id: 'migrating-display', status: 'pending' }),
+    getTask: async () => ({ status: 'completed', resultPersisted: true, displayRunId: 'migrated' }),
+    getDisplay: () => { reads++; return new Promise(resolve => { completeDisplay = resolve }) },
+    onResult: value => results.push(value),
+  })
+  await controller.start(5); await clock.advance(25_000)
+  assert.equal(controller.getState().loading, true)
+  assert.equal(reads, 1)
+  completeDisplay({ ...snapshot(), displayRunId: 'migrated' }); await flush()
+  assert.equal(results.length, 1)
+  assert.equal(controller.getState().error, '')
+  assert.equal(clock.pending, 0)
+})

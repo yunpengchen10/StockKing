@@ -1,7 +1,7 @@
 <script setup>
 import { computed, inject, onActivated, onBeforeMount, onBeforeUnmount, onDeactivated, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { Follow, GetEngineStatus, GetKingPicks, GetKingPicksHistory, GetDisplayedKingPicks, StartKingPicksRefresh, GetKingPicksRefreshTask, GetStockKingBackgroundLearning, GetStockKingBackgroundStatus, SetStockKingBackgroundLearning, GetStockKingAutoRecommendations, SetStockKingAutoRecommendations } from '../../wailsjs/go/main/App'
+import { Follow, GetEngineStatus, GetKingPicks, GetKingPicksHistory, GetKingPicksSnapshot, GetDisplayedKingPicks, StartKingPicksRefresh, GetKingPicksRefreshTask, GetStockKingBackgroundLearning, GetStockKingBackgroundStatus, SetStockKingBackgroundLearning, GetStockKingAutoRecommendations, SetStockKingAutoRecommendations } from '../../wailsjs/go/main/App'
 import { useMessage } from 'naive-ui'
 import { toResearchCode } from '../utils/symbol'
 import PickIndicatorEvidence from './PickIndicatorEvidence.vue'
@@ -15,6 +15,7 @@ import { nextDayQueueLabel, nextDayTouchLabel, savedRecommendationSummary, prima
 import { premarketDisplayState, premarketText, premarketQuoteState, premarketPlanLabel } from '../utils/premarket.mjs'
 import { opportunityDisplay, opportunityRecommendations } from '../utils/opportunityDisplay.mjs'
 import { themeBoardDisplay, themeFeedbackDisplay, marketBriefDisplay, themePercent } from '../utils/themeDisplay.mjs'
+import { runCustomStockScreen } from '../utils/customStockScreen.mjs'
 
 const router = useRouter()
 const message = useMessage()
@@ -36,14 +37,20 @@ const activeTier = ref('regular')
 const precisionProfile = ref('regular')
 const activeBoard = ref('nonKeChuang')
 const viewMode = ref('adaptive')
-const controlsOpen = ref(false), moreDetailsOpen = ref(false)
+const moreDetailsOpen = ref(false)
 const pageActive = ref(true)
 const ledgerModes = ['records', 'reviews', 'learning']
 const visitedLedgerModes = ref([])
 const recordsRefreshToken = ref(0)
+const recordsView = ref('current')
+const reviewFilter = ref(null)
+let snapshotRequest = 0
 watch(viewMode, mode => {
   if (ledgerModes.includes(mode) && !visitedLedgerModes.value.includes(mode)) visitedLedgerModes.value.push(mode)
 })
+watch(() => router.currentRoute?.value, route => {
+  if (route?.name === 'kingPicks' && route.query?.view === 'records') openRecommendationRecords()
+}, { immediate: true })
 const backgroundEnabled = ref(true)
 const recommendationsEnabled = ref(true)
 const backgroundStatus = ref({ status: 'never_run', updatedAt: '' })
@@ -108,6 +115,27 @@ const themeFeedback = computed(() => themeFeedbackDisplay(
   premarketNow.value, viewingHistory.value))
 const marketBrief = computed(() => marketBriefDisplay(adaptive.value.marketBrief || pageResult.value.marketBrief,
   premarketNow.value, viewingHistory.value, opportunities.value.cards, adaptivePicks.value))
+const publication = computed(() => {
+  const saved = adaptive.value.publishedPicks
+  return saved?.status === 'published' && saved.runId && saved.runId === recordsRunId.value && Array.isArray(saved.items) ? saved : null
+})
+const rankedPicks = computed(() => publication.value?.items || [])
+const screenVisible = ref(false), screenDraft = ref(''), screenQuery = ref(''), screenPage = ref(0)
+function openCustomScreen() {
+  try { screenQuery.value = snapshotStorage?.getItem('stock-king.custom-screen.v1') || '' } catch (_) { /* Storage is optional. */ }
+  screenDraft.value = screenQuery.value
+  screenPage.value = 0
+  screenVisible.value = true
+}
+const screenResult = computed(() => runCustomStockScreen(screenQuery.value, adaptive.value.customScreen?.rows || []))
+const screenMatches = computed(() => screenResult.value.matches.slice(screenPage.value * 5, (screenPage.value + 1) * 5))
+watch(() => adaptive.value.generatedAt || result.value.generatedAt, () => { screenPage.value = 0 })
+function applyCustomScreen() {
+  screenPage.value = 0
+  screenQuery.value = screenDraft.value.trim()
+  if (screenResult.value.status === 'invalid') return
+  try { snapshotStorage?.setItem('stock-king.custom-screen.v1', screenQuery.value) } catch (_) { /* Results remain available. */ }
+}
 const activeFeedback = computed(() => themeFeedback.value.marketBriefFeedback || themeFeedback.value)
 const feedbackHeading = computed(() => {
   if (viewingHistory.value) return '历史反馈 · 当时已知结果'
@@ -222,6 +250,15 @@ const invalidatedPicks = computed(() => {
   })
 })
 const nextDayWatchlist = computed(() => Array.isArray(adaptive.value?.nextDayWatchlist) ? adaptive.value.nextDayWatchlist : [])
+const firstBoardPicks = computed(() => adaptive.value.nextDayResearch?.retrospectiveProjection ? [] :
+  nextDayWatchlist.value.filter(pick => {
+    const signal = pick.nextDaySignal || {}
+    return signal.queue === 'first_board' && signal.touchedLimitToday === false && signal.selected !== false
+      && signal.selectionEligible !== false && signal.sourceUsableAtCompletion !== false && signal.limitEntry?.eligible === true
+  }))
+const benchmarkStocks = computed(() => marketBrief.value.focusStocks.filter(stock => ['at_limit', 'touched_limit'].includes(stock.limitEntry?.status)))
+const unverifiedFocus = computed(() => marketBrief.value.focusStocks.filter(stock => stock.limitEntry?.status === 'unavailable'))
+const focusIdeas = computed(() => marketBrief.value.focusStocks.filter(stock => !benchmarkStocks.value.includes(stock) && !unverifiedFocus.value.includes(stock)))
 const nextDayContinuationWatchlist = computed(() => Array.isArray(adaptive.value?.nextDayContinuationWatchlist) ? adaptive.value.nextDayContinuationWatchlist : [])
 const savedRecommendations = computed(() => savedRecommendationSummary(adaptive.value))
 const nextDayQueues = computed(() => [
@@ -361,9 +398,10 @@ function internalCode(value) {
 }
 
 async function refresh() {
-  if (loading.value || restoring.value) return
+  if (loading.value) return
   if (viewMode.value !== 'classic') {
     displayRevision++
+    restoring.value = false
     await refreshController.start(maxPerBoard.value)
     return
   }
@@ -382,11 +420,10 @@ async function refresh() {
 function mergeAdaptive(snapshot) {
   if (!snapshot || typeof snapshot !== 'object') return
   result.value = {
-    ...result.value,
     schemaVersion: 4,
-    methodologyVersion: snapshot.modelVersion || snapshot.model_version || result.value?.methodologyVersion || 'king-adaptive-skill-v2.3.1',
-    generatedAt: snapshot.generatedAt || snapshot.generated_at || result.value?.generatedAt || '',
-    asOfDate: snapshot.asOfDate || snapshot.as_of_date || result.value?.asOfDate || '',
+    methodologyVersion: snapshot.modelVersion || snapshot.model_version || 'king-adaptive-skill-v2.3.1',
+    generatedAt: snapshot.generatedAt || snapshot.generated_at || '',
+    asOfDate: snapshot.asOfDate || snapshot.as_of_date || '',
     adaptive: snapshot,
   }
 }
@@ -437,7 +474,7 @@ async function restoreDisplayed() {
   const revision = displayRevision
   try {
     if (!displayReadPromise) {
-      const pending = withRecordReadTimeout(GetDisplayedKingPicks()).finally(() => {
+      const pending = withRecordReadTimeout(GetDisplayedKingPicks(), 50000).finally(() => {
         if (displayReadPromise === pending) displayReadPromise = null
       })
       displayReadPromise = pending
@@ -464,6 +501,14 @@ async function restoreDisplayed() {
 function returnToDisplayed() {
   viewingHistory.value = false
   result.value = displayedResult.value || { adaptive: { candidates: [] }, generatedAt: '' }
+}
+function showCurrentPicks() {
+  returnToDisplayed()
+  viewMode.value = 'adaptive'
+  void restoreDisplayed()
+}
+function selectView(mode) {
+  if (mode === 'adaptive') showCurrentPicks()
 }
 
 function historyResult(item) { return item?.result || {} }
@@ -509,6 +554,7 @@ function observationPrice(value) {
 }
 function formatTime(value) {
   if (!value) return '时间未知'
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value
   const parsed = new Date(value)
   return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
 }
@@ -524,11 +570,28 @@ async function openHistory() {
   } finally { historyLoading.value = false }
 }
 
+async function openRecordSnapshot(id) {
+  const request = ++snapshotRequest
+  try {
+    const item = await withRecordReadTimeout(GetKingPicksSnapshot(id))
+    if (disposed || request !== snapshotRequest || viewMode.value !== 'records') return
+    if (item?.run_id !== id || !isScanHistory(item) || !isRestorableSnapshot(historyResult(item))) throw new Error('原始扫描快照不可用')
+    restoreHistory(item)
+    moreDetailsOpen.value = true
+  } catch (error) {
+    if (!disposed && request === snapshotRequest) message.error(error?.message || String(error))
+  }
+}
+function openStockReview(signal) {
+  reviewFilter.value = { date: signal.date, symbol: signal.code }
+  viewMode.value = 'reviews'
+}
+
 function restoreHistory(item) {
   if (!isScanHistory(item)) return
   const snapshot = historyResult(item)
   if (!snapshot || !Array.isArray(snapshot.candidates)) return
-  mergeAdaptive(snapshot)
+  mergeAdaptive({ ...snapshot, run_id: snapshot.run_id || snapshot.runId || item.run_id })
   viewingHistory.value = true
   viewMode.value = 'adaptive'
   historyVisible.value = false
@@ -546,6 +609,12 @@ function openKline(pick) {
 }
 function openRecommendationRecords() {
   // Explicitly return to the same persisted scan currently shown in picks.
+  recordsView.value = 'current'
+  recordsRefreshToken.value++
+  viewMode.value = 'records'
+}
+function openRecommendationHistory() {
+  recordsView.value = 'history'
   recordsRefreshToken.value++
   viewMode.value = 'records'
 }
@@ -618,9 +687,12 @@ onDeactivated(() => {
 <template>
   <main class="picks-page" :class="{ dark: darkTheme }">
     <header>
-      <h2>精选</h2>
-      <n-button v-if="viewMode !== 'adaptive'" secondary @click="viewMode='adaptive'">返回精选</n-button>
-      <n-button type="primary" :loading="loading" :disabled="restoring" title="重新获取行情并在本地计算，成功保存后显示" @click="refresh">刷新扫描</n-button>
+      <h2>{{ viewMode === 'records' ? '推荐记录' : viewMode === 'reviews' ? '延后复盘' : viewMode === 'archive' ? '扫描研究档案' : '精选' }}</h2>
+      <n-button v-if="viewMode === 'adaptive' && !viewingHistory" secondary @click="openCustomScreen">自定义选股</n-button>
+      <n-button v-if="viewMode === 'adaptive'" secondary @click="openRecommendationRecords">本轮记录</n-button>
+      <n-button v-if="viewMode === 'adaptive' && !viewingHistory" secondary @click="reviewFilter=null; viewMode='reviews'">核验结果</n-button>
+      <n-button v-if="viewMode !== 'adaptive'" secondary @click="showCurrentPicks">返回精选</n-button>
+      <n-button type="primary" :loading="loading" title="重新获取行情并在本地计算，成功保存后显示" @click="refresh">刷新扫描</n-button>
     </header>
     <n-alert v-if="refreshError" type="warning" :show-icon="false" class="sync-alert">更新未完成：{{ refreshError }}</n-alert>
     <n-alert v-if="viewingHistory || (!engine.ready && !loading)" type="warning" :show-icon="false" class="sync-alert"><span>{{ viewingHistory ? '正在浏览历史快照' : (engine.message || '引擎正在启动，已保存推荐可以继续查看。') }}</span><n-button v-if="viewingHistory" size="tiny" text @click="returnToDisplayed">返回当前</n-button></n-alert>
@@ -628,21 +700,56 @@ onDeactivated(() => {
     <n-alert v-if="restoreError" type="warning" :show-icon="false" class="sync-alert">最新推荐读取失败：{{ restoreError }}<br/>{{ displayedResult ? '当前显示上次保存的推荐，尚未确认是否最新。' : '暂未取得推荐。' }}<n-button size="tiny" text @click="restoring=true; restoreDisplayed()">重试读取</n-button></n-alert>
     <n-alert v-if="displayRecovery?.status === 'recovering_history' && !viewingHistory" type="info" :show-icon="false" class="sync-alert">{{ displayRecovery.message }} 尚未确认是否为最新结果；还有 {{ displayRecovery.remainingHeaders }} 条历史记录待核对。</n-alert>
     <div v-if="!restoring || viewingHistory" class="picks-meta"><span>{{ pageResult.asOfDate || pageResult.as_of_date || pageResult.generatedAt?.slice(0, 10) || '待生成' }}</span><details class="sk-help-details"><summary>扫描信息</summary><p>生成 {{ pageResult.generatedAt || pageResult.generated_at || '—' }} · 版本 {{ viewMode === 'adaptive' && isDailyPrimary ? dailyAssessment.version || '日线条件规则' : pageResult.methodologyVersion || '兼容旧榜' }}</p><p>后台学习 {{ backgroundEnabled ? '开启' : '暂停' }} · {{ backgroundStatus.status || '未运行' }} {{ backgroundStatus.updatedAt }}</p><p>每轮扫描保留当时证据，可在历史中回看。</p></details></div>
-    <details class="picks-controls sk-help-details" :open="controlsOpen" @toggle="controlsOpen=$event.target.open">
-      <summary>更多功能与设置</summary>
+    <section class="picks-controls" aria-label="功能与设置">
       <div class="picks-control-actions">
+      <n-button secondary @click="openRecommendationHistory">历史推荐记录</n-button>
       <n-button secondary @click="methodVisible=true">如何使用</n-button>
       <n-input-number v-if="viewMode==='classic'" v-model:value="maxPerBoard" :min="5" :max="50" style="width:112px"><template #suffix>只 / 组</template></n-input-number>
       <div class="background-switch"><n-switch :value="recommendationsEnabled" @update:value="toggleRecommendations" /><span title="北京时间交易日定时扫描；手动刷新不重复计入训练">自动推荐</span></div>
       <div class="background-switch"><n-switch :value="backgroundEnabled" @update:value="toggleBackground" /><span title="控制每周本地训练与模型晋升检查">自动学习</span></div>
       <n-button secondary @click="openHistory">扫描历史</n-button>
+      <n-button secondary @click="viewMode='archive'">扫描研究档案</n-button>
       <n-button v-if="viewMode !== 'classic'" secondary @click="restoreDisplayed">读取已保存结果</n-button>
       </div>
-    <n-tabs v-model:value="viewMode" type="line" animated class="view-tabs"><n-tab-pane name="adaptive" tab="本地精选" /><n-tab-pane name="records" tab="推荐记录" /><n-tab-pane name="reviews" tab="延后复盘" /><n-tab-pane name="learning" tab="学习状态" /><n-tab-pane name="classic" tab="策略分组" /></n-tabs>
-    </details>
+    <n-tabs v-model:value="viewMode" @update:value="selectView" type="line" animated class="view-tabs"><n-tab-pane name="adaptive" tab="本地精选" /><n-tab-pane name="records" tab="推荐记录" /><n-tab-pane name="reviews" tab="延后复盘" /><n-tab-pane name="learning" tab="学习状态" /><n-tab-pane name="classic" tab="策略分组" /></n-tabs>
+    </section>
 
-    <section v-if="viewMode === 'adaptive' && restoring && !viewingHistory" class="picks-loading" role="status" aria-live="polite"><n-spin size="small" /><span>正在读取最新已完成的推荐…</span></section>
-    <section v-if="!restoring || viewingHistory" v-show="viewMode === 'adaptive'">
+    <section v-if="['adaptive','archive'].includes(viewMode) && restoring && !viewingHistory" class="picks-loading" role="status" aria-live="polite"><n-spin size="small" /><span>正在读取最新已完成的推荐…</span></section>
+    <section v-if="viewMode === 'adaptive' && (!restoring || viewingHistory)" class="focus-stocks shortlist" aria-label="上涨潜力精选">
+      <div class="theme-section-heading"><div><h3>上涨潜力精选</h3>
+        <p v-if="publication">本轮 {{ rankedPicks.length }} 只 · 扫描于 {{ formatTime(publication.asOf) }}<template v-if="publication.publishedAt"> · 发布于 {{ formatTime(publication.publishedAt) }}</template><template v-else-if="publication.recordedAt"> · 补录于 {{ formatTime(publication.recordedAt) }}</template></p></div></div>
+      <div v-if="rankedPicks.length" class="focus-list">
+        <article v-for="stock in rankedPicks" :key="stock.code" class="focus-stock">
+          <div class="focus-stock-heading"><div><span class="pick-rank">{{ stock.rank === 1 ? '首选' : '第 ' + stock.rank + ' 名' }}</span><strong>{{ stock.name }}</strong><code>{{ stock.code }}</code></div><n-button size="small" secondary @click="openKline(stock)">查看走势</n-button></div>
+          <p v-for="reason in stock.reasons" :key="reason">{{ reason }}</p>
+          <p v-if="stock.risk">风险：{{ stock.risk }}</p>
+          <p class="theme-source">{{ stock.basisLabel || '扫描参考价' }} ¥{{ observationPrice(stock.price) }} · {{ quoteSourceLabel(stock.source) }} · {{ formatTime(stock.sourceTime) }}</p>
+        </article>
+      </div>
+      <p v-else class="shortlist-empty" role="status">{{ publication ? '本轮没有符合上涨潜力和未触板条件的股票。' : (adaptive.generatedAt || result.generatedAt) ? '该轮未留存可核验的已发布精选名单。' : '完成扫描后，精选会显示在这里。' }}</p>
+    </section>
+
+    <n-modal v-model:show="screenVisible" preset="card" title="自定义选股" style="width:min(580px, 94vw)" :mask-closable="true">
+      <form class="custom-screen" @submit.prevent="applyCustomScreen">
+        <label for="king-screen-conditions">选股条件</label>
+        <n-input v-model:value="screenDraft" type="textarea" :input-props="{ id: 'king-screen-conditions' }" :autosize="{minRows: 2, maxRows: 5}" placeholder="例如：股价低于20元，涨幅大于2%，卖一量不少于1万股" />
+        <p class="theme-source">可输入股票名称或代码、题材、股价、涨幅、距涨停幅度、卖一量。多个条件用逗号隔开。</p>
+        <n-button type="primary" attr-type="submit">按条件筛选</n-button>
+      </form>
+      <p class="theme-source" v-if="adaptive.customScreen">扫描 {{ formatTime(adaptive.customScreen.asOf) }} · 本轮研究范围 {{ adaptive.customScreen.checkedCount }} 只，其中 {{ adaptive.customScreen.rows?.length || 0 }} 只尚未触板且有有效卖盘。</p>
+      <p v-else class="theme-source">该轮未保存可筛选的板前盘口，请刷新扫描。</p>
+      <p v-for="error in screenResult.errors" :key="error" role="alert">{{ error }}</p>
+      <div v-if="screenResult.status === 'ready' && adaptive.customScreen" aria-live="polite" class="custom-results">
+        <p>{{ screenResult.matches.length ? '匹配 '+screenResult.matches.length+' 只' : '本轮没有股票满足全部条件' }} · {{ screenResult.conditions.join('，') }}</p>
+        <article v-for="{row,reasons} in screenMatches" :key="row.code" class="focus-stock">
+          <div class="focus-stock-heading"><div><strong>{{ row.name }}</strong><code>{{ row.code }}</code></div><n-button size="small" secondary @click="openKline(row); screenVisible=false">图表</n-button></div>
+          <p>{{ reasons.join(' · ') }}</p><small>信号价 ¥{{ observationPrice(row.limitEntry.price) }} · 卖一 ¥{{ observationPrice(row.limitEntry.askPrice) }} · {{ formatTime(row.limitEntry.bookSourceTime) }}</small>
+        </article>
+        <div v-if="screenResult.matches.length > 5" class="custom-pagination"><n-button :disabled="screenPage===0" size="small" @click="screenPage--">上一页</n-button><span>{{ screenPage+1 }} / {{ Math.ceil(screenResult.matches.length / 5) }}</span><n-button :disabled="(screenPage+1)*5>=screenResult.matches.length" size="small" @click="screenPage++">下一页</n-button></div>
+      </div>
+    </n-modal>
+
+    <section v-if="(!restoring || viewingHistory) && (viewMode === 'archive' || (viewMode === 'adaptive' && viewingHistory))">
       <section v-if="marketBrief.mainlines.length" class="theme-board market-mainlines" aria-label="题材主线">
         <div class="theme-section-heading"><div><h3>{{ viewingHistory ? '历史主线 · 当时判断' : '今日主线' }}</h3><p>从市场热点出发，跟踪题材与关联股票。</p></div><n-tag size="small" :bordered="false">{{ viewingHistory ? '历史事件快照' : '市场热点跟踪' }}</n-tag></div>
         <p v-if="marketBrief.summary" class="theme-source">{{ marketBrief.summary }}</p>
@@ -681,25 +788,49 @@ onDeactivated(() => {
         <p v-if="!themeBoard.selected.length" class="theme-empty" role="status">{{ themeBoard.emptyMessage }}</p>
         <details class="sk-help-details"><summary>数据口径与缺口</summary><p v-for="gap in themeBoard.gaps" :key="gap" class="theme-gap">{{ gap }}</p><p class="theme-source">{{ themeBoard.scope }}</p></details>
       </section>
+      <section v-if="Array.isArray(adaptive.nextDayWatchlist)" class="focus-stocks" aria-label="涨停前观察">
+        <div class="theme-section-heading"><div><h3>涨停前观察 · {{ firstBoardPicks.length }} 只</h3><p>观察下一交易日是否冲板。入列时须当日未触板，且涨停价以下有卖单。</p></div><n-button size="small" secondary @click="openRecommendationRecords">同轮记录</n-button></div>
+        <div v-if="firstBoardPicks.length" class="focus-list">
+          <article v-for="pick in firstBoardPicks" :key="codeOf(pick)" class="focus-stock">
+            <div class="focus-stock-heading"><div><strong>{{ nameOf(pick) }}</strong><code>{{ codeOf(pick) }}</code></div><span>观察日 {{ pick.nextDaySignal.targetSession }}</span></div>
+            <p>信号价 ¥{{ observationPrice(pick.nextDaySignal.referencePrice) }} · 当时卖一 ¥{{ observationPrice(pick.nextDaySignal.limitEntry.askPrice) }}（{{ pick.nextDaySignal.limitEntry.askVolumeShares }} 股）</p>
+            <p>截至信号时最高 ¥{{ observationPrice(pick.nextDaySignal.limitEntry.sessionHigh) }} · 当日涨停价 ¥{{ observationPrice(pick.nextDaySignal.limitEntry.limitUp) }}</p>
+            <p v-if="pick.nextDaySignal.branches?.length">{{ pick.nextDaySignal.branches.join(' · ') }}</p>
+            <p class="theme-source">{{ quoteSourceLabel(pick.nextDaySignal.limitEntry.bookSource) }} · 盘口 {{ formatTime(pick.nextDaySignal.limitEntry.bookSourceTime) }} · 扫描时参考</p>
+            <n-button size="small" secondary @click="openKline(pick)">图表</n-button>
+          </article>
+        </div>
+        <p v-else class="theme-empty">这一轮没有同时留存未触板和有效卖盘证据的前瞻候选。</p>
+      </section>
       <section class="focus-stocks" aria-label="重点股票">
-        <div class="theme-section-heading"><div><h3>{{ viewingHistory ? '重点股票 · 历史记录' : '重点股票' }}</h3><p>先有研究对象，再等待交易条件确认。</p></div><n-tag size="small" :bordered="false">{{ marketBrief.focusStocks.length }} 只</n-tag></div>
-        <div v-if="marketBrief.focusStocks.length" class="focus-list">
-          <article v-for="stock in marketBrief.focusStocks" :key="stock.code" class="focus-stock">
+        <div class="theme-section-heading"><div><h3>{{ viewingHistory ? '重点股票 · 历史记录' : '重点股票 · 题材观察' }}</h3><p>跟踪题材事件相关的股票。</p></div><n-tag size="small" :bordered="false">{{ focusIdeas.length }} 只</n-tag></div>
+        <div v-if="focusIdeas.length" class="focus-list">
+          <article v-for="stock in focusIdeas" :key="stock.code" class="focus-stock">
             <div class="focus-stock-heading"><div><strong>{{ stock.name }}</strong><code>{{ stock.code }}</code><span v-if="stock.themeName" class="focus-theme">{{ stock.themeName }}<template v-if="stock.theme?.leaderRank"> · 题材内第 {{ stock.theme.leaderRank }}</template></span></div><n-tag size="small" :type="stock.conditionsMet ? 'success' : 'warning'" :bordered="false">{{ stock.statusLabel }}</n-tag></div>
             <div class="focus-stock-body"><div><div class="focus-price"><strong>{{ stock.price === null ? '未取得' : `¥${stock.price.toFixed(2)}` }}</strong><span>{{ themePercent(stock.changePct, 2, true) }}</span></div><p>{{ stock.reason || '原记录未保存具体研究理由，查看详情核验。' }}</p><p v-if="stock.pending.length" class="focus-pending">等待：{{ stock.pending.slice(0, 2).join('；') }}</p><p class="theme-source">{{ stock.quoteLabel }} · {{ quoteSourceLabel(stock.source) }} · {{ formatTime(stock.sourceTime) }}</p></div><div class="focus-actions"><n-button size="small" secondary @click="addWatch(stock)">自选</n-button><n-button size="small" secondary @click="openKline(stock)">图表</n-button></div></div>
             <details v-if="stock.confirmed.length || stock.pending.length || stock.risks.length" class="sk-help-details"><summary>已确认条件与风险</summary><p v-for="item in stock.confirmed" :key="`confirmed-${item}`">已确认：{{ item }}</p><p v-for="item in stock.pending" :key="`pending-${item}`">待确认：{{ item }}</p><p v-for="item in stock.risks" :key="`risk-${item}`">风险：{{ item }}</p></details>
           </article>
         </div>
-        <p v-else class="theme-empty" role="status">{{ marketBrief.emptyMessage }}</p>
+        <p v-else class="theme-empty" role="status">{{ benchmarkStocks.length || unverifiedFocus.length ? '本轮题材关联股中，没有核实到尚未触板且有卖盘的股票。' : marketBrief.emptyMessage }}</p>
+        <details v-if="benchmarkStocks.length" class="sk-help-details"><summary>题材风向标 · 已触板 {{ benchmarkStocks.length }} 只</summary>
+          <p v-for="stock in benchmarkStocks" :key="stock.code">{{ stock.name }} {{ stock.code }} · {{ stock.limitEntry.status === 'at_limit' ? '扫描时已涨停' : '当日触板后回落' }} · 当时报价 ¥{{ observationPrice(stock.price) }} · 涨停价 ¥{{ observationPrice(stock.limitEntry.limitUp) }} · {{ formatTime(stock.sourceTime) }}</p>
+        </details>
+        <details v-if="unverifiedFocus.length" class="sk-help-details"><summary>题材跟踪 · 盘口待核验 {{ unverifiedFocus.length }} 只</summary>
+          <p v-for="stock in unverifiedFocus" :key="stock.code">{{ stock.name }} {{ stock.code }} · {{ stock.limitEntry.reason }} · {{ formatTime(stock.sourceTime) }}</p>
+        </details>
         <p class="theme-source">观察名单不代表已满足买入条件；报价过期后保留为扫描参考，交易前需重新核验。</p>
         <details v-if="marketBrief.gaps.length" class="sk-help-details"><summary>本轮观察数据缺口</summary><p v-for="gap in marketBrief.gaps" :key="gap">{{ gap }}</p></details>
+      </section>
+      <section class="focus-stocks" aria-label="本轮推荐">
+        <div class="theme-section-heading"><div><h3>{{ publication ? '本轮推荐 · ' + rankedPicks.length + ' 只' : '本轮推荐 · 未留存发布清单' }}</h3><p>扫描时间 {{ formatTime(adaptive.generatedAt || result.generatedAt) }}</p></div><n-button size="small" secondary @click="openRecommendationRecords">查看同轮记录</n-button></div>
+        <div v-if="rankedPicks.length" class="history-candidates"><n-tag v-for="stock in rankedPicks" :key="stock.code" :bordered="false">第 {{ stock.rank }} 名 · {{ stock.name }} · {{ stock.code }}</n-tag></div>
       </section>
       <section class="theme-feedback" aria-label="题材每日反馈">
         <div class="theme-section-heading"><div><h3>{{ feedbackHeading }}</h3><p>{{ activeFeedback.sourceDay ? `观察日 ${activeFeedback.sourceDay}` : '等待首次有效扫描与收盘核验' }} · 更新 {{ formatTime(activeFeedback.asOf) }}</p></div><n-tag size="small" :type="activeFeedback.available ? 'info' : 'warning'" :bordered="false">{{ activeFeedback.statusLabel }}</n-tag></div>
         <p v-if="activeFeedback.summary" class="theme-feedback-summary">{{ activeFeedback.summary }}</p>
         <div v-if="themeFeedback.marketBriefFeedback?.rows.length" class="theme-table-wrap">
           <table class="theme-review-table"><thead><tr><th>重点观察股</th><th>首次参考 → 收盘</th><th>观察后变化</th><th>核验情况</th></tr></thead><tbody>
-            <tr v-for="item in themeFeedback.marketBriefFeedback.rows" :key="item.code"><td>{{ item.name || item.code }} <code>{{ item.code }}</code></td><td>{{ item.referencePrice === null ? '未取得' : `¥${item.referencePrice.toFixed(2)}` }} → {{ item.closePrice === null ? '待核验' : `¥${item.closePrice.toFixed(2)}` }}</td><td>{{ themePercent(item.changePct, 2, true) }}</td><td>{{ item.gaps.join('；') || (item.changePct === null ? '证据待补齐' : '已核验价格变化') }}</td></tr>
+            <tr v-for="item in themeFeedback.marketBriefFeedback.rows" :key="item.code"><td>{{ item.name || item.code }} <code>{{ item.code }}</code></td><td>{{ item.referencePrice === null ? '未取得' : `¥${item.referencePrice.toFixed(2)}` }} → {{ item.closePrice === null ? '待核验' : `¥${item.closePrice.toFixed(2)}` }}</td><td>{{ themePercent(item.changePct, 2, true) }}</td><td>{{ item.gaps.join('；') || (item.changePct === null ? '证据待补齐' : '已核验价格变化') }}<small v-if="item.closeQuote?.source" class="theme-source"> · {{ item.closeQuote.source }}<template v-if="item.closeQuote.day"> · {{ item.closeQuote.day }}</template><template v-if="item.closeQuote.observed_at"> · 取证 {{ formatTime(item.closeQuote.observed_at) }}</template></small></td></tr>
           </tbody></table>
         </div>
         <details v-if="themeFeedback.themes.length" class="sk-help-details"><summary>完整题材反馈 · {{ themeFeedback.themes.length }} 个题材</summary>
@@ -1064,7 +1195,7 @@ onDeactivated(() => {
       </details>
     </section>
 
-    <PicksLedger v-for="mode in visitedLedgerModes" v-show="viewMode === mode" :key="mode" :mode="mode" :active="pageActive && viewMode === mode" :refresh-token="mode === 'records' ? recordsRefreshToken : 0" :display-run-id="recordsRunId" :display-as-of="adaptive.generatedAt || result.generatedAt || ''" :display-has-opportunities="opportunities.available" @open-chart="openKline" />
+    <PicksLedger v-for="mode in visitedLedgerModes" v-show="viewMode === mode" :key="mode" :mode="mode" :active="pageActive && viewMode === mode" :refresh-token="mode === 'records' ? recordsRefreshToken : 0" :records-view="recordsView" :display-run-id="recordsRunId" :display-as-of="adaptive.generatedAt || result.generatedAt || ''" :displayed-stocks="rankedPicks" :publication="publication" :review-filter="reviewFilter" @open-snapshot="openRecordSnapshot" @open-review="openStockReview" @open-chart="openKline" />
 
     <section v-show="viewMode === 'classic'">
       <n-tabs v-model:value="activeTier" type="segment" animated class="tier-tabs"><n-tab-pane v-for="tier in tierOptions" :key="tier.key" :name="tier.key"><template #tab><span class="tier-tab" :title="tier.note"><b>{{ tier.label }}</b></span></template></n-tab-pane></n-tabs>
@@ -1096,6 +1227,8 @@ onDeactivated(() => {
       </n-spin>
     </section>
     <n-drawer v-model:show="methodVisible" :width="500" placement="right"><n-drawer-content title="精选 · 方法与使用" closable><div class="pick-explanation">
+      <template v-if="viewMode === 'adaptive' && !viewingHistory"><h3>上涨潜力精选</h3><p>每轮最多五只。比较当时的趋势、上方空间和回落风险，剔除已经触及涨停的股票。临近涨停且尚未触板的股票仍可入选。首页和推荐记录读取同一份已发布名单。</p><p>自定义选股按照你输入的条件匹配本轮报价。核验结果可以查看已到期信号的后续走势。</p></template>
+      <template v-else>
       <ol class="usage-steps"><li><b>刷新扫描</b> · 检查列表生成时间、行情源时间和覆盖范围。</li><li><b>为何入选</b> · 查看实际因子、价格结构与失效条件。</li><li><b>图表</b> · 使用共用行情核对当前结构。</li><li><b>延后复盘</b> · 查看T+1、T+3、T+5的观察变化与模拟成交。</li></ol>
       <h3>机会精选 · 资金、持续趋势与入场位置</h3><p>全市场当日累计资金快照用于发现资金流向的板块和个股；随后核验同源30分钟资金净额、完整行业成分覆盖与持续价格结构，最后检查当前价格距结构低点的ATR距离。必需证据缺失时保留观察，不赋予 F-A 资格。每轮最多5只，不凑数；板块强度、个股强度、资金持续性、路径效率和入场距离的相对分位等权排序，展示原值、分位和权重。资金是供应商分类估算，排序不代表胜率或已成交收益。旧 E / M 名单保留原始版本，仅供历史复核。</p>
       <template v-if="isDailyPrimary"><h3>日线条件推荐</h3><p>使用上一完整交易日及更早的日K、当日新鲜报价、涨跌停状态、财报、业绩预告与解禁证据独立筛选。三档分别执行价格距离、压力空间和事件风险条件，每档最多5只；证据缺失或风险不满足仍可为空。日线条件以下一交易日（T+1）为观察目标，未经概率校准。</p><p>日线卡片展示原始日K指标、来源日期、支撑压力和风险缺口；分钟历史与上午模型的准备进度另列，日线条件不作为分钟模型已通过的证据。</p></template>
@@ -1106,6 +1239,7 @@ onDeactivated(() => {
       <h3>预测任务与复盘</h3><p>上午方向观察单独评估首次信号到当日收盘的表现与回撤，并保留T+1合法退出的扣费收益评估。下午入场任务继续考察下一交易日合法退出。潜伏、延续独立研究次日价格事件，不能用触板代替可成交盈利。各任务独立成熟、训练和验证。行情身份或价格路径存在冲突时隔离相关数据，旧模型不继续使用失效的数据版本。</p><p>模型使用时间顺序的训练、校准、滚动检验与最终留出。未完成验证时保留规则研究状态，不显示预测概率；启用模型后必须满足预期净收益和风险调整效用均为正，允许本轮零只。</p>
       <h3>策略分组</h3><p>V1.2三档共用研究排序，分别执行乖离、ATR、结构盈亏比、业绩与解禁门槛。事件风险覆盖未知时仅观察；已知负面业绩预告或超限解禁独立否决。激进档在分钟突破已核验时允许上方压力与盈亏比未知，但不生成目标价；已知盈亏比仍须达标。旧版不同策略的分值不能直接比较，旧契约模型不会用于新规则。</p>
       <details><summary>定时扫描与学习</summary><p>北京时间09:20盘前观察；09:40、09:55、10:30、14:55独立扫描；15:30归档与到期复盘；周五15:45本地训练。自动推荐和自动学习分别控制。错过时点保留遗漏记录，手动刷新不计入正式训练。</p><p>默认至少120个成熟交易日、1000条有效样本，并满足训练和校准分段要求后才检验模型。独立留出段至少60个信号日、50笔完成交易；训练与验证按实际标签结束时间隔离，至少留5个交易日间隔。扣费收益与相对优势的置信下界须为正，回撤不恶化，再从模型实际创建后开展至少20个交易日且至少50笔完成观察的前瞻影子验证。失败标签日与空仓日保留，未达要求继续使用规则。</p><p>本地精选读取后台最新完成并保存的扫描，页面可见时每30秒自动同步，返回页面时重新读取。主推荐、日线观察、潜伏与延续观察随同一快照更新。“刷新扫描”成功后以新结果覆盖当前列表，失败时保留已保存的结果；新一轮无合格候选时明确显示空结果。查看扫描历史时保留所选快照，点击“返回当前”恢复最新结果。模拟成交使用下一完整分钟入场，满足T+1后尝试期限收盘退出；遇跌停、停牌或容量不足则继续持仓，逐日标价并等待首个有完整证据的可卖分钟。缺路径不跳过，未成交独立记录；价格观察与模拟收益均不是用户真实交易。</p></details>
+      </template>
     </div></n-drawer-content></n-drawer>
     <n-drawer v-model:show="explanationVisible" :width="520" placement="right"><n-drawer-content :title="`${nameOf(selectedPick)} · ${selectedIsInsufficient ? '交易条件未满足' : '为什么入选'}`" closable><div class="pick-explanation">
       <h3>{{ explanation.title }}</h3><small>快照 {{ formatTime(adaptive.generatedAt || result.generatedAt) }} · 行情来源 {{ selectedEvidenceSummary && explanation.source === '未取得' ? '摘要未提供来源字段' : explanation.source }}<br/>推荐逻辑 {{ selectedEvidenceSummary && explanation.logicVersion === '旧记录未保存' ? '摘要未提供逻辑版本' : explanation.logicVersion }}</small>
@@ -1163,6 +1297,15 @@ onDeactivated(() => {
 </template>
 
 <style scoped>
+.pick-rank { font-weight: 600; color: var(--sk-text-muted); font-size: 13px; }
+.shortlist-empty { padding: 20px 0 8px; }
+.shortlist-empty p, .custom-screen p, .custom-results small { color: var(--sk-text-muted); }
+.custom-screen { display: grid; gap: 8px; }
+.custom-screen button { justify-self: start; }
+.custom-screen p, .custom-results p { margin: 4px 0 8px; }
+.custom-results { display: grid; gap: 8px; max-height: 46vh; overflow-y: auto; }
+.custom-pagination { display: flex; align-items: center; justify-content: space-between; }
+
 .picks-controls{margin:6px 0 14px;font-size:12px;color:var(--sk-text-muted)}
 .picks-control-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:14px 0 5px}
 .picks-more-details{margin:22px 0;border-top:1px solid var(--sk-border);padding:16px 0;font-size:13px}

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { priceObservationPercent, recordDisplayPayload, isOpportunitySelection } from './pickLedger.mjs'
+import { displayedRecordStocks, priceObservationPercent, recordDisplayPayload, isOpportunitySelection } from './pickLedger.mjs'
 import { primaryRecommendationPicks, primaryRecommendationState, firstRecommendationEvidence, dailyObservationPicks, primaryAdmissionReasons, marketBreadthSummary } from './pickLedger.mjs'
 import { groupSignals, ledgerPercent, ledgerPrice, ledgerSigned, reviewStatusLabel, reviewReasonLabel, visibleReviews, reviewProgress, learningEffect, reviewReturn, shanghaiDate, learningProgress, recordQuoteCode, recordQuoteCodes, signalPriceComparison, createRecordQuoteLoader, nextDaySignalOf, isNextDaySelection, signalSelectionLabel, nextDayPatternValue, savedRecommendationSummary, nextDayQueueLabel, nextDayTouchLabel } from './pickLedger.mjs'
 
@@ -447,4 +447,21 @@ test('same-round records use display identity, retain opportunity research, and 
   const empty = recordDisplayPayload({ items: [{ runId: 'empty', signals: [{ code: '600003', selected: true }] }] }, { scope: 'current', runId: 'empty', opportunityOnly: true })
   assert.deepEqual(groupSignals(empty), [])
   assert.equal(JSON.stringify(payload), frozen)
+})
+
+test('same scan ledger includes visible focus and recommendations while preserving each signal kind', () => {
+  const shown = displayedRecordStocks([{ code: '000001', name: '重点观察' }], [{ pick: { code: '600002' } }], [{ code: '600003' }])
+  const signals = [
+    { code: '000001', selected: false, marketBriefFocus: true, snapshot: { marketBriefFocus: { price: 12 } } },
+    { code: '600002', opportunitySelected: true }, { code: '600003', selected: true },
+    { code: '600004', nextDaySelected: true }, { code: '600005', marketBriefFocus: true },
+  ]
+  const payload = { items: [{ runId: 'source', displayRunId: 'display', signals }] }
+  const current = recordDisplayPayload(payload, { scope: 'current', runId: 'display', displayedStocks: shown })
+  const rows = groupSignals(current).flatMap(g => g.signals)
+  assert.deepEqual(rows.map(row => row.code), ['000001', '600002', '600003'])
+  assert.equal(signalSelectionLabel(rows[0]), '重点观察')
+  assert.equal(rows[0].selected, false)
+  assert.equal(rows[0].snapshot.marketBriefFocus.price, 12)
+  assert.deepEqual(recordDisplayPayload(payload, { scope: 'current', runId: 'empty', displayedStocks: shown }).items, [])
 })

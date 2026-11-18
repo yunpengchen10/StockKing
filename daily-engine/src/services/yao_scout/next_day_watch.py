@@ -12,17 +12,18 @@ import math
 from zoneinfo import ZoneInfo
 
 from .labels import calculate_limit_price
+from .limit_entry import assess_limit_entry
 from .research_factors import _sessions
 
 TZ = ZoneInfo('Asia/Shanghai')
-VERSION = 'next-day-limit-watch-v3'
-SUPPORTED_VERSIONS = frozenset({VERSION, 'next-day-limit-watch-v2', 'next-day-limit-watch-v1'})
+VERSION = 'next-day-limit-watch-v4'
+SUPPORTED_VERSIONS = frozenset({VERSION, 'next-day-limit-watch-v3', 'next-day-limit-watch-v2', 'next-day-limit-watch-v1'})
 MEANING = '未触板潜伏与已触板延续独立排序；未校准为涨停概率，观察入选不代表通过买入或成交检查'
 FIRST_BOARD_POLICY = {'minChangePct': -3., 'maxChangePct': 5., 'minLimitDistancePct': 4.,
                       'maxAtrExtension': 2.5, 'todayLimitTouchAllowed': False,
                       'knownPreviousSessionLimitCloseAllowed': False,
                       'limitMoveAtrFullScore': 3., 'limitMoveAtrZeroScore': 8.,
-                      'meaning': '时点未触及主板10%价格模式的潜伏研究；未核实昨日形态时不称已验证首板'}
+                      'meaning': '行情源时点尚未触及当日涨停价且有卖盘的潜伏研究；未核实昨日形态时不称已验证首板'}
 FIRST_BOARD_WEIGHTS = {'highPosition': 15, 'platformReadiness': 20, 'trend': 15,
                        'lowExtension': 15, 'rangeCapacity': 20, 'vwapSupport': 10, 'minuteStrength': 5}
 CONTINUATION_WEIGHTS = {'highPosition': 25, 'breakoutProximity': 25, 'trend': 20,
@@ -109,7 +110,8 @@ def build_next_day_watchlist(candidates, now, top_n=5, *, calendar_provider=None
         if not sessions:
             exclusions['calendar_unavailable'] += 1
             continue
-        if at.date() not in sessions or not time(9, 30) <= at.time().replace(tzinfo=None) <= time(15, 1):
+        clock = at.time().replace(tzinfo=None)
+        if at.date() not in sessions or not (time(9, 30) <= clock <= time(11, 30) or time(13) <= clock < time(15)):
             exclusions['no_trading_session_observation'] += 1
             continue
         later = [day for day in sessions if day > at.date()]
@@ -126,8 +128,14 @@ def build_next_day_watchlist(candidates, now, top_n=5, *, calendar_provider=None
             exclusions['unusable_price_or_special_session'] += 1
             continue
         change = (p/prev-1)*100
-        limit = calculate_limit_price(prev, code, at.date())
-        touched = high >= limit-.005
+        # T uses the provider's session limit and book at the decision. The
+        # separate T+1 label may only have a historical 10% price pattern.
+        limit_entry = assess_limit_entry(code, quote, now)
+        touched = limit_entry['status'] in {'at_limit', 'touched_limit'}
+        if not touched and not limit_entry['eligible']:
+            exclusions['limit_or_offer_unverified'] += 1
+            continue
+        limit = limit_entry['limitUp']
         distance = (limit/p-1)*100
         ordinary = FIRST_BOARD_POLICY['minChangePct']-1e-8 <= change <= FIRST_BOARD_POLICY['maxChangePct']+1e-8
         population['validQuotePrice'] += 1
@@ -190,7 +198,7 @@ def build_next_day_watchlist(candidates, now, top_n=5, *, calendar_provider=None
         if p >= daily['high20']*.97 and change > 0 and location >= .65:
             branches.append('平台突破蓄势')
         if touched and p >= limit*.98:
-            branches.append('触板形态延续（10%价位）')
+            branches.append('当日触板延续')
         if p > op and p > vwap and p >= daily['ma20'] and location >= .70:
             branches.append('分歧修复承接')
         if not branches:
@@ -252,19 +260,19 @@ def build_next_day_watchlist(candidates, now, top_n=5, *, calendar_provider=None
         if weakness_penalty:
             reasons.append(f'最新完整5分钟涨速{speed:+.2f}%，已观察转弱扣{weakness_penalty:.2f}分；等待重新转强')
         if queue == 'first_board':
-            reasons.insert(0, f'截至源时间当日涨跌{change:+.2f}%，盘中尚未触及10%模式价，距该价{distance:.2f}%；不与已触板股票争抢潜伏名额')
+            reasons.insert(0, f'截至源时间当日涨跌{change:+.2f}%，盘中最高价尚未触及行情源涨停价，距该价{distance:.2f}%；不与已触板股票争抢潜伏名额')
             reasons.append(f'较MA5延伸{extension:.2f}个ATR；优先观察未过度延伸的平台或修复结构')
-            reasons.append(f'历史ATR14占前收{daily["atr14"]/prev*100:.2f}%；今日10%模式幅度约{limit_move_atr:.2f}个ATR，作为冲板幅度与既有波动的比较，不是概率')
+            reasons.append(f'历史ATR14占前收{daily["atr14"]/prev*100:.2f}%；当日涨停幅度约{limit_move_atr:.2f}个ATR，作为冲板幅度与既有波动的比较，不是概率')
         else:
-            reasons.insert(0, f'盘中已触及10%模式价，当前涨跌{change:+.2f}%；仅进入延续队列，不占潜伏名额')
+            reasons.insert(0, f'盘中已触及行情源涨停价，当前涨跌{change:+.2f}%；仅进入延续队列，不占潜伏名额')
         signal = {'version': VERSION, 'target': 'next_session_limit_up', 'signalSession': at.date().isoformat(),
                   'targetSession': later[0].isoformat(), 'score': score, 'probability': None,
                   'scoreMeaning': MEANING, 'validationStatus': 'unvalidated_rules', 'branches': branches,
                   'reasons': reasons, 'gaps': gaps, 'executionEligible': False,
                   'queue': queue, 'queueLabel': queue_label, 'touchedLimitToday': touched,
-                  'previousSessionPattern': yesterday,
+                  'previousSessionPattern': yesterday, 'limitEntry': limit_entry,
                   'executionState': candidate.get('status'), 'sourceTime': at.isoformat(),
-                  'priceLimitBasis': '主板10%价格结构；未核验目标日ST/除权制度，复盘独立标记价格模式',
+                  'priceLimitBasis': '当日采用行情源涨停价；次日分钟复盘只记录主板10%价格模式，未核验目标日实际涨停价',
                   'referencePrice': p,
                   'trigger': '下一交易日观察突破与承接；交易前重新核验报价、盘口及风险',
                   'invalidation': '回落跌破支撑、无法成交或新披露利空时重新评估',
@@ -300,6 +308,71 @@ def build_next_day_watchlist(candidates, now, top_n=5, *, calendar_provider=None
     summary['weaknessPolicy'] = '新鲜5分钟转弱按同队列minuteStrength权重与尺度反向扣分；缺失不伪装成无风险，旧推荐不重排'
     return {'nextDayWatchlist': selected, 'nextDayContinuationWatchlist': continuation_selected,
             'nextDayResearch': summary, 'researchCandidates': research}
+
+
+def finalize_next_day_publication(run):
+    """Apply each queue's evidence gate at the completed scan's publication time."""
+    from src.services.public_market_quotes import market_phase
+    from .daily_opportunities import quote_check
+
+    ranked = run.pop('_nextDayRanking')
+    limit = run.pop('_nextDayLimit')
+    at = timestamp(run.get('generatedAt'))
+    target = timestamp((run.get('delivery') or {}).get('target_at'))
+    permitted = bool(at and market_phase(at) == 'continuous'
+        and run.get('status') in {'completed_observations', 'no_candidates_with_coverage_limits'})
+    if run.get('official') and target:
+        permitted = permitted and 0 <= (at-target).total_seconds() < 120
+
+    # A stock can appear in multiple views. Freeze one decision on every copy
+    # before the ledger projects the selected and control samples.
+    copies = {}
+    collections = [run.get(key) or [] for key in ('controls', 'candidates', 'precisionResearch',
+        'morningResearch', 'windvanes', 'evidenceInsufficient', 'precisionWatchlist', 'invalidatedCandidates')]
+    collections.extend((run.get('profileCandidates') or {}).values())
+    for collection in collections:
+        for row in collection:
+            copies.setdefault(row.get('code'), []).append(row)
+    queues = {'first_board': [], 'continuation': []}
+    rejected = 0
+    learning_rejected = sum(signal.get('selectionEligible') is False for _, signal in ranked)
+    for code, signal in ranked:
+        rows = copies.get(code, [])
+        quote = next((row['quote'] for row in rows if row.get('quote')), {})
+        evidence = assess_limit_entry(code, quote, at)
+        queue = signal['queue']
+        usable = (permitted and not quote_check(quote, code, at)
+                  and timestamp(signal['sourceTime']) == timestamp(evidence['sourceTime'])
+                  and signal['referencePrice'] == evidence['price']
+                  and ((queue == 'first_board' and evidence['eligible'] and signal['touchedLimitToday'] is False)
+                       or (queue == 'continuation' and evidence['status'] in ('at_limit', 'touched_limit')
+                           and signal['touchedLimitToday'] is True)))
+        selected = bool(usable and signal.get('selectionEligible') is not False and len(queues[queue]) < limit)
+        signal.update(limitEntry=evidence, publishedAt=run['generatedAt'],
+                      sourceUsableAtCompletion=usable, selected=selected)
+        if not usable:
+            rejected += 1
+            signal.update(selectionEligible=False,
+                selectionMissingReasons=[*(signal.get('selectionMissingReasons') or []),
+                                         'quote_or_delivery_expired_at_completion'])
+        for row in rows:
+            row['nextDaySignal'] = signal
+        if selected:
+            queues[queue].append({**rows[0], 'quote': quote, 'rank': len(queues[queue])+1,
+                'status': 'next_day_watch', 'stateLabel': signal['queueLabel'],
+                'horizon': '下一交易日', 'selectionReasons': signal['reasons']})
+    first, continuation = queues['first_board'], queues['continuation']
+    run.update(nextDayWatchlist=first, nextDayContinuationWatchlist=continuation)
+    summary = run['nextDayResearch']
+    summary.update(selectedCount=len(first), continuationSelectedCount=len(continuation),
+        publicationCheckedAt=run['generatedAt'], completionQuoteRejectedCount=rejected,
+        learningRejectedCount=learning_rejected,
+        learningStatuses=sorted({signal.get('learningStatus', 'rules_unvalidated') for _, signal in ranked}))
+    for key in ('dataQuality', 'data_quality'):
+        if key in run:
+            run[key]['next_day_research'] = summary
+    if permitted and 'opportunityChannels' not in run:
+        run['message'] += f'研究区有{len(first)}只次日未触板观察、{len(continuation)}只已触板延续观察。'
 
 
 def project_frozen_next_day(run):
@@ -493,7 +566,7 @@ def read_next_day_reviews(service, filters=None):
     as_of = timestamp(service.clock())
     calendar = _review_calendar(service.calendar_provider)
     versions = sorted(SUPPORTED_VERSIONS)
-    where = ["json_extract(e.snapshot_json,'$.nextDaySignal.version') IN ("
+    where = ["json_valid(e.snapshot_json)", "json_extract(e.snapshot_json,'$.nextDaySignal.version') IN ("
              + ','.join('?' for _ in versions) + ')']
     args = list(versions)
     if filters.get('include_controls') is False:

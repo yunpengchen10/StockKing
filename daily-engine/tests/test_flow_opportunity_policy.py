@@ -35,7 +35,7 @@ def inputs(code='600001', *, prices=None, flow_delta=1000., sector='A', scale=1.
             {'end': (cutoff-timedelta(minutes=30-i)).isoformat(), 'main_net_flow': i*flow_delta*scale}
             for i in range(31)]}
     row = {'code': code, 'name': '测试', 'fundEvidence': fund, 'dataLineage': {'status': 'verified'},
-        'quote': {'code': code, 'price': price, 'pre_close': 10., 'open_price': 10.,
+        'quote': {'code': code, 'price': price, 'pre_close': 10., 'open_price': 10., 'limit_up': 11.,
             'high': max(prices)+.2, 'low': min(prices)-.2, 'change_pct': (price/10-1)*100,
             'source': 'fixture_quote', 'source_time': now.isoformat(),
             'order_book': {'source': 'fixture_quote', 'source_time': now.isoformat(),

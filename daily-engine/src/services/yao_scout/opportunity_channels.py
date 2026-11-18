@@ -219,6 +219,9 @@ def _assess(candidate, now, minute, daily, context, previous, sector_flow):
     sector_flow = sector_flow or {}
     assessment = assess_flow_policy(row, minute, daily, quote, buy, trend, minute_at, now,
                                     stock_flow, sector_flow)
+    entry = assessment['limitEntry']
+    if entry['status'] in ('at_limit', 'touched_limit'):
+        hard.append(entry['reason'])
     missing.extend(assessment['missing'])
     support, counter = assessment['support'], assessment['counterEvidence']
     grade = 'C' if hard else 'F-A' if assessment['qualified'] else 'B'
@@ -249,7 +252,7 @@ def _assess(candidate, now, minute, daily, context, previous, sector_flow):
             'minuteSource': (minute or {}).get('source'), 'minuteAsOf': minute_at.isoformat() if minute_at else None,
             'bookSourceTime': buy['sourceTime']},
         'flowEvidence': {'stock': stock_flow, 'sector': deepcopy(sector_flow)},
-        'metrics': metrics, 'buyWindow': buy, 'spaceStatus': 'unknown', 'remainingSpacePct': None,
+        'metrics': metrics, 'buyWindow': buy, 'limitEntry': entry, 'spaceStatus': 'unknown', 'remainingSpacePct': None,
         'researchOnly': True, 'probability': None, 'disclosureEvidence': disclosures,
         'validationStatus': 'prospective_rules_unvalidated',
         'triggerMeaning': '固定窗口决策记录；不是已成交或事后重建首次触发',

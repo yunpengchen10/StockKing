@@ -33,6 +33,8 @@ def make_service(monkeypatch, start, tmp_path, fetch=None, batch=None):
         events.append(('quote', tick[0]))
         return {'code': code, 'source': 'tencent', 'price': 10, 'pre_close': 9.8, 'open_price': 9.7,
                 'limit_up': 10.78, 'limit_down': 8.82,
+                'order_book': {'source': 'tencent', 'source_time': tick[0].isoformat(),
+                               'asks': [{'price': 10.01, 'volume_shares': 1000}]},
                 'high': 10.05, 'low': 9.65, 'change_pct': 100*(10/9.8-1),
                 'amount': 980000000, 'volume':100000000, 'provider_timestamp': tick[0].isoformat(),
                 'active_buy_share_pct':60,'active_flow_source':'fixture','active_flow_as_of':tick[0].isoformat()}

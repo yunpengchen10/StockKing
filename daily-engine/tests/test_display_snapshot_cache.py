@@ -7,6 +7,62 @@ from types import SimpleNamespace
 from src.services.stock_king_display import LocalPicksDisplayStore, _MAX_HISTORY_READS
 
 
+def test_custom_screen_uses_all_distinct_frozen_quotes_and_only_verified_members():
+    from src.services.stock_king_display import _display_response
+    at = '2026-11-03T10:30:00+08:00'
+    def quote(code):
+        return {'code': code, 'name': code, 'provider_timestamp': at, 'source': 'fixture',
+                'price': 10.3, 'high': 10.4, 'pre_close': 10, 'limit_up': 11,
+                'order_book': {'source_time': at, 'source': 'fixture',
+                               'asks': [{'price': 10.31, 'volume_shares': 300}]}}
+    quotes = {str(code): quote(str(code)) for code in range(600010, 600023)}
+    quotes['600020']['high'] = 11
+    quotes['600021'].update(price=11, high=11)
+    quotes['600022']['order_book']['asks'] = []
+    watches = [{'code': '600010', 'quote': quotes['600010'], 'nextDaySignal': {
+        'queue': 'first_board', 'touchedLimitToday': False, 'sourceTime': at,
+        'selected': True, 'referencePrice': 10.3, 'branches': ['平台突破蓄势']}}]
+    run = {'generatedAt': at, 'dailyObservationQuotes': quotes, 'nextDayWatchlist': watches,
+           'controls': watches, 'themeBoard': {'themes': [
+               {'name': name, 'memberCodes': [code], 'membershipEligible': eligible, 'sourceTime': at}
+               for name, code, eligible in [('机器人', '600011', True), ('未核实', '600010', False)]]}}
+    shown = _display_response({'adaptive': run})['adaptive']
+    screen = shown['customScreen']
+    assert screen['checkedCount'] == 13 and screen['eligibleCount'] == 10
+    assert screen['excludedCounts'] == {'at_limit': 1, 'touched_limit': 1, 'unavailable': 1}
+    selected, other = screen['rows'][:2]
+    assert selected['code'] == '600010' and selected['firstBoardSelected'] and not selected['formalSelected']
+    assert selected['reasons'] == ['平台突破蓄势'] and selected['themes'] == []
+    assert other['code'] == '600011' and other['themes'] == ['机器人'] and not other['firstBoardSelected']
+    assert other['changePct'] == 3 and other['limitEntry']['askVolumeShares'] == 300
+    assert 'dailyObservationQuotes' not in shown and 'quote' not in other
+
+
+def test_custom_screen_resolves_latest_quotes_and_rejects_conflicts():
+    from datetime import datetime, timedelta
+    from src.services.stock_king_display import _custom_screen
+    now = datetime.fromisoformat('2026-11-03T10:30:00+08:00')
+    def quote(code, offset=0, **changes):
+        at = (now+timedelta(seconds=offset)).isoformat()
+        return {'code': code, 'name': code, 'source': 'fixture', 'source_time': at,
+                'price': 10, 'high': 10.5, 'pre_close': 9.9, 'limit_up': 10.89,
+                'order_book': {'source': 'fixture', 'source_time': at,
+                               'asks': [{'price': 10.01, 'volume_shares': 100}]}, **changes}
+    codes = [str(code) for code in range(600010, 600016)]
+    older = [quote(codes[0], -10), quote(codes[1], -10), quote(codes[2]), quote(codes[3]),
+             quote(codes[4], -10), quote(codes[5], -10)]
+    updates = [quote(codes[0], high=10.89), quote(codes[1], price=10.89, high=10.89),
+               quote(codes[2], price=10.2), quote(codes[3], limit_up=10.9),
+               quote(codes[4], order_book={}), quote(codes[5], 2, price=12)]
+    for a, b in ((older, updates), (updates, older)):
+        run = {'controls': [{'code': q['code'], 'quote': q} for q in a],
+               'dailyObservationQuotes': {q['code']: q for q in b}}
+        screen = _custom_screen(run, now)
+        assert [row['code'] for row in screen['rows']] == [codes[5]]
+        assert screen['excludedCounts'] == {'touched_limit': 1, 'at_limit': 1, 'conflicting': 2, 'unavailable': 1}
+        assert screen['rows'][0]['limitEntry']['sourceTime'] == older[5]['source_time']
+
+
 def scan(index, *, valid=True):
     return {'run_id': f'cache-{index}', 'mode': 'king_live', 'scanSlot': 'live',
             'status': 'completed_observations',
@@ -71,7 +127,8 @@ def test_external_atomic_snapshot_replacement_invalidates_shared_cache(tmp_path,
     os.replace(replacement, store.path)
     latest = LocalPicksDisplayStore(None).read()
     assert latest['displayRunId'] != first['displayRunId']
-    assert latest['adaptive'] == scan(2)
+    assert latest['adaptive']['publishedPicks']['status'] == 'unrecorded'
+    assert {k: v for k, v in latest['adaptive'].items() if k != 'publishedPicks'} == scan(2)
     assert json.loads(store.path.read_text(encoding='utf-8')) == frozen
 
 
@@ -166,3 +223,20 @@ def test_other_process_replace_after_save_never_caches_our_payload_under_its_fil
     assert store.save(scan(2))['displayRunId'] == 'cache-3'
     for _ in range(2):
         assert LocalPicksDisplayStore(None).read()['displayRunId'] == 'cache-3'
+
+
+def test_record_snapshot_reads_one_exact_scan_without_changing_the_display(tmp_path, monkeypatch):
+    monkeypatch.setenv('YAO_SCOUT_DATA_DIR', str(tmp_path))
+    run = {**scan(2), 'controls': [{'code': '600099'}]}
+    reads = []
+    def fetch(key):
+        reads.append(key)
+        return {'mode': 'king_live', 'run_id': key, 'result': run} if key == run['run_id'] else None
+    store = LocalPicksDisplayStore(SimpleNamespace(get_yao_run=fetch))
+    item = store.history_snapshot(run['run_id'])
+    assert item['result']['run_id'] == item['run_id'] == run['run_id']
+    assert item['result']['candidates'] == run['candidates']
+    assert 'controls' not in item['result']
+    assert store.history_snapshot('missing') is None
+    assert reads == [run['run_id'], 'missing']
+    assert not store.path.exists()

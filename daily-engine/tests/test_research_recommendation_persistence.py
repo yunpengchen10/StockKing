@@ -37,11 +37,13 @@ def test_display_counts_frozen_union_and_read_is_nonmutating(tmp_path, monkeypat
     store = LocalPicksDisplayStore(None)
     result = scan()
     saved = store.save(result)
-    assert saved["candidateCount"] == saved["tradeCandidateCount"] == 1
-    assert saved["nextDayCandidateCount"] == saved["savedRecommendationCount"] == 2
+    assert saved["candidateCount"] == saved["savedRecommendationCount"] == saved["publishedPickCount"] == 0
+    assert saved["tradeCandidateCount"] == 1 and saved["nextDayCandidateCount"] == 2
     assert saved["continuationCandidateCount"] == 1
     assert saved["displayRunId"] == "frozen-research"
-    assert saved["adaptive"] == result
+    assert saved["adaptive"]["publishedPicks"]["items"] == []
+    assert saved["adaptive"]["customScreen"]["eligibleCount"] == 0
+    assert {k: v for k, v in saved["adaptive"].items() if k not in {'publishedPicks', 'customScreen'}} == result
     # Simulate an existing display saved before response summaries were added.
     old = {key: value for key, value in saved.items() if key not in {
         "tradeCandidateCount", "nextDayCandidateCount", "savedRecommendationCount",

@@ -36,7 +36,7 @@ def test_daily_without_any_minutes_survives_display_restart(tmp_path, monkeypatc
     assert displayable_run(result)
     saved = LocalPicksDisplayStore(None).save(result)
     assert saved['dailyCandidateCount'] == saved['tradeCandidateCount'] == count
-    assert saved['savedRecommendationCount'] == count
+    assert saved['savedRecommendationCount'] == saved['publishedPickCount'] == 0
     before = (tmp_path/'local-picks-display-v1.json').read_bytes()
     assert LocalPicksDisplayStore(None).read() == saved
     assert (tmp_path/'local-picks-display-v1.json').read_bytes() == before
@@ -57,7 +57,9 @@ def test_missing_or_stale_daily_evidence_preserves_last_success(tmp_path, monkey
     result = scan()
     result['dailyAssessment'].update(change)
     assert not displayable_run(result)
-    with pytest.raises(ValueError, match='日线.*已保留上次结果'):
+    expected_error = ('当前时段的潜力参考价与趋势条件未同时通过核验；已保留上次结果'
+        if change.get('status') == 'outside_continuous_trading_window' else '日线.*已保留上次结果')
+    with pytest.raises(ValueError, match=expected_error):
         store.save(result)
     assert LocalPicksDisplayStore(None).read() == saved
 
@@ -86,7 +88,7 @@ def test_daily_assessment_cannot_cross_lunch_or_close_window():
 def test_daily_counts_never_include_other_research_queues(tmp_path, monkeypatch):
     monkeypatch.setenv('YAO_SCOUT_DATA_DIR', str(tmp_path))
     saved = LocalPicksDisplayStore(None).save(scan())
-    assert saved['dailyCandidateCount'] == saved['savedRecommendationCount'] == 1
+    assert saved['dailyCandidateCount'] == 1 and saved['savedRecommendationCount'] == 0
     assert saved['nextDayCandidateCount'] == 1
 
 
@@ -160,7 +162,9 @@ def test_sql_metadata_restores_daily_branch_and_does_not_repeat_payload_reads(tm
             saved = LocalPicksDisplayStore(db).read()
             if 'displayRecovery' not in saved:
                 break
-        assert saved['adaptive'] == valid and saved['dailyCandidateCount'] == 1
+        assert saved['adaptive']['publishedPicks']['status'] == 'unrecorded'
+        assert {k: v for k, v in saved['adaptive'].items() if k != 'publishedPicks'} == valid
+        assert saved['dailyCandidateCount'] == 1
         expected_reads = [row['run_id'] for row in (unknown, stale, missing, valid)]
         assert reads == expected_reads  # New metadata rows are validated once, in bounded batches.
         assert LocalPicksDisplayStore(db).read() == saved
@@ -190,7 +194,8 @@ def test_new_observation_snapshot_replaces_old_formal_list_without_promoting_res
     run['dailyObservationResearch'] = {'candidates': deepcopy(run['dailyCandidates'])}
     assert displayable_run(run)
     saved = store.save(run)
-    assert saved['tradeCandidateCount'] == saved['savedRecommendationCount'] == formal_count
+    assert saved['tradeCandidateCount'] == formal_count
+    assert saved['savedRecommendationCount'] == 0
     assert saved['dailyObservationCount'] == saved['dailyCandidateCount'] == observation_count
     assert saved['adaptive']['candidates'] == run['candidates']
     assert saved['adaptive']['dailyCandidates'] == run['dailyCandidates']
@@ -236,7 +241,8 @@ def test_verified_daily_observation_replaces_old_display_despite_stale_directory
 
     assert displayable_run(result)
     saved = store.save(result)
-    assert saved['adaptive'] == result
+    assert saved['adaptive']['publishedPicks']['status'] == 'published'
+    assert {k: v for k, v in saved['adaptive'].items() if k != 'publishedPicks'} == result
     assert saved['tradeCandidateCount'] == saved['savedRecommendationCount'] == 0
     assert saved['dailyObservationCount'] == count
     # Saving a new observation must not relabel the original old fields as live.
@@ -346,7 +352,8 @@ def test_history_headers_restore_repaired_observation_and_reject_formal_bypass(t
             saved = LocalPicksDisplayStore(db).read()
             if 'displayRecovery' not in saved:
                 break
-        assert saved['adaptive'] == valid
+        assert saved['adaptive']['publishedPicks']['status'] == 'unrecorded'
+        assert {k: v for k, v in saved['adaptive'].items() if k != 'publishedPicks'} == valid
         assert reads == [row['run_id'] for row in (invalid_profile, invalid_main, valid)]
         assert LocalPicksDisplayStore(None).read() == saved
     finally:

@@ -1143,37 +1143,11 @@ class LocalOpportunityService(DailyOpportunityService):
                 p['primaryAdmission']['missingReasons']) for p in researched)
                 for reason in sorted({reason for p in researched for reason in
                     p['primaryAdmission']['reasons'] + p['primaryAdmission']['missingReasons']})}}
-        for row in next_research:
-            source_usable = not quote_check(row.get('quote') or {}, row['code'], completion_at)
-            row['nextDaySignal']['sourceUsableAtCompletion'] = source_usable
-            if not reviewable or not source_usable:
-                row['nextDaySignal'].update(selectionEligible=False, selected=False,
-                    selectionMissingReasons=['quote_or_delivery_expired_at_completion'])
-        for queue, key in (('first_board','nextDayWatchlist'), ('continuation','nextDayContinuationWatchlist')):
-            eligible = [row for row in next_research if row['nextDaySignal']['queue']==queue
-                        and row['nextDaySignal'].get('selectionEligible') is not False]
-            run[key] = [{**row, 'rank':rank, 'status':'next_day_watch',
-                'stateLabel':row['nextDaySignal']['queueLabel'],
-                'horizon':'下一交易日', 'selectionReasons':row['nextDaySignal']['reasons'],
-                'nextDaySignal':{**row['nextDaySignal'], 'selected':True}}
-                for rank, row in enumerate(eligible[:limit], 1)]
         run['nextDayResearch'] = next_day['nextDayResearch']
-        run['nextDayResearch'].update(selectedCount=len(run['nextDayWatchlist']),
-            continuationSelectedCount=len(run['nextDayContinuationWatchlist']),
-            learningStatuses=sorted({row['nextDaySignal'].get('learningStatus','rules_unvalidated') for row in next_research}),
-            completionQuoteRejectedCount=sum(not row['nextDaySignal']['sourceUsableAtCompletion'] for row in next_research),
-            learningRejectedCount=sum(row['nextDaySignal'].get('selectionEligible') is False for row in next_research))
-        next_selected = {row['code'] for row in run['nextDayWatchlist'] + run['nextDayContinuationWatchlist']}
-        next_signals = {row['code']: {**row['nextDaySignal'], 'selected': row['code'] in next_selected}
-                        for row in next_research}
-        for candidate in researched:
-            if candidate['code'] in next_signals:
-                candidate['nextDaySignal'] = next_signals[candidate['code']]
-        for collection in run['profileCandidates'].values():
-            for candidate in collection:
-                if candidate['code'] in next_signals:
-                    candidate['nextDaySignal'] = next_signals[candidate['code']]
-        quality['next_day_research'] = run['nextDayResearch']
+        # The final timestamp is set after all remaining scan work. Keep the
+        # learned order and frozen signals until that timestamp is available.
+        run['_nextDayRanking'] = [(row['code'], row['nextDaySignal']) for row in next_research]
+        run['_nextDayLimit'] = limit
         quality['factorAvailability'] = {key:{
             'observed':sum(bool((p.get('factorAvailability',{}).get(key) or {}).get('available')) for p in researched),
             'missing':sum(not bool((p.get('factorAvailability',{}).get(key) or {}).get('available')) for p in researched),
@@ -1185,9 +1159,6 @@ class LocalOpportunityService(DailyOpportunityService):
                 run['status'] = 'completed_observations'
             else:
                 run['status'] = 'no_candidates_with_coverage_limits'
-            run['message'] = (f'本轮主推荐{len(run["candidates"])}只；缺证据、风险未通过或上午模型未验证时不补位。'
-                              f'研究区另有{len(run["nextDayWatchlist"])}只次日潜伏、'
-                              f'{len(run["nextDayContinuationWatchlist"])}只延续观察；观察排序未校准为上涨概率。')
         selected_codes = {candidate['code'] for candidate in run['candidates']}
         run['controls'] = [candidate for candidate in researched if candidate['code'] not in selected_codes]
         run['scoreVersion'] = SCORE_VERSION
@@ -1239,9 +1210,7 @@ class LocalOpportunityService(DailyOpportunityService):
             candidates=researched, slot=slot, official=bool(run.get('official'))))
         quality['admission_diagnostics'] = run['admissionDiagnostics']
         if reviewable:
-            run['message'] = (run['admissionDiagnostics']['summary']
-                + f'研究区：{len(run["nextDayWatchlist"])}只次日潜伏、'
-                  f'{len(run["nextDayContinuationWatchlist"])}只延续观察。')
+            run['message'] = run['admissionDiagnostics']['summary']
         if daily_queued:
             run['message'] += f'另有{len(run["dailyCandidates"])}只日线观察，未计入正式主榜。'
         if self.selection_mode == 'auto':
@@ -1329,6 +1298,9 @@ class LocalOpportunityService(DailyOpportunityService):
         """Finish research and ledger work inside the official slot claim."""
         from .signal_learning import SignalLearningService
         result = clean(run)
+        if '_nextDayRanking' in result:
+            from .next_day_watch import finalize_next_day_publication
+            finalize_next_day_publication(result)
         result.update(modelVersion=SCORE_VERSION, model_version=SCORE_VERSION, llmUsed=False)
         slot = result.get('scanSlot')
         if slot == 'review' and result.get('status') == 'audit_only':
@@ -1341,9 +1313,14 @@ class LocalOpportunityService(DailyOpportunityService):
                 result['dailyObservationReview'] = {'status': 'failed', 'reason': type(error).__name__}
             # Preserve the independent daily checkpoint before new public I/O.
             self.db.save_yao_run(clean(result))
-            from .theme_feedback import ThemeFeedbackStore
+            from .daily_observation_queue import review_published_closes
             try:
-                feedback_store = ThemeFeedbackStore(self.yao.data_dir)
+                result['publishedCloseReview'] = review_published_closes(learning)
+            except Exception as error:
+                result['publishedCloseReview'] = {'status': 'failed', 'reason': type(error).__name__}
+            from .theme_feedback import ThemeFeedbackStore
+            feedback_store = ThemeFeedbackStore(self.yao.data_dir)
+            try:
                 pending = feedback_store.pending_codes(self.clock(), limit=2000)
                 batches, _ = bounded_fetch_map(self._quotes,
                     [pending[start:start+20] for start in range(0, len(pending), 20)],
@@ -1351,8 +1328,18 @@ class LocalOpportunityService(DailyOpportunityService):
                 close_quotes = {code: quote for batch in batches for code, quote in batch.items()}
                 result['themeFeedback'] = feedback_store.review(self.clock(), close_quotes)
             except Exception as error:
-                result['themeFeedback'] = {'status': 'unavailable', 'summary': '题材复盘证据暂未齐备',
+                result['themeFeedback'] = {'status': 'unavailable', 'summary': '盘后快照核验暂不可用',
                     'gaps': [type(error).__name__]}
+            try:
+                recovered = feedback_store.retry_daily_closes(self.clock(), clock=self.clock)
+                for report in recovered:
+                    if report['sourceDay'] == self.clock().date().isoformat():
+                        result['themeFeedback'] = report
+                result['themeCloseRetries'] = [{'sourceDay': row['sourceDay'], 'checkedAt': row['asOf'],
+                    'observedCount': row['observedCount'],
+                    'watchObservedCount': row['marketBriefFeedback']['observedCount']} for row in recovered]
+            except Exception as error:
+                result['themeCloseRetryError'] = type(error).__name__
             self.db.save_yao_run(clean(result))
             # Settle existing evidence before potentially slow public I/O. Save
             # this checkpoint so interruption cannot hide work already done.
@@ -1372,6 +1359,10 @@ class LocalOpportunityService(DailyOpportunityService):
                 result['priorityMinuteArchive'] = {'status': 'failed', 'reason': type(error).__name__}
             result['reviewProgress'] = {'stage': 'signal_review_saved', 'at': self.clock().isoformat()}
             self.db.save_yao_run(clean(result))
+            try:
+                result['recordHistoryIndex'] = learning.backfill_record_history(limit=32)
+            except Exception as error:
+                result['recordHistoryIndex'] = {'status': 'failed', 'reason': type(error).__name__}
             try:
                 result['observationReview'] = review_local_observations(
                     self.db, self.quote_fetcher, self.clock(), clock=self.clock)
@@ -1451,7 +1442,20 @@ class LocalOpportunityService(DailyOpportunityService):
                     self.clock(), max_labels=120, budget_seconds=1.0)
             except Exception as error:
                 result['dailyObservationReview'] = {'status': 'failed', 'reason': type(error).__name__}
-        self.db.save_yao_run(clean(result))
+        from .potential_picks import prepare_reference_assessment
+        prepare_reference_assessment(result)
+        from src.services.stock_king_display import LocalPicksDisplayStore, displayable_run, publish_picks
+        if result.get('run_id') and displayable_run(result):
+            def freeze_scan(publication):
+                result['publishedPicks'] = publication
+                result['publishedPickCount'] = len(publication['items']) if publication['status'] == 'published' else None
+                self.db.save_yao_run(clean(result))
+            publish_picks(self.yao.data_dir, result, persist=freeze_scan)
+            if (result.get('publishedPicks') or {}).get('status') == 'published':
+                LocalPicksDisplayStore(self.db, data_dir=self.yao.data_dir).save(
+                    result, source='scheduled' if result.get('official') else 'manual')
+        else:
+            self.db.save_yao_run(clean(result))
         if (slot in ('live', '0940', '0955', '1030', '1455')
                 and not result.get('premarketAssessment')
                 and result.get('status') in ('completed_observations', 'no_candidates_with_coverage_limits')):

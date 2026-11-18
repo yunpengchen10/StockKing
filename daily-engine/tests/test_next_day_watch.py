@@ -27,7 +27,9 @@ def candidate(code='600001', price=10.5):
             'decision_at': NOW.isoformat(), 'referencePrice': price, 'dailyLastClose': 10.,
             'quote': {'code': code, 'source': 'fixture', 'provider_timestamp': NOW.isoformat(),
                       'price': price, 'pre_close': 10., 'open_price': 10.1, 'high': max(price, 10.6),
-                      'low': 10., 'volume': 1000000, 'amount': 10200000},
+                      'low': 10., 'volume': 1000000, 'amount': 10200000, 'limit_up': 11.,
+                      'order_book': {'source': 'fixture', 'source_time': NOW.isoformat(),
+                                     'asks': [{'price': round(price+.01, 2), 'volume_shares': 1000}]}},
             'dataEligibility': {'status': 'observation', 'amountHistoryDays': 8, 'priceHistoryDays': 8},
             'precisionDecision': {'profiles': {'regular': {'entryEligible': False}},
                                   'sourceContext': {'coverage': {'forecast': False, 'unlock': False}}},
@@ -80,7 +82,7 @@ def test_locked_limit_is_researchable_but_suspension_and_known_adverse_event_are
     row['quote']['locked_limit_up'] = True
     result = build_next_day_watchlist([row], NOW, calendar_provider=calendar)
     assert not result['nextDayWatchlist']
-    assert '触板形态延续（10%价位）' in result['nextDayContinuationWatchlist'][0]['nextDaySignal']['branches']
+    assert '当日触板延续' in result['nextDayContinuationWatchlist'][0]['nextDaySignal']['branches']
     assert not result['nextDayContinuationWatchlist'][0]['nextDaySignal']['executionEligible']
     row['quote']['suspended'] = True
     assert not build_next_day_watchlist([row], NOW, calendar_provider=calendar)['researchCandidates']
@@ -220,6 +222,39 @@ def test_limit_touch_then_retreat_to_three_percent_never_enters_latent_pool():
     assert result['nextDayResearch']['populationCounts']['todayTouched'] == 1
 
 
+@pytest.mark.parametrize('book_change', ['missing_limit', 'empty_ask', 'zero_size', 'stale_book'])
+def test_prelimit_requires_an_observed_limit_and_a_live_offer(book_change):
+    row = candidate(price=10.3)
+    q = row['quote']
+    if book_change == 'missing_limit':
+        del q['limit_up']
+    elif book_change == 'empty_ask':
+        q['order_book']['asks'] = []
+    elif book_change == 'zero_size':
+        q['order_book']['asks'][0]['volume_shares'] = 0
+    else:
+        q['order_book']['source_time'] = (NOW-timedelta(seconds=31)).isoformat()
+    result = build_next_day_watchlist([row], NOW, calendar_provider=calendar)
+    assert not result['nextDayWatchlist'] and not result['nextDayContinuationWatchlist']
+    assert result['nextDayResearch']['exclusionCounts']['limit_or_offer_unverified'] == 1
+
+
+def test_provider_limit_and_opened_limit_are_frozen_in_distinct_queues():
+    first = candidate('600030', price=10.3)
+    first['quote']['high'] = 10.4
+    opened = candidate('600031', price=10.85)
+    opened['quote']['high'] = 11
+    result = build_next_day_watchlist([first, opened], NOW, calendar_provider=calendar)
+    pre, = result['nextDayWatchlist']
+    assert pre['nextDaySignal']['limitEntry']['status'] == 'pre_limit'
+    assert pre['nextDaySignal']['limitEntry']['limitUp'] == 11
+    assert pre['nextDaySignal']['limitEntry']['askPrice'] == 10.31
+    assert pre['nextDaySignal']['executionEligible'] is False
+    past, = result['nextDayContinuationWatchlist']
+    assert past['nextDaySignal']['limitEntry']['status'] == 'touched_limit'
+    assert past['nextDaySignal']['touchedLimitToday'] is True
+
+
 def test_seven_percent_untouched_is_not_disguised_as_ordinary_or_continuation():
     row = candidate(price=10.7)
     result = build_next_day_watchlist([row], NOW, calendar_provider=calendar)
@@ -230,7 +265,7 @@ def test_seven_percent_untouched_is_not_disguised_as_ordinary_or_continuation():
 def test_price_tick_limit_and_ordinary_move_boundaries_are_not_integer_percentage_tests():
     row = candidate(price=6.75)
     row['dailyLastClose'] = row['quote']['pre_close'] = 6.14
-    row['quote'].update(open_price=6.2, high=6.75, low=6.14, amount=6400000)
+    row['quote'].update(open_price=6.2, high=6.75, low=6.14, amount=6400000, limit_up=6.75)
     for item in row['indicatorEvidence'][:-1]:
         item['value'] = {'ma5': 6.2, 'ma10': 6.1, 'ma20': 6., 'high20': 6.7, 'atr14': .2}[item['key']]
     result = build_next_day_watchlist([row], NOW, calendar_provider=calendar)

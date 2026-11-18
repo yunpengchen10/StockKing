@@ -12,6 +12,7 @@ import * as pickLedger from './pickLedger.mjs'
 import * as premarket from './premarket.mjs'
 import * as opportunityDisplay from './opportunityDisplay.mjs'
 import * as themeDisplay from './themeDisplay.mjs'
+import * as customStockScreen from './customStockScreen.mjs'
 
 const flush = async () => { for (let n = 0; n < 30; n++) await Promise.resolve(); await vue.nextTick() }
 const deferred = () => {
@@ -26,7 +27,185 @@ const snapshot = (generatedAt, source = 'scheduled') => ({
 const oldSnapshot = () => snapshot('2026-07-13T10:30:00+08:00', 'manual')
 const latestSnapshot = () => snapshot('2026-10-13T10:30:00+08:00')
 
-test('default page connects real market-event observations while folding technical modules and preserving historical dates', async () => {
+const publishedRow = (rank, code, name, sourceTime, price = 10.3) => ({
+  rank, code, name, price, sourceTime, source: 'sina', basisLabel: '盘中量价',
+  reasons: [`${name}的价格在成交均价之上，短期均线向上`], risk: `${name}跌破本轮支撑则重新评估`,
+})
+
+function publish(saved, runId, items) {
+  saved.adaptive.run_id = runId
+  saved.adaptive.publishedPicks = {
+    runId, asOf: saved.generatedAt, publishedAt: saved.generatedAt, version: 'potential-picks-v1', status: 'published', items,
+  }
+}
+
+test('homepage shows the five published rows, shares their order with records, and screens beyond the list', async () => {
+  const saved = snapshot('2026-11-16T14:31:14+08:00')
+  const stamp = '2026-11-16T14:31:03+08:00'
+  const universe = Array.from({length: 9}, (_, i) => {
+    const code = String(600001 + i), price = 10 + i / 100
+    const limitEntry = { code, status: 'pre_limit', eligible: true, price, limitUp: 11, sessionHigh: price,
+      askPrice: price + .01, askVolumeShares: 20000, source: 'quote', sourceTime: stamp,
+      bookSource: 'quote', bookSourceTime: stamp, limitSource: 'quote', limitSourceTime: stamp }
+    return {code, name: '样本'+i, changePct: 3, limitEntry}
+  })
+  saved.adaptive.customScreen = { asOf: saved.generatedAt, checkedCount: 10, rows: universe }
+  const picks = universe.slice(0, 7).map(row => ({...row, ruleRecommendation: true,
+    opportunity: { grade: 'F-A', channel: 'F', limitEntry: row.limitEntry, supports: ['资金和持续趋势均已确认'] } }))
+  saved.adaptive.opportunityChannels = { recommendations: picks }
+  saved.adaptive.nextDayWatchlist = [{code: '600099', name: '只供研究的股票'},
+    { ...universe[3], nextDaySignal: { queue: 'first_board', touchedLimitToday: false, selected: true,
+      limitEntry: universe[3].limitEntry, targetSession: '2026-11-17' } }]
+  const orderedRows = [5, 0, 6, 4, 1].map((index, slot) =>
+    publishedRow(slot + 1, universe[index].code, universe[index].name, stamp, universe[index].limitEntry.price))
+  publish(saved, 'king-live-fixture', orderedRows)
+  const oldSignals = {runId: 'old-controls', signals: [{code: '600098', name: '旧对照样本', selected: false}]}
+  const mounted = mountPicks({
+    GetDisplayedKingPicks: async () => saved,
+    GetStockKingRecommendationHistory: async () => ({recordsVersion: 'published-picks-v1', items: [oldSignals, saved.adaptive.publishedPicks]}),
+  }, null, Date.parse(saved.generatedAt))
+  try {
+    await flush()
+    const state = mounted.state()
+    const page = mounted.visibleText()
+    assert.match(page, /上涨潜力精选/)
+    assert.match(page, /首选.*第\s*2\s*名.*第\s*5\s*名/s)
+    assert.doesNotMatch(page, /次日观察|目标交易日|只供研究的股票|样本2|样本3|第\s*6\s*名/)
+    const codes = state.rankedPicks.map(row => row.code)
+    assert.deepEqual(codes, orderedRows.map(row => row.code))
+    for (const row of state.rankedPicks) {
+      assert.ok(page.includes(row.name))
+      assert.ok(row.reasons.length && row.reasons.some(reason => page.includes(reason)))
+      assert.ok(row.risk && page.includes(row.risk))
+    }
+    assert.deepEqual(state.rankedPicks.map(row => page.indexOf(row.name)).sort((a, b) => a - b),
+      state.rankedPicks.map(row => page.indexOf(row.name)))
+    state.openRecommendationRecords()
+    await flush()
+    assert.deepEqual(mounted.ledgerStocks().map(row => row.code), codes)
+    for (const scope of ['current', 'history']) {
+      mounted.ledgerState().recordsScope = scope
+      await flush()
+      const ledgerPage = mounted.visibleText()
+      assert.match(ledgerPage, /首选.*样本5.*第 2 名.*样本0.*第 5 名.*样本1/s)
+      assert.doesNotMatch(ledgerPage, /旧对照样本|样本2|样本3/)
+      for (const row of orderedRows) assert.ok(ledgerPage.includes(row.reasons[0]) && ledgerPage.includes(row.risk))
+    }
+    state.viewMode = 'adaptive'
+    state.openCustomScreen()
+    state.screenDraft = '股价低于20元，涨幅大于2%，卖一量不少于1万股'
+    state.applyCustomScreen()
+    await flush()
+    assert.match(mounted.visibleText(), /匹配 9 只/)
+    assert.equal(state.screenMatches.length, 5)
+    state.screenPage = 1
+    assert.equal(state.screenMatches.length, 4)
+    assert.equal(state.screenMatches[3].row.code, '600009')
+    state.screenDraft = '未来一定涨停'
+    state.applyCustomScreen()
+    assert.equal(state.screenResult.status, 'invalid')
+    state.openCustomScreen()
+    assert.match(state.screenDraft, /^股价低于20元/)
+    state.screenDraft = '600009'
+    state.applyCustomScreen()
+    assert.deepEqual(state.screenMatches.map(match => match.row.code), ['600009'])
+    state.screenVisible = false
+    state.result = { ...saved, adaptive: {...saved.adaptive, publishedPicks: {...saved.adaptive.publishedPicks, items: []}} }
+    await flush()
+    assert.doesNotMatch(mounted.visibleText(), /本轮没有合格推荐|次日观察首选|样本|只供研究的股票/)
+  } finally { mounted.dispose() }
+})
+
+test('premarket, intraday, and closing scans each show their own frozen publication and matching records', async () => {
+  const premarket = snapshot('2026-11-17T09:20:00+08:00')
+  const morning = snapshot('2026-11-17T10:30:12+08:00')
+  const evening = snapshot('2026-11-17T15:30:10+08:00')
+  const morningStamp = '2026-11-17T10:29:57+08:00'
+  const closeStamp = '2026-11-17T15:00:00+08:00'
+  const first = publishedRow(1, '600009', '上午首位样本', morningStamp)
+  const second = publishedRow(2, '600010', '上午次位样本', morningStamp, 9.6)
+  publish(premarket, 'king-0920-fixture', [
+    {...publishedRow(1, '600017', '盘前样本', '2026-11-16T15:00:00+08:00', 18.7), basisLabel: '前收盘量价'},
+  ])
+  publish(morning, 'king-1030-fixture', [first, second])
+  publish(evening, 'king-close-fixture', [
+    {...publishedRow(1, '600015', '收盘样本', closeStamp, 20.4), basisLabel: '收盘量价'},
+  ])
+  const original = JSON.stringify([premarket, morning, evening])
+  const mounted = mountPicks({GetDisplayedKingPicks: async () => premarket}, null, Date.parse(premarket.generatedAt))
+  const state = mounted.state()
+  const assertPublication = async (saved, absent) => {
+    await flush()
+    const expected = saved.adaptive.publishedPicks.items
+    const page = mounted.visibleText()
+    assert.doesNotMatch(page, absent)
+    assert.match(page, /上涨潜力精选/)
+    for (const row of expected) {
+      assert.ok(page.includes(row.name) && page.includes(row.code))
+      assert.ok(page.includes(row.reasons[0]) && page.includes(row.risk))
+      assert.ok(page.includes(row.sourceTime.slice(11, 19)))
+    }
+    assert.deepEqual(state.rankedPicks.map(row => row.code), expected.map(row => row.code))
+    state.openRecommendationRecords()
+    await flush()
+    assert.deepEqual(mounted.ledgerStocks().map(row => [row.rank, row.code, row.price, row.reasons, row.risk]),
+      expected.map(row => [row.rank, row.code, row.price, row.reasons, row.risk]))
+    state.viewMode = 'adaptive'
+  }
+  try {
+    await assertPublication(premarket, /次日观察|上午首位样本|收盘样本|第\s*2\s*名/)
+    state.result = morning
+    await assertPublication(morning, /次日观察|盘前样本|收盘样本|第\s*3\s*名/)
+    state.result = evening
+    await assertPublication(evening, /上午首位样本|上午次位样本|次日观察|第\s*2\s*名/)
+    const emptyPublication = {...evening.adaptive.publishedPicks, items: []}
+    for (const publication of [undefined, {...evening.adaptive.publishedPicks, runId: morning.adaptive.run_id},
+      {...evening.adaptive.publishedPicks, status: 'unrecorded'}, emptyPublication]) {
+      state.result = {...evening, adaptive: {...evening.adaptive, publishedPicks: publication,
+        nextDayWatchlist: [{code: '600099', name: '未发布候选'}]}}
+      await flush()
+      assert.deepEqual(state.rankedPicks, [])
+      assert.doesNotMatch(mounted.visibleText(), /收盘样本|上午首位样本|未发布候选/)
+      assert.equal(Boolean(state.publication), publication === emptyPublication)
+      state.openRecommendationRecords()
+      await flush()
+      assert.deepEqual(mounted.ledgerStocks(), [])
+      state.viewMode = 'adaptive'
+    }
+    assert.equal(JSON.stringify([premarket, morning, evening]), original)
+  } finally { mounted.dispose() }
+})
+
+test('first-board candidates show their contemporaneous offer and a sealed theme leader is a benchmark', async () => {
+  const saved = snapshot('2026-11-16T14:31:08+08:00')
+  const stamp = '2026-11-16T14:31:03+08:00'
+  const entry = { eligible: true, status: 'pre_limit', price: 14.95, sessionHigh: 14.99, limitUp: 16.20,
+    askPrice: 14.96, askVolumeShares: 5100, bookSource: 'fixture', bookSourceTime: stamp }
+  const pick = { code: '000902', name: '板前样本', nextDaySignal: { queue: 'first_board', selected: true,
+    targetSession: '2026-11-17', touchedLimitToday: false, referencePrice: 14.95, limitEntry: entry } }
+  saved.adaptive.nextDayWatchlist = [pick, { ...pick, code: '600004', name: '缺卖盘样本',
+    nextDaySignal: { ...pick.nextDaySignal, limitEntry: { eligible: false } } }]
+  saved.adaptive.marketBrief = { version: 'market-brief-v1', asOf: saved.generatedAt, focusStocks: [{
+    name: '封板样本', code: '600001', price: 4.36, changePct: 10, sourceTime: stamp, source: 'fixture',
+    limitEntry: { eligible: false, status: 'at_limit', limitUp: 4.36 }, status: 'watch',
+  }] }
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
+  try {
+    mounted.state().viewMode = 'archive'
+    await flush()
+    const page = mounted.visibleText()
+    assert.match(page, /涨停前观察 · 1 只.*板前样本.*观察日 2026-11-17.*当时卖一 ¥14\.96（5100 股）.*当日涨停价 ¥16\.20/s)
+    assert.match(page, /题材风向标 · 已触板 1 只/)
+    assert.match(page, /本轮推荐 · 未留存发布清单/)
+    assert.doesNotMatch(page, /封板样本|缺卖盘样本/)
+    assert.match(mounted.text(), /封板样本 600001 · 扫描时已涨停/)
+    mounted.state().openRecommendationRecords()
+    await flush()
+    assert.deepEqual(mounted.ledgerStocks(), [])
+  } finally { mounted.dispose() }
+})
+
+test('scan archive connects real market-event observations while folding technical modules and preserving historical dates', async () => {
   const saved = snapshot('2026-11-13T10:30:00+08:00')
   saved.adaptive.themeBoard = { status: 'unavailable', themes: [], gaps: ['完整成分未齐'] }
   saved.adaptive.opportunityChannels = { version: 'opportunity-theme-20261113-v1', recommendations: [],
@@ -45,6 +224,7 @@ test('default page connects real market-event observations while folding technic
   const before = JSON.stringify(saved)
   const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
   try {
+    mounted.state().viewMode = 'archive'
     await flush()
     const visible = mounted.visibleText()
     assert.ok(visible.indexOf('今日主线') < visible.indexOf('重点股票'))
@@ -52,6 +232,9 @@ test('default page connects real market-event observations while folding technic
     assert.match(visible, /昨日题材今日跟踪/)
     assert.match(visible, /事件 2026-11-12 · fixture:event/)
     assert.match(visible, /事件关联股票样本600001/)
+    assert.deepEqual(mounted.state().rankedPicks, [])
+    assert.match(visible, /本轮推荐 · 未留存发布清单/)
+    assert.match(visible, /查看同轮记录/)
     assert.match(visible, /观察 \/ 等待确认/)
     assert.match(visible, /¥10.50/)
     assert.match(visible, /资金与入场位置等待确认/)
@@ -59,7 +242,7 @@ test('default page connects real market-event observations while folding technic
     assert.match(visible, /昨日观察样本.*¥10.00 → ¥10.40.*\+4.00%/s)
     assert.match(visible, /缺收盘样本.*待核验.*未取得.*缺收盘报价/s)
     assert.doesNotMatch(visible, /旧完整题材反馈/)
-    assert.doesNotMatch(visible, /题材证据待补齐|资金证据不可用|自动学习|模型验证精选|策略分组/)
+    assert.doesNotMatch(visible, /题材证据待补齐|资金证据不可用|模型验证精选/)
     assert.match(mounted.text(), /资金证据不可用/)
     assert.match(mounted.text(), /非全概念成分排名/)
     assert.equal(mounted.state().adaptivePicks.length, 0)
@@ -68,7 +251,6 @@ test('default page connects real market-event observations while folding technic
     assert.match(mounted.visibleText(), /历史参考价 · 行情已过期/)
     assert.doesNotMatch(mounted.visibleText(), /源时间在30秒内/)
     mounted.state().moreDetailsOpen = true
-    mounted.state().controlsOpen = true
     await flush()
     assert.match(mounted.visibleText(), /资金证据不可用/)
     assert.match(mounted.visibleText(), /自动学习/)
@@ -83,6 +265,7 @@ test('post-close feedback arrives on a saved-result poll without requesting a ne
   const mounted = mountPicks({ GetDisplayedKingPicks: async () => ({ ...saved, currentThemeFeedback: feedback }),
     StartKingPicksRefresh: async () => { scans++; throw new Error('feedback read must not scan') } }, null, Date.parse(saved.generatedAt))
   try {
+    mounted.state().viewMode = 'archive'
     await flush()
     assert.match(mounted.visibleText(), /等待今日收盘核验/)
     mounted.setNow(Date.parse('2026-11-13T15:35:00+08:00'))
@@ -114,6 +297,7 @@ test('theme-first page renders main themes, core stocks and feedback in order wi
   const before = JSON.stringify(saved)
   const mounted = mountPicks({ GetDisplayedKingPicks: async () => saved }, null, Date.parse(saved.generatedAt))
   try {
+    mounted.state().viewMode = 'archive'
     await flush()
     const visible = mounted.visibleText()
     assert.ok(visible.indexOf('今日主线') < visible.indexOf('重点股票'))
@@ -384,11 +568,11 @@ test('large opportunity observation lists show ten initially and expand without 
   } finally { mounted.dispose() }
 })
 
-// Existing modules remain reachable after opening the details and controls.
+// Research diagnostics remain available in the dedicated scan archive.
 function mountDetailedPicks(...args) {
   const mounted = mountPicks(...args)
+  mounted.state().viewMode = 'archive'
   mounted.state().moreDetailsOpen = true
-  mounted.state().controlsOpen = true
   return mounted
 }
 
@@ -397,7 +581,7 @@ function mountDetailedPicks(...args) {
 // controlled here so unresolved bridge calls cannot keep the test runner alive.
 function mountPicks(api = {}, cached = null, now = null) {
   const timers = new Map(), stored = new Map()
-  let nextTimer = 0, instance
+  let nextTimer = 0, instance, ledgerInstance, ledgerStocks = []
   const clock = {
     setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id },
     clearTimeout: id => timers.delete(id),
@@ -414,19 +598,25 @@ function mountPicks(api = {}, cached = null, now = null) {
     GetStockKingBackgroundStatus: async () => ({ status: 'idle' }),
     GetStockKingBackgroundLearning: async () => true,
     GetStockKingAutoRecommendations: async () => true,
+    GetStockKingRecordQuotes: async () => ({quotes: {}}),
     StartKingPicksRefresh: async () => { throw new Error('opening the page must not start a scan') },
     GetKingPicksRefreshTask: async () => { throw new Error('no task should require polling') },
     ...api,
   }
   const child = { render: () => null }
   const modules = {
-    vue,
+    // Native filter inputs have no DOM in this renderer. The tests change
+    // their backing refs directly and exercise the real record watchers.
+    vue: {...vue, vModelSelect: {}, vModelText: {}},
     'vue-router': { useRouter: () => ({ push() {} }) },
     'naive-ui': { useMessage: () => ({ success() {}, warning() {}, error() {} }) },
     '../../wailsjs/go/main/App': bridge,
     '../utils/symbol': { toResearchCode: value => value },
     './PickIndicatorEvidence.vue': child,
-    './PicksLedger.vue': child,
+    './PicksLedger.vue': {
+      props: ['mode', 'displayedStocks'],
+      setup: props => () => { if (props.mode === 'records') ledgerStocks = props.displayedStocks; return null },
+    },
     '../utils/learningStatus.mjs': learningStatus,
     '../utils/recommendationQuality.mjs': recommendationQuality,
     '../utils/pickExplain.mjs': pickExplain,
@@ -434,6 +624,7 @@ function mountPicks(api = {}, cached = null, now = null) {
     '../utils/premarket.mjs': premarket,
     '../utils/opportunityDisplay.mjs': opportunityDisplay,
     '../utils/themeDisplay.mjs': themeDisplay,
+    '../utils/customStockScreen.mjs': customStockScreen,
     '../utils/picksRefresh.mjs': {
       ...refresh,
       createPicksRefreshController: options => refresh.createPicksRefreshController({ ...options, setTimer: clock.setTimeout, clearTimer: clock.clearTimeout }),
@@ -443,21 +634,32 @@ function mountPicks(api = {}, cached = null, now = null) {
       withRecordReadTimeout: (request, timeoutMs) => recordRead.withRecordReadTimeout(request, timeoutMs, clock),
     },
   }
-  const source = readFileSync(new URL('../components/KingPicks.vue', import.meta.url), 'utf8')
-  const { descriptor } = parse(source)
-  const script = compileScript(descriptor, { id: 'picks-display-test' })
   const imports = code => code.replace(/^import\s+(.+?)\s+from\s+['"](.+?)['"];?$/gm,
     (_, bindings, path) => `const ${bindings.replace(/\bas\b/g, ':')} = modules[${JSON.stringify(path)}]`)
   const componentDate = now === null ? Date : class extends Date {
     constructor(...args) { super(...(args.length ? args : [now])) }
     static now() { return now }
   }
-  const component = new Function('modules', 'window', 'document', 'setTimeout', 'clearTimeout', 'Date', imports(script.content).replace('export default', 'return'))(
-    modules, { localStorage: storage }, { visibilityState: 'visible' }, clock.setTimeout, clock.clearTimeout, componentDate)
-  const template = compileTemplate({ source: descriptor.template.content, filename: 'KingPicks.vue', id: 'picks-display-test', compilerOptions: { bindingMetadata: script.bindings } })
-  assert.deepEqual(template.errors, [])
-  const render = new Function('modules', imports(template.code).replace('export function render', 'return function render'))(modules)
-  component.render = function (...args) { instance = vue.getCurrentInstance(); return render.apply(this, args) }
+  const componentTags = new Set()
+  function loadView(filename, onRender) {
+    const {descriptor} = parse(readFileSync(new URL('../components/' + filename, import.meta.url), 'utf8'))
+    for (const match of descriptor.template.content.matchAll(/<(n-[\w-]+)/g)) componentTags.add(match[1])
+    const script = compileScript(descriptor, {id: 'picks-display-test'})
+    const view = new Function('modules', 'window', 'document', 'setTimeout', 'clearTimeout', 'Date', imports(script.content).replace('export default', 'return'))(
+      modules, {localStorage: storage}, {visibilityState: 'visible'}, clock.setTimeout, clock.clearTimeout, componentDate)
+    const template = compileTemplate({source: descriptor.template.content, filename, id: 'picks-display-test', compilerOptions: {bindingMetadata: script.bindings}})
+    assert.deepEqual(template.errors, [])
+    const render = new Function('modules', imports(template.code).replace('export function render', 'return function render'))(modules)
+    view.render = function (...args) { onRender(vue.getCurrentInstance()); return render.apply(this, args) }
+    return view
+  }
+  if (api.GetStockKingRecommendationHistory) {
+    modules['./PicksLedger.vue'] = loadView('PicksLedger.vue', vm => {
+      ledgerInstance = vm
+      ledgerStocks = vm.props.displayedStocks
+    })
+  }
+  const component = loadView('KingPicks.vue', vm => { instance = vm })
 
   const node = (type, text = '') => ({ type, text, props: {}, style: {}, children: [], parent: null })
   const detach = child => {
@@ -481,7 +683,7 @@ function mountPicks(api = {}, cached = null, now = null) {
   const spin = { setup: (_, { slots }) => () => vue.h('div', slots.default?.()) }
   const card = { setup: (_, { slots }) => () => vue.h('div', [slots.header?.(), slots.default?.(), slots.footer?.()]) }
   const tabPane = { props: ['tab'], setup: (props, { slots }) => () => vue.h('div', [props.tab, slots.default?.()]) }
-  for (const name of new Set([...descriptor.template.content.matchAll(/<(n-[\w-]+)/g)].map(match => match[1]))) app.component(name, name === 'n-spin' ? spin : name === 'n-card' ? card : name === 'n-tab-pane' ? tabPane : passthrough)
+  for (const name of componentTags) app.component(name, name === 'n-spin' ? spin : name === 'n-card' ? card : name === 'n-tab-pane' ? tabPane : passthrough)
   app.mount(root)
   const textOf = element => element.type === 'comment' || element.style.display === 'none' ? '' : `${element.text}${element.children.map(textOf).join('')}`
   // Unlike textContent, a closed native <details> exposes only its first
@@ -495,6 +697,8 @@ function mountPicks(api = {}, cached = null, now = null) {
   return {
     active, timers, storage,
     state: () => instance.setupState,
+    ledgerStocks: () => ledgerStocks,
+    ledgerState: () => ledgerInstance.setupState,
     setNow(value) { now = value },
     text: () => textOf(root),
     visibleText: () => visibleTextOf(root),
@@ -923,7 +1127,7 @@ test('an unanswered saved-result read times out, permits retry, and ignores its 
   const mounted = mountDetailedPicks({ GetDisplayedKingPicks: () => ++reads === 1 ? pending.promise : Promise.resolve(latestSnapshot()) }, cached)
   try {
     await flush()
-    await mounted.runTimer(20000)
+    await mounted.runTimer(50000)
     assert.equal(mounted.state().restoring, false)
     assert.equal(mounted.state().result.generatedAt, cached.generatedAt)
     assert.match(mounted.state().restoreError, /记录读取超时/)
@@ -1108,4 +1312,103 @@ test('new daily observation cards do not borrow historical first references when
     assert.ok(!mounted.text().includes('首次日线观察'))
     assert.ok(!mounted.text().includes('¥99.00'))
   } finally { mounted.dispose() }
+})
+
+
+test('opening a record restores its archived run without borrowing the current brief', async () => {
+  const current = latestSnapshot()
+  current.marketBrief = { focusStocks: [{ code: '600002', name: '今日股票' }] }
+  publish(current, 'current-run', [publishedRow(1, '600001', '当期推荐', current.generatedAt)])
+  const old = oldSnapshot()
+  publish(old, 'archived-1', [publishedRow(1, '600099', '原发布首选', old.generatedAt)])
+  const prior = old.adaptive
+  const mounted = mountPicks({ GetDisplayedKingPicks: async () => current,
+    GetKingPicksSnapshot: async id => ({ run_id: id, mode: 'king_live', result: prior }) })
+  try {
+    await flush()
+    const state = mounted.state()
+    state.openRecommendationRecords()
+    await state.openRecordSnapshot('archived-1')
+    assert.equal(state.viewingHistory, true)
+    assert.equal(state.recordsRunId, 'archived-1')
+    assert.equal(state.marketBrief.supplied, false)
+    assert.match(mounted.visibleText(), /原发布首选/)
+    assert.doesNotMatch(mounted.visibleText(), /当期推荐/)
+    state.openRecommendationRecords()
+    await flush()
+    assert.deepEqual(mounted.ledgerStocks(), prior.publishedPicks.items)
+    state.returnToDisplayed()
+    assert.deepEqual(state.result, current)
+  } finally { mounted.dispose() }
+})
+
+test('history and settings are directly accessible and returning to picks restores the newest published scan', async () => {
+  let current = snapshot('2026-11-18T10:30:00+08:00')
+  publish(current, 'scheduled-am',
+    [publishedRow(1, '600001', '上午推荐', '2026-11-18T10:30:00+08:00')])
+  const old = snapshot('2026-11-17T10:30:00+08:00')
+  publish(old, 'old-published',
+    [publishedRow(1, '600002', '历史推荐样本', '2026-11-17T10:30:00+08:00')])
+  const queries = []
+  const mounted = mountPicks({
+    GetDisplayedKingPicks: async () => current,
+    GetStockKingRecommendationHistory: async (...args) => {
+      queries.push(args)
+      return {recordsVersion: 'published-picks-v1', items: [old.adaptive.publishedPicks]}
+    },
+    GetKingPicksSnapshot: async id => ({run_id:id, mode:'king_live', result:old.adaptive}),
+  })
+  try {
+    await flush()
+    assert.match(mounted.visibleText(), /历史推荐记录/)
+    assert.match(mounted.visibleText(), /自动推荐/)
+    assert.match(mounted.visibleText(), /自动学习/)
+    const state = mounted.state()
+    state.openRecommendationHistory()
+    await flush()
+    assert.equal(mounted.ledgerState().recordsScope, 'history')
+    assert.equal(queries.at(-1)[4], '')
+    await state.openRecordSnapshot('old-published')
+    await flush()
+    assert.match(mounted.visibleText(), /历史推荐样本/)
+    current = snapshot('2026-11-18T14:55:00+08:00')
+    publish(current, 'scheduled-pm',
+      [publishedRow(1, '600003', '尾盘新推荐', '2026-11-18T14:55:00+08:00')])
+    state.showCurrentPicks()
+    await flush()
+    assert.equal(state.viewingHistory, false)
+    assert.equal(state.publication.runId, 'scheduled-pm')
+    assert.match(mounted.visibleText(), /尾盘新推荐/)
+    assert.doesNotMatch(mounted.visibleText(), /历史推荐样本/)
+    state.openRecommendationRecords()
+    await flush()
+    assert.equal(mounted.ledgerState().recordsScope, 'current')
+    assert.deepEqual(mounted.ledgerStocks(), current.adaptive.publishedPicks.items)
+  } finally { mounted.dispose() }
+})
+
+test('manual refresh can complete while the initial saved-display read is still pending', async () => {
+  const slowRead = deferred()
+  const fresh = snapshot('2026-11-18T14:50:00+08:00', 'manual')
+  publish(fresh, 'clicked-during-load', [publishedRow(1, '600001', '手动完成推荐', fresh.generatedAt)])
+  let starts = 0, reads = 0
+  const mounted = mountPicks({
+    GetDisplayedKingPicks: () => ++reads === 1 ? slowRead.promise : Promise.resolve(fresh),
+    StartKingPicksRefresh: async () => { starts++; return {task_id:'new-click',status:'pending'} },
+    GetKingPicksRefreshTask: async () => ({task_id:'new-click',status:'completed',resultPersisted:true,
+      displayRunId:'clicked-during-load',displayGeneratedAt:fresh.generatedAt}),
+  })
+  try {
+    await flush()
+    assert.equal(mounted.state().restoring, true)
+    await mounted.state().refresh()
+    await flush()
+    assert.equal(starts, 1)
+    assert.equal(mounted.state().restoring, false)
+    assert.equal(mounted.state().loading, false)
+    assert.match(mounted.visibleText(), /手动完成推荐/)
+    slowRead.resolve(oldSnapshot())
+    await flush()
+    assert.equal(mounted.state().publication.runId, 'clicked-during-load')
+  } finally { slowRead.resolve(null); mounted.dispose() }
 })

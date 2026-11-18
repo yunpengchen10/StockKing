@@ -28,6 +28,7 @@ def test_verified_weak_market_keeps_stock_gates_and_allocates_only_half_total_bu
     for index in range(5):
         row = _eligible_candidate()
         row.update(code=f'60000{index}', industry=f'industry{index}', marketRegime={'state': 'normal'})
+        row['quote']['code'] = row['code']
         row['researchFactors']['E']['features']['advancing_pct'] = 16.72
         row['precisionDecision'] = evaluate(row, CONTEXT, DAILY)
         row['primaryAdmission'] = row['precisionDecision']['primaryAdmission']

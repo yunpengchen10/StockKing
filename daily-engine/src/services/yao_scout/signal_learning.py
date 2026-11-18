@@ -24,6 +24,7 @@ import numpy as np
 from src.quant.executable_backtest import AccountConfig, _fees, _lot
 from src.services.yao_scout.minute_history import bar_session, normalize_bars
 from .task_learning import scoped_lineage_validation
+from . import record_history_index
 from src.services.yao_scout.research_policy import DEFAULT_PARAMETERS
 
 
@@ -245,14 +246,11 @@ def _compact_features(payload: Mapping[str, Any]) -> dict[str, float]:
             and (value := _number(raw)) is not None}
 
 
-def _project_opportunity_records(signals, rows, run, code_filter=None):
-    """Expose the published E/M list, without manufacturing execution samples.
-
-    The frozen recommendations array is the authority, including old releases
-    that omitted these rows from signal_events. Reading never re-scores it.
-    """
+def _project_publication_records(signals, rows, run, code_filter, *, market_brief=False, as_of=None):
+    """Join a frozen published list to its own scan, preserving each category's evidence."""
+    kind = 'market_brief_focus' if market_brief else 'opportunity_recommendation'
     by_code = {row['code']: row for row in signals}
-    for candidate in rows:
+    for candidate in rows or []:
         if not isinstance(candidate, Mapping):
             continue
         code = _code(candidate.get('code'))
@@ -264,9 +262,10 @@ def _project_opportunity_records(signals, rows, run, code_filter=None):
                 'signalId': sha256(f"{run['run_id']}:{code}".encode()).hexdigest()[:32],
                 'code': code, 'name': str(candidate.get('name') or code),
                 'selected': False, 'recommendationKinds': [],
-                'decisionAt': candidate.get('decision_at') or run['as_of'],
+                'decisionAt': (as_of if market_brief else candidate.get('decision_at')) or run['as_of'],
                 'sourceTime': _source_time(candidate),
-                'signalPrice': _number(candidate.get('signalPrice') or candidate.get('referencePrice'), positive=True),
+                'signalPrice': _number(candidate.get('price') if market_brief else
+                                       candidate.get('signalPrice') or candidate.get('referencePrice'), positive=True),
                 'firstTradablePrice': None, 'reviewStatus': 'observation_only',
                 'trainingEligible': False, 'reviewEligible': False,
                 'features': _feature_values(candidate), 'reason': candidate.get('selectionReasons') or [],
@@ -275,10 +274,14 @@ def _project_opportunity_records(signals, rows, run, code_filter=None):
             }
             signals.append(row)
             by_code[code] = row
-        row['opportunitySelected'] = True
-        row['snapshot']['opportunity'] = candidate.get('opportunity') or {}
-        if 'opportunity_recommendation' not in row['recommendationKinds']:
-            row['recommendationKinds'].append('opportunity_recommendation')
+        if market_brief:
+            row['marketBriefFocus'] = True
+            row['snapshot']['marketBriefFocus'] = dict(candidate)
+        else:
+            row['opportunitySelected'] = True
+            row['snapshot']['opportunity'] = candidate.get('opportunity') or {}
+        if kind not in row['recommendationKinds']:
+            row['recommendationKinds'].append(kind)
     return signals
 
 
@@ -460,7 +463,13 @@ def _default_calendar(start: date, end: date) -> list[date]:
         import exchange_calendars as xcals
 
         calendar = xcals.get_calendar("XSHG")
-        return [stamp.date() for stamp in calendar.sessions_in_range(start, end)]
+        # A 60-day lookahead may exceed the published holiday calendar even
+        # when the exact T+1/3/5 sessions are already known. Return the
+        # supported prefix; a horizon beyond that prefix remains unknown.
+        last = min(end, calendar.last_session.date())
+        if start > last:
+            return []
+        return [stamp.date() for stamp in calendar.sessions_in_range(start, last)]
     except Exception:
         return []
 
@@ -536,6 +545,13 @@ class SignalLearningService:
                     UNIQUE(run_id, code)
                 );
                 CREATE INDEX IF NOT EXISTS signal_events_code_date ON signal_events(code, decision_at);
+                CREATE INDEX IF NOT EXISTS signal_events_next_day_reviews ON signal_events(
+                    json_extract(snapshot_json,'$.nextDaySignal.version'),
+                    json_extract(snapshot_json,'$.nextDaySignal.selected'),run_id,code,signal_id)
+                    WHERE json_valid(snapshot_json);
+                CREATE INDEX IF NOT EXISTS signal_events_morning_reviews ON signal_events(
+                    json_extract(snapshot_json,'$.morningSignal.version'),decision_at,code)
+                    WHERE json_valid(snapshot_json);
                 CREATE TABLE IF NOT EXISTS signal_outcomes(
                     signal_id TEXT NOT NULL REFERENCES signal_events(signal_id), horizon INTEGER NOT NULL,
                     status TEXT NOT NULL, fill_status TEXT NOT NULL, evidence_grade TEXT NOT NULL,
@@ -567,8 +583,11 @@ class SignalLearningService:
             if "review_eligible" not in columns:
                 db.execute("ALTER TABLE signal_events ADD COLUMN review_eligible INTEGER NOT NULL DEFAULT 0")
                 db.execute("UPDATE signal_events SET review_eligible=training_eligible")
+            db.execute("CREATE INDEX IF NOT EXISTS signal_events_review_candidates ON signal_events"
+                       "(review_eligible,selected DESC,run_id,code,signal_id)")
             from .daily_observation_outcomes import init_schema
             init_schema(db)
+            record_history_index.init_schema(db)
 
     @scoped_lineage_validation
     def persist_scan(self, result: Mapping[str, Any], slot: str, as_of: datetime | str, official: bool) -> dict[str, Any]:
@@ -838,6 +857,12 @@ class SignalLearningService:
                 scan_meta['result'] = result
                 scan_meta['sampleEligibilitySummary'] = sample_counts
                 db.execute('UPDATE signal_runs SET scan_json=? WHERE run_id=?', (_json(scan_meta), run_id))
+                brief = result.get('marketBrief') or {}
+                record_history_index.save(db, run_id, [
+                    result.get('run_id'), result.get('runId'), scan_meta.get('sourceRunId'),
+                    result.get('nextDayWatchlist'), result.get('nextDayContinuationWatchlist'),
+                    (result.get('opportunityChannels') or {}).get('recommendations'),
+                    brief.get('asOf'), brief.get('focusStocks')], _COMPACT_KEYS, _json)
                 from .daily_observation_outcomes import persist_scan as persist_daily_observations
                 persist_daily_observations(db, result, run_id, day, published_at)
             else:
@@ -971,6 +996,9 @@ class SignalLearningService:
             codes.setdefault(code, set()).update(days)
         return {code: sorted(days) for code, days in codes.items()}
 
+    def backfill_record_history(self, limit=500):
+        return record_history_index.backfill(self, _COMPACT_KEYS, _json, limit=limit)
+
     def _history_run_ids(self, db: sqlite3.Connection, filters: Mapping[str, Any], limit: int) -> list[str]:
         """Order small metadata before inspecting any of the frozen scan blobs.
 
@@ -995,14 +1023,32 @@ class SignalLearningService:
         if not requested_run and not code:
             return [row[0] for row in db.execute(query + " LIMIT ?", (*args, limit))]
         candidates = db.execute(query, args).fetchall()
+        indexed, aliases, code_runs = set(), set(), set()
+        if record_history_index.available(db):
+            indexed = {row[0] for row in db.execute('SELECT run_id FROM signal_history_lists_v1')}
+            if requested_run:
+                aliases = {row[0] for row in db.execute('SELECT run_id FROM signal_history_lists_v1 WHERE display_id=?',
+                                                         (requested_run,))}
+            if code:
+                code_runs = {row[0] for row in db.execute('SELECT run_id FROM signal_history_codes_v1 WHERE code=? '
+                              'UNION SELECT run_id FROM signal_events WHERE code=?', (code, code))}
         selected = []
         for row in candidates:
             run_id = row[0]
+            if run_id in indexed:
+                if ((not requested_run or run_id == requested_run or run_id in aliases)
+                        and (not code or run_id in code_runs)):
+                    selected.append(run_id)
+                    if len(selected) == limit:
+                        break
+                continue
             # Direct IDs need no JSON lookup. Display aliases retain the old
             # OR semantics, including multiple saved rounds sharing an alias.
             if requested_run and run_id != requested_run:
-                alias = db.execute("SELECT json_extract(scan_json,'$.result.run_id') "
-                                   "FROM signal_runs WHERE run_id=?", (run_id,)).fetchone()[0]
+                alias = db.execute("SELECT coalesce(nullif(json_extract(scan_json,'$.result.run_id'),''),"
+                                   "nullif(json_extract(scan_json,'$.result.runId'),''),"
+                                   "json_extract(scan_json,'$.sourceRunId')) FROM signal_runs WHERE run_id=?",
+                                   (run_id,)).fetchone()[0]
                 if alias != requested_run:
                     continue
             if code and not db.execute(
@@ -1015,8 +1061,10 @@ class SignalLearningService:
                     "EXISTS(SELECT 1 FROM json_each(r.scan_json,'$.result.nextDayContinuationWatchlist') x "
                     "WHERE substr(json_extract(x.value,'$.code'),1,6)=?) OR "
                     "EXISTS(SELECT 1 FROM json_each(r.scan_json,'$.result.opportunityChannels.recommendations') x "
+                    "WHERE substr(json_extract(x.value,'$.code'),1,6)=?) OR "
+                    "EXISTS(SELECT 1 FROM json_each(r.scan_json,'$.result.marketBrief.focusStocks') x "
                     "WHERE substr(json_extract(x.value,'$.code'),1,6)=?))",
-                    (run_id, code, code, code)).fetchone()
+                    (run_id, code, code, code, code)).fetchone()
                 if not found:
                     continue
             selected.append(run_id)
@@ -1093,12 +1141,17 @@ class SignalLearningService:
                         "features": _feature_values(frozen), "reason": frozen.get("selectionReasons") or [],
                         "snapshot": _snapshot(frozen), "ledgerRecordOrigin": "saved_scan_projection",
                     })
-                _project_opportunity_records(signals,
+                code_filter = _code(filters.get('symbol')) if filters.get('symbol') else None
+                _project_publication_records(signals,
                     (frozen_result.get('opportunityChannels') or {}).get('recommendations') or [],
-                    run, _code(filters.get('symbol')) if filters.get('symbol') else None)
+                    run, code_filter)
+                brief = frozen_result.get('marketBrief') or {}
+                _project_publication_records(signals, brief.get('focusStocks'), run, code_filter,
+                                             market_brief=True, as_of=brief.get('asOf'))
                 items.append({
                     "runId": run["run_id"], "slot": run["slot"], "asOf": run["as_of"],
-                    "displayRunId": frozen_result.get('run_id') or run['run_id'],
+                    "displayRunId": (frozen_result.get('run_id') or frozen_result.get('runId')
+                                     or scan.get('sourceRunId') or run['run_id']),
                     "official": bool(run["official"]), "modelVersion": run["version"],
                     "status": run["status"], "signals": signals,
                     "scan": scan,
@@ -1129,17 +1182,16 @@ class SignalLearningService:
                            "distributionRisk", "dataConfidence")) + " ELSE e.features_json END")
         items = []
         with self._connect() as db:
+            indexed = record_history_index.available(db)
             run_ids = self._history_run_ids(db, filters, limit)
             for run_id in run_ids:
                 # Parse each selected scan once and fetch only its saved lists.
                 # Most of scan_json is unrelated universe/minute evidence.
-                run = db.execute(
-                    "SELECT run_id,slot,as_of,trading_day,official,version,status,"
-                    "json_extract(scan_json,'$.result.run_id','$.result.nextDayWatchlist',"
-                    "'$.result.nextDayContinuationWatchlist',"
-                    "'$.result.opportunityChannels.recommendations') saved_lists "
-                    "FROM signal_runs WHERE run_id=?", (run_id,)).fetchone()
-                display_run_id, watch_rows, continuation_rows, opportunity_rows = json.loads(run['saved_lists'])
+                run = db.execute("SELECT run_id,slot,as_of,trading_day,official,version,status "
+                                 "FROM signal_runs WHERE run_id=?", (run_id,)).fetchone()
+                (original_id, legacy_id, source_id, watch_rows, continuation_rows, opportunity_rows,
+                 brief_at, focus_rows) = record_history_index.read(db, run_id, indexed)
+                display_run_id = original_id or legacy_id or source_id
                 def compact_rows(rows, keys=_COMPACT_KEYS):
                     # Match json_extract/json_set's existing scalar boolean
                     # representation; nested evidence retains its JSON types.
@@ -1154,12 +1206,13 @@ class SignalLearningService:
                             queue.add(code)
                 opportunities = compact_rows(opportunity_rows, (*_COMPACT_KEYS, 'opportunity'))
                 opportunity_codes = {_code(row.get('code')) for row in opportunities} - {None}
+                focus_codes = {_code(row.get('code')) for row in focus_rows or [] if isinstance(row, Mapping)} - {None}
                 event_where, event_args = ["e.run_id=?"], [run["run_id"]]
                 if code_filter:
                     event_where.append("e.code=?")
                     event_args.append(code_filter)
                 if not include_controls:
-                    chosen = sorted(next_day | continuation | opportunity_codes)
+                    chosen = sorted(next_day | continuation | opportunity_codes | focus_codes)
                     watch_clause = " OR e.code IN (" + ",".join("?" for _ in chosen) + ")" if chosen else ""
                     event_where.append("(e.selected=1 OR json_extract(e.snapshot_json,'$.nextDaySignal.selected')=1"
                                        " OR json_extract(e.snapshot_json,'$.dailySignal.selected')=1"
@@ -1208,7 +1261,8 @@ class SignalLearningService:
                         "reviewEligible": False, "features": _feature_values(candidate),
                         "reason": candidate.get("selectionReasons") or [], "snapshot": candidate,
                         "ledgerRecordOrigin": "saved_scan_projection"})
-                _project_opportunity_records(signals, opportunities, run, code_filter)
+                _project_publication_records(signals, opportunities, run, code_filter)
+                _project_publication_records(signals, focus_rows, run, code_filter, market_brief=True, as_of=brief_at)
                 items.append({"runId": run["run_id"], "slot": run["slot"], "asOf": run["as_of"],
                     "displayRunId": display_run_id or run['run_id'],
                     "tradingDay": run["trading_day"], "official": bool(run["official"]), "modelVersion": run["version"],
@@ -2287,7 +2341,7 @@ class SignalLearningService:
     def morning_reviews(self, filters=None):
         from .morning_task import MORNING_VERSION, summarize_morning_records
         filters = dict(filters or {})
-        where, args = ["json_extract(e.snapshot_json,'$.morningSignal.version')=?"], [MORNING_VERSION]
+        where, args = ["json_valid(e.snapshot_json)", "json_extract(e.snapshot_json,'$.morningSignal.version')=?"], [MORNING_VERSION]
         if filters.get('date'):
             where.append('substr(e.decision_at,1,10)=?')
             args.append(str(filters['date']))
@@ -2295,16 +2349,17 @@ class SignalLearningService:
             where.append('e.code=?')
             args.append(_code(filters['symbol']) or '')
         with self._connect() as db:
-            rows = db.execute("SELECT e.signal_id,e.code,e.decision_at,e.snapshot_json,o.result_json,o.reviewed_at "
+            rows = db.execute("SELECT e.signal_id,e.code,e.decision_at,json_extract(e.snapshot_json,'$.morningSignal') AS signal_json,o.result_json,o.reviewed_at "
                 "FROM signal_events e LEFT JOIN morning_outcomes o ON o.signal_id=e.signal_id WHERE "
                 + ' AND '.join(where) + ' ORDER BY e.decision_at,e.code', args).fetchall()
         items = []
         for row in rows:
-            signal = json.loads(row['snapshot_json'])['morningSignal']
+            signal = json.loads(row['signal_json'])
             result = json.loads(row['result_json']) if row['result_json'] else {'status': 'pending'}
             items.append({**signal, **result, 'signalId': row['signal_id'], 'code': row['code'],
                           'decisionAt': row['decision_at'], 'reviewedAt': row['reviewed_at']})
-        return {'items': items, 'count': len(items), 'summary': summarize_morning_records(items)}
+        visible = items[-filters['limit']:] if filters.get('compact') and filters.get('limit') else items
+        return {'items': visible, 'count': len(visible), 'total': len(items), 'summary': summarize_morning_records(items)}
 
     @scoped_lineage_validation
     def rank_next_day_candidates(self, candidates, as_of=None):

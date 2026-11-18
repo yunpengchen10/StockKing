@@ -209,3 +209,29 @@ def test_deferred_intraday_exit_releases_cash_before_later_scan():
     second['exitMinuteVolume'] = 1
     failed = SignalLearningService._account_nav([first, second], np.array([70., 70.]), AccountConfig(max_positions=1))
     assert not failed['valid'] and failed['reason'] == 'exit_participation_evidence_missing_or_exceeded'
+
+
+def test_calendar_lookahead_uses_only_published_exchange_sessions(monkeypatch):
+    from datetime import date, datetime
+    from types import SimpleNamespace
+
+    import exchange_calendars as xcals
+    from src.services.yao_scout.daily_observation_outcomes import TZ, evaluate_reference
+    from src.services.yao_scout.signal_learning import _default_calendar, SignalLearningService
+
+    published = [datetime(2026, 11, day) for day in (10, 11, 12, 13, 16, 17)]
+    boundary = datetime(2026, 12, 31)
+    def known_sessions(start, end):
+        assert end <= boundary.date()
+        return [stamp for stamp in published + [boundary] if start <= stamp.date() <= end]
+    monkeypatch.setattr(xcals, 'get_calendar', lambda name: SimpleNamespace(
+        last_session=boundary, sessions_in_range=known_sessions))
+    service = SimpleNamespace(_sessions=SignalLearningService._sessions, calendar_provider=_default_calendar)
+    cutoff = datetime(2026, 11, 10, 10, 30, tzinfo=TZ)
+    signal = {'trading_day': '2026-11-10', 'observation_id': 'frozen'}
+    for horizon, expected in [(1, '2026-11-11'), (3, '2026-11-13'), (5, '2026-11-17')]:
+        label = evaluate_reference(service, signal, horizon, cutoff, {}, {})
+        assert label[2:4] == (expected, 'not_matured')
+    signal['trading_day'] = '2026-12-31'
+    assert evaluate_reference(service, signal, 1, cutoff, {}, {})[2:4] == (None, 'calendar_unavailable')
+    assert _default_calendar(date(2027, 1, 4), date(2027, 2, 4)) == []

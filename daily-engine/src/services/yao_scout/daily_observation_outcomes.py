@@ -68,6 +68,9 @@ def init_schema(db):
         CREATE INDEX IF NOT EXISTS daily_observation_appearance_run ON daily_observation_appearances(run_id);
         CREATE INDEX IF NOT EXISTS daily_observation_signal_created ON daily_observation_signals(created_at);
         CREATE INDEX IF NOT EXISTS daily_observation_signal_recent ON daily_observation_signals(trading_day DESC,reference_at,code);
+        CREATE INDEX IF NOT EXISTS daily_observation_detail_priority ON daily_observation_signals(
+            (first_category IN ('opportunity_recommendation','selected','profile_selected')) DESC,
+            trading_day DESC,reference_at,code);
         CREATE INDEX IF NOT EXISTS daily_observation_signal_version ON daily_observation_signals(task_version,trading_day);
     ''')
     from .daily_observation_queue import init_schema as init_queue
@@ -188,6 +191,10 @@ def persist_scan(db, result, run_id, trading_day, published_at):
             (observation_id, code, str(row.get('name') or code), trading_day, task, version, run_id, first_category,
              price, decision.isoformat(), source_time, source, int(not gaps), _json(gaps), _json(snapshot), published_at.isoformat()))
         saved += cursor.rowcount
+        if cursor.rowcount:
+            db.executemany('INSERT OR IGNORE INTO daily_observation_review_queue '
+                           '(observation_id,horizon,next_attempt_at) VALUES(?,?,?)',
+                           [(observation_id, horizon, published_at.isoformat()) for horizon in HORIZONS])
         db.execute('INSERT OR IGNORE INTO daily_observation_appearances VALUES(?,?,?,?)',
                    (observation_id, run_id, published_at.isoformat(), _json(sorted(categories))))
     return saved
@@ -208,6 +215,8 @@ def read_verified_close(data_dir, code, day, as_of):
                              'ON s.code=q.code AND s.day=q.day WHERE s.code=? AND s.day=?', (code, day)).fetchone()
         if not row:
             return {'status': 'missing_close', 'gaps': ['session_or_quality_missing']}
+        if row[1] == 'tainted':
+            return {'status': 'unverified_close', 'gaps': ['session_quality_tainted']}
         if row[1] != 'verified':
             return {'status': 'unverified_close', 'gaps': ['session_quality_not_verified']}
         bars, anchor = json.loads(zlib.decompress(row[0])), json.loads(row[2] or '{}')
@@ -319,13 +328,21 @@ def reviews(service, *, as_of=None, limit=500, filters=None):
         args.append(code if re.fullmatch(r'\d{6}', code) else '__invalid__')
     horizons = [int(filters['horizon'])] if filters.get('horizon') in HORIZONS else list(HORIZONS)
     clause = ' WHERE ' + ' AND '.join(where)
-    ordered = ' FROM daily_observation_signals s' + clause + ' ORDER BY s.trading_day DESC,s.reference_at,s.code LIMIT ?'
+    # Bound the details after ranking the actual publications. Otherwise recent
+    # control rows can fill every slot before the UI hides controls.
+    ordered = (' FROM daily_observation_signals s' + clause +
+               " ORDER BY (s.first_category IN ('opportunity_recommendation','selected','profile_selected')) DESC,"
+               's.trading_day DESC,s.reference_at,s.code LIMIT ?')
     chosen = 'WITH chosen AS (SELECT s.observation_id' + ordered + ') '
     horizon_sql = ','.join('?' for _ in horizons)
     outcomes, appearances, groups = defaultdict(list), defaultdict(list), {}
+    compact = bool(filters.get('compact'))
+    fields = ('s.observation_id,s.code,s.name,s.trading_day,s.task_id,s.task_version,s.first_category,'
+              's.reference_price,s.reference_at,s.reference_source_time,s.reference_source,'
+              's.reference_verified,s.reference_gaps_json' if compact else 's.*')
     with service._connect() as db:
         total = db.execute('SELECT COUNT(*) FROM daily_observation_signals s' + clause, args).fetchone()[0]
-        signals = [dict(row) for row in db.execute('SELECT s.*' + ordered, (*args, limit))] if total else []
+        signals = [dict(row) for row in db.execute('SELECT ' + fields + ordered, (*args, limit))] if total else []
         # An empty observation DB performs no child scans or JSON decoding.
         for row in db.execute(chosen + 'SELECT o.* FROM daily_observation_outcomes o JOIN chosen c '
                               'ON c.observation_id=o.observation_id WHERE o.reviewed_at<=? AND o.horizon IN ('
@@ -335,7 +352,7 @@ def reviews(service, *, as_of=None, limit=500, filters=None):
             outcomes[item['observation_id']].append(item)
         for row in db.execute(chosen + 'SELECT a.* FROM daily_observation_appearances a JOIN chosen c '
                               'ON c.observation_id=a.observation_id WHERE a.observed_at<=? ORDER BY a.observed_at',
-                              (*args, limit, cutoff)) if signals else ():
+                              (*args, limit, cutoff)) if signals and not compact else ():
             item = dict(row)
             item['categories'] = json.loads(item.pop('categories_json'))
             appearances[item['observation_id']].append(item)
@@ -361,9 +378,10 @@ def reviews(service, *, as_of=None, limit=500, filters=None):
                 group['missing'][row['status']] = row['signals']
     for signal in signals:
         signal['reference_gaps'] = json.loads(signal.pop('reference_gaps_json'))
-        signal['snapshot'] = json.loads(signal.pop('snapshot_json'))
         signal['outcomes'] = outcomes[signal['observation_id']]
-        signal['appearances'] = appearances[signal['observation_id']]
+        if not compact:
+            signal['snapshot'] = json.loads(signal.pop('snapshot_json'))
+            signal['appearances'] = appearances[signal['observation_id']]
     # The health read recalculates due dates even if the worker stopped; it does
     # not create queue rows, run reviews, or fetch prices.
     from .daily_observation_queue import status as queue_status

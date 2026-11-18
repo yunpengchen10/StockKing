@@ -518,6 +518,10 @@ export function GetKingPicks(arg1, arg2) {
   return window['go']['main']['App']['GetKingPicks'](arg1, arg2);
 }
 
+export function GetKingPicksSnapshot(arg1) {
+  return window['go']['main']['App']['GetKingPicksSnapshot'](arg1);
+}
+
 export function GetKingPicksHistory(arg1) {
   return window['go']['main']['App']['GetKingPicksHistory'](arg1);
 }

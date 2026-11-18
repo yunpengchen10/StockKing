@@ -15,6 +15,8 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from src.services.stock_king_publications import PicksPublications, missing_publication, published_count, RECORDS_VERSION
+
 from src.services.stock_king_service import (
     STOCK_KING_METHODOLOGY_VERSION,
     STOCK_KING_SCHEMA_VERSION,
@@ -26,6 +28,7 @@ _display_lock = threading.RLock()
 _display_cache: OrderedDict[str, tuple[tuple[int, ...], dict[str, Any]]] = OrderedDict()
 _history_checked: dict[tuple[str, str], dict[tuple[Any, ...], datetime | None]] = {}
 _MAX_HISTORY_READS = 2
+_PROJECTION_VERSION = 1
 logger = logging.getLogger(__name__)
 _SCAN_MODES = tuple(f"king_{slot}" for slot in ("live", "0920", "0922", "0940", "0955", "1030", "1455"))
 _SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -128,13 +131,148 @@ def _display_pick(pick: Any, *, opportunity: bool = False, summary: bool = False
     return shown
 
 
+def _latest_screen_quote(code, copies, published):
+    from src.services.yao_scout.limit_entry import assess_limit_entry
+    from src.services.yao_scout.theme_rotation import _at, _number
+
+    latest = None
+    quotes = []
+    for quote in copies:
+        stamp = _at(quote.get('provider_timestamp') or quote.get('source_time'))
+        if not (stamp and published and stamp <= published):
+            continue
+        if latest is None or stamp > latest:
+            latest, quotes = stamp, []
+        if stamp == latest and quote not in quotes:
+            quotes.append(quote)
+    assessed = [(quote, assess_limit_entry(code, quote, published)) for quote in quotes]
+    facts = {(entry['status'], entry['price'], entry['sessionHigh'], entry['limitUp'],
+              _number(quote.get('pre_close', quote.get('previous_close')))) for quote, entry in assessed}
+    if not facts:
+        return {}, {'status': 'unavailable', 'eligible': False}
+    if len(facts) > 1:
+        return {}, {'status': 'conflicting', 'eligible': False}
+    # Concurrent sources can carry books with different clocks. Report only
+    # the latest validated book, provided peers with that clock agree.
+    book_at = max((_at(entry['bookSourceTime']) for _, entry in assessed if entry['bookSourceTime']), default=None)
+    current = [(quote, entry) for quote, entry in assessed if _at(entry['bookSourceTime']) == book_at]
+    if len({(entry['askPrice'], entry['askVolumeShares']) for _, entry in current}) > 1:
+        return {}, {'status': 'conflicting', 'eligible': False}
+    return current[0]
+
+
+def _custom_screen(run, published):
+    """Project the full same-scan research universe once per saved display snapshot."""
+    from src.services.yao_scout.theme_rotation import _at, _number
+
+    channels = run.get('opportunityChannels') or {}
+    watches = {row['code']: row for row in run.get('nextDayWatchlist') or []
+               if isinstance(row, dict) and row.get('code')
+               and not (run.get('nextDayResearch') or {}).get('retrospectiveProjection')}
+    formal = {row['code'] for row in run.get('candidates') or [] if isinstance(row, dict)
+              and row.get('code') and not row.get('observationOnly') and row.get('status') != 'daily_observation'}
+    opportunities = {row['code'] for row in channels.get('recommendations') or []
+                     if isinstance(row, dict) and row.get('code')}
+    records = {}
+    quotes = {}
+    collections = [list(watches.values()), channels.get('recommendations'), run.get('candidates'),
+                   run.get('controls'), run.get('precisionResearch'), run.get('evidenceInsufficient'),
+                   run.get('windvanes'), run.get('dailyObservationResearch'), run.get('dailyAttackWatchlist'),
+                   run.get('precisionWatchlist'), run.get('nextDayContinuationWatchlist'), run.get('dailyCandidates'),
+                   channels.get('researchCandidates'), channels.get('observations')]
+    for key in ('profileCandidates', 'dailyProfileCandidates'):
+        collections.extend((run.get(key) or {}).values())
+    for collection in collections:
+        for row in collection or []:
+            if not isinstance(row, dict) or not isinstance(row.get('code'), str):
+                continue
+            code = row['code']
+            records.setdefault(code, row)
+            quote = row.get('quote')
+            if isinstance(quote, dict) and quote:
+                quotes.setdefault(code, []).append(quote)
+    for code, quote in (run.get('dailyObservationQuotes') or {}).items():
+        if isinstance(quote, dict) and quote:
+            quotes.setdefault(code, []).append(quote)
+    if not quotes and 'dailyObservationQuotes' not in run:
+        # Older summary-only payloads contain names but no recoverable quote universe.
+        return None
+    members = {}
+    for theme in (run.get('themeBoard') or {}).get('themes') or []:
+        stamp = _at(theme.get('sourceTime'))
+        if not (theme.get('membershipEligible') and theme.get('name') and stamp
+                and published and stamp.date() == published.date() and stamp <= published):
+            continue
+        for code in theme.get('memberCodes') or []:
+            if code in quotes:
+                members.setdefault(code, []).append(theme['name'])
+    rows, excluded = [], {}
+    for code in sorted(quotes.keys() | records.keys()):
+        record = records.get(code, {})
+        quote, evidence = _latest_screen_quote(code, quotes.get(code, []), published)
+        if not evidence['eligible']:
+            status = evidence['status']
+            excluded[status] = excluded.get(status, 0) + 1
+            continue
+        signal = (watches.get(code) or {}).get('nextDaySignal') or {}
+        selected = bool(signal.get('queue') == 'first_board' and signal.get('selected') is True
+                        and signal.get('touchedLimitToday') is False
+                        and signal.get('referencePrice') == evidence['price']
+                        and _at(signal.get('sourceTime')) == _at(evidence['sourceTime']))
+        reasons = (signal.get('branches') if selected else record.get('selectionReasons')) or []
+        previous = _number(quote.get('pre_close') or quote.get('previous_close'))
+        rows.append({'code': code, 'name': record.get('name') or quote.get('name') or code,
+            'price': evidence['price'], 'changePct': round((evidence['price']/previous-1)*100, 4),
+            'headroomPct': round((evidence['limitUp']/evidence['price']-1)*100, 4),
+            'limitEntry': evidence, 'themes': list(dict.fromkeys(members.get(code, []))),
+            'firstBoardSelected': selected, 'formalSelected': code in formal,
+            'opportunitySelected': code in opportunities,
+            'reasons': [reason for reason in reasons if isinstance(reason, str)][:2]})
+    rows.sort(key=lambda row: (not row['firstBoardSelected'], not row['opportunitySelected'],
+                               not row['formalSelected'], (watches.get(row['code']) or {}).get('rank') or 999, row['code']))
+    return {'asOf': published.isoformat() if published else None,
+            'rows': rows, 'checkedCount': len(records.keys() | quotes.keys()), 'eligibleCount': len(rows),
+            'excludedCounts': excluded, 'scope': '仅含本轮冻结的研究股票和日线观察报价，按代码去重；已核验当日未触板且卖一有量。'}
+
+
 def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
     """Project display facts; the complete frozen evidence stays in the archive."""
     run = payload.get("adaptive")
     if not isinstance(run, dict):
         return payload
+    # Old snapshots froze the full same-scan quote before the UI started
+    # retaining limit evidence. Match all four identifying facts before using it.
+    from src.services.yao_scout.limit_entry import assess_limit_entry
+    from src.services.yao_scout.theme_rotation import _at
+    published = _at(run.get('generatedAt') or run.get('as_of') or run.get('generated_at'))
     omitted = {"controls", "windvanes", "morningResearch", "dailyObservationResearch", "dailyObservationQuotes", "themeResearchUniverse"}
     shown = {key: value for key, value in run.items() if key not in omitted}
+    screen = _custom_screen(run, published)
+    if screen is not None:
+        shown['customScreen'] = screen
+    brief = run.get('marketBrief')
+    if (isinstance(brief, dict) and published
+            and any(isinstance(row, dict) and not row.get('limitEntry') for row in brief.get('focusStocks') or [])):
+        evidence = {code: [quote] for code, quote in (run.get('dailyObservationQuotes') or {}).items()
+                    if isinstance(quote, dict)}
+        for item in run.get('controls') or []:
+            quote = item.get('quote') if isinstance(item, dict) else None
+            if isinstance(quote, dict):
+                evidence.setdefault(item.get('code'), []).append(quote)
+        focus = []
+        for row in brief.get('focusStocks') or []:
+            if not isinstance(row, dict):
+                continue
+            code, stamp = row.get('code'), _at(row.get('sourceTime'))
+            if stamp and not row.get('limitEntry'):
+                for quote in evidence.get(code, []):
+                    if (quote.get('code') == code and quote.get('price') == row.get('price')
+                            and quote.get('source') == row.get('source')
+                            and _at(quote.get('provider_timestamp') or quote.get('source_time')) == stamp):
+                        row = {**row, 'limitEntry': assess_limit_entry(code, quote, published)}
+                        break
+            focus.append(row)
+        shown['marketBrief'] = {**brief, 'focusStocks': focus}
     if isinstance(run.get('themeBoard'), dict):
         board = run['themeBoard']
         shown['themeBoard'] = {key: value for key, value in board.items() if key != 'themes'}
@@ -153,6 +291,16 @@ def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
                 'nextDayWatchlist', 'nextDayContinuationWatchlist', 'invalidatedCandidates'):
         if isinstance(run.get(key), list):
             shown[key] = [_display_pick(row) for row in run[key]]
+            if key == 'nextDayWatchlist' and published:
+                for original, row in zip(run[key], shown[key]):
+                    signal = row.get('nextDaySignal') if isinstance(row, dict) else None
+                    if not isinstance(signal, dict) or signal.get('queue') != 'first_board' or signal.get('limitEntry'):
+                        continue
+                    quote = original.get('quote') or {}
+                    stamp = _at(signal.get('sourceTime'))
+                    if (isinstance(quote, dict) and stamp and signal.get('referencePrice') == quote.get('price')
+                            and stamp == _at(quote.get('provider_timestamp') or quote.get('source_time'))):
+                        signal['limitEntry'] = assess_limit_entry(row.get('code'), quote, published)
     for key in ('profileCandidates', 'dailyProfileCandidates'):
         if isinstance(run.get(key), dict):
             shown[key] = {profile: [_display_pick(row) for row in picks] if isinstance(picks, list) else picks
@@ -170,6 +318,14 @@ def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
             }}
             shown["precisionWatchlist"].append(item)
     return {**payload, "adaptive": shown, "displayEvidenceMode": "summary"}
+
+
+def publish_picks(root, run, *, screen=None, reason='scan', persist=None, current_only=False):
+    from src.services.yao_scout.potential_picks import select_potential_picks
+    def make_items():
+        frozen_screen = screen if screen is not None else _custom_screen(run, _generated_at(run).astimezone(_SHANGHAI_TZ))
+        return select_potential_picks(run, frozen_screen)
+    return PicksPublications(root).publish(run, make_items, reason=reason, persist=persist, current_only=current_only)
 
 
 def _daily_assessment_valid(run: dict[str, Any], *, historical: bool = False) -> bool:
@@ -251,6 +407,8 @@ def _daily_refresh_error(run: dict[str, Any]) -> str:
     coverage = quality.get("quote_coverage") or {}
     if quality.get("snapshot_count") == 0:
         reason = "全市场股票目录为空"
+    elif assessment.get('status') == 'outside_continuous_trading_window':
+        reason = '当前时段的潜力参考价与趋势条件未同时通过核验'
     elif not isinstance(assessment, dict) or not assessment:
         reason = "本轮日线评估记录缺失"
     elif not _daily_assessment_valid(run):
@@ -491,6 +649,8 @@ def displayable_run(run: Any, *, historical: bool = False) -> bool:
     """A source outage is not an empty selection. Old snapshots do not expire here."""
     if not isinstance(run, dict) or run.get("status") not in _VALID_STATUSES:
         return False
+    if (run.get('publishedPicks') or {}).get('status') == 'superseded':
+        return False
     if run.get("scanSlot") in {"review", "weekly", "0925"}:
         return False
     if not isinstance(run.get("candidates"), list):
@@ -501,6 +661,10 @@ def displayable_run(run: Any, *, historical: bool = False) -> bool:
         # A valid daily branch cannot publish an unsupported or old opportunity
         # contract as a new result. Historical reads retain the recorded version.
         return False
+    if run.get('potentialAssessment'):
+        from src.services.yao_scout.potential_picks import reference_assessment_valid
+        if reference_assessment_valid(run, historical=historical):
+            return True
     if run.get('marketBrief') is not None:
         # Independent watch evidence cannot launder a damaged formal list.
         if opportunity is not None and (not isinstance(opportunity.get('recommendations'), list)
@@ -565,13 +729,80 @@ def displayable_run(run: Any, *, historical: bool = False) -> bool:
 
 
 class LocalPicksDisplayStore:
-    def __init__(self, db_manager: Any):
+    def __init__(self, db_manager: Any, *, data_dir=None):
         # The desktop supplies its persistent per-user YAO_SCOUT_DATA_DIR.
         # A stand-alone server still gets a stable location independent of cwd.
-        root = Path(os.getenv("YAO_SCOUT_DATA_DIR") or os.getenv("SCREENING_DATA_DIR")
+        root = Path(data_dir or os.getenv("YAO_SCOUT_DATA_DIR") or os.getenv("SCREENING_DATA_DIR")
                     or Path.home() / ".stock-king" / "data" / "picks").expanduser().resolve()
         self.path = root / "local-picks-display-v1.json"
         self.db = db_manager
+        self.publications = PicksPublications(root)
+
+    @property
+    def _projection_path(self):
+        return self.path.with_name('local-picks-display-view-v1.json')
+
+    def _read_projection(self, stamp):
+        try:
+            packet = json.loads(self._projection_path.read_text(encoding='utf-8'))
+            payload = packet['payload']
+            run = payload['adaptive']
+            if (packet.get('projectionVersion') == _PROJECTION_VERSION
+                    and packet.get('sourceStamp') == list(stamp)
+                    and payload.get('displaySnapshotVersion') == 1
+                    and payload.get('schemaVersion') == STOCK_KING_SCHEMA_VERSION
+                    and payload.get('displayRunId') == (run.get('run_id') or run.get('runId'))):
+                return payload
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+        return None
+
+    def _write_projection(self, stamp, payload):
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self.path.parent,
+                    prefix='.local-picks-view-', suffix='.tmp', delete=False) as handle:
+                temporary = Path(handle.name)
+                json.dump({'projectionVersion': _PROJECTION_VERSION, 'sourceStamp': list(stamp),
+                           'payload': payload}, handle, ensure_ascii=False, allow_nan=False)
+            os.replace(temporary, self._projection_path)
+        except (OSError, ValueError, TypeError):
+            logger.warning('Unable to cache the display projection; the saved scan remains available')
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def publication(self, run):
+        saved = run.get('publishedPicks')
+        run_id = run.get('run_id') or run.get('runId')
+        if isinstance(saved, dict) and saved.get('runId') == run_id and saved.get('status') == 'published':
+            # Restore the compact index from the same frozen document after an interrupted commit.
+            return self.publications.get(run_id) or publish_picks(self.path.parent, run, reason='restore')
+        if isinstance(saved, dict) and saved.get('runId') == run_id and saved.get('status') == 'superseded':
+            return saved
+        return self.publications.get(run_id) or missing_publication(run)
+
+    def records(self, *, run_id='', date='', symbol='', version='', scope='current'):
+        if not (run_id or date or symbol or version or scope == 'history'):
+            run = self.read().get('adaptive') or {}
+            doc = run.get('publishedPicks')
+            docs = [doc] if doc and doc.get('status') == 'published' else []
+            status = 'published' if docs else 'unrecorded'
+        else:
+            docs = self.publications.history(run_id=run_id, date=date, symbol=symbol, version=version)
+            status = 'ok' if docs else 'no_matches'
+            if run_id and not docs and not self.publications.get(run_id):
+                row = self.db.get_yao_run(run_id) if self.db is not None else None
+                frozen = (row or {}).get('result') or {}
+                if self.publication(frozen)['status'] == 'published':
+                    docs = self.publications.history(run_id=run_id, date=date, symbol=symbol, version=version)
+                    status = 'ok' if docs else 'no_matches'
+                else:
+                    status = 'unrecorded'
+        return {'recordsVersion': RECORDS_VERSION, 'status': status, 'items': docs, 'count': len(docs)}
 
     @property
     def storage_key(self) -> str:
@@ -584,12 +815,37 @@ class LocalPicksDisplayStore:
             cached = _display_cache.get(self.storage_key)
             if cached and cached[0] == stamp:
                 _display_cache.move_to_end(self.storage_key)
-                return deepcopy(cached[1])
+                response = deepcopy(cached[1])
+                previous = response['adaptive'].get('publishedPicks') or {}
+                if previous.get('status') == 'unrecorded':
+                    recovered = self.publications.get(previous.get('runId'))
+                    if recovered:
+                        response['adaptive']['publishedPicks'] = recovered
+                        count = published_count(recovered)
+                        response.update(publishedPickCount=count, savedRecommendationCount=count, candidateCount=count)
+                        self._cache_saved(stamp, deepcopy(response))
+                return response
+            projected = self._read_projection(stamp)
+            if projected is not None:
+                previous = projected['adaptive'].get('publishedPicks') or {}
+                if previous.get('status') == 'unrecorded':
+                    recovered = self.publications.get(previous.get('runId'))
+                    if recovered:
+                        projected['adaptive']['publishedPicks'] = recovered
+                        count = published_count(recovered)
+                        projected.update(publishedPickCount=count, savedRecommendationCount=count, candidateCount=count)
+                        self._write_projection(stamp, projected)
+                self._cache_saved(stamp, projected)
+                return deepcopy(projected)
             value = json.loads(self.path.read_text(encoding="utf-8"))
             if (isinstance(value, dict) and value.get("displaySnapshotVersion") == 1
                     and value.get("schemaVersion") == STOCK_KING_SCHEMA_VERSION
                     and displayable_run(value.get("adaptive"), historical=True)):
                 shown = _display_response({**value, **display_counts(value["adaptive"])})
+                shown['adaptive']['publishedPicks'] = self.publication(value['adaptive'])
+                count = published_count(shown['adaptive']['publishedPicks'])
+                shown.update(publishedPickCount=count, savedRecommendationCount=count, candidateCount=count)
+                self._write_projection(stamp, shown)
                 self._cache_saved(stamp, shown)
                 return deepcopy(shown)
         except (OSError, ValueError, TypeError):
@@ -706,6 +962,19 @@ class LocalPicksDisplayStore:
             feedback = {'status': 'unavailable', 'summary': '题材反馈读取暂不可用', 'gaps': [type(error).__name__]}
         return {**payload, 'currentPrimaryReadiness': current, 'currentThemeFeedback': feedback}
 
+    def history_snapshot(self, run_id: str) -> dict[str, Any] | None:
+        row = self.db.get_yao_run(run_id)
+        if not row or row.get("mode") not in _SCAN_MODES:
+            return None
+        run = row.get("result")
+        if not isinstance(run, dict) or not isinstance(run.get("candidates"), list):
+            return None
+        shown = _display_response({"adaptive": run})["adaptive"]
+        shown['publishedPicks'] = self.publication(run)
+        count = published_count(shown['publishedPicks'])
+        return {"run_id": row["run_id"], "mode": row["mode"], "as_of": row.get("as_of"), "result": shown,
+                "publishedPickCount": count}
+
     def read(self) -> dict[str, Any]:
         # Reading history never starts a live scan. The normal polling path
         # touches metadata columns and a cached projection, not historical JSON.
@@ -714,6 +983,25 @@ class LocalPicksDisplayStore:
         recovery = None
         with _display_lock:
             saved = self._read_saved()
+        # Scheduled scans publish independently of an open desktop. The small
+        # publication index points directly to the winning scan, so normal reads
+        # never replay every older research result to discover that winner.
+        # Older adapters can still contain unpublished legacy rows. Keep their
+        # migration path; current database adapters publish every new scan.
+        latest = self.publications.latest() if self.db is None or callable(
+            getattr(self.db, 'list_yao_run_headers', None)) else None
+        if latest:
+            if saved.get('displayRunId') == latest['runId']:
+                return saved
+            if self.db is not None:
+                try:
+                    row = self.db.get_yao_run(latest['runId'])
+                    result = (row or {}).get('result')
+                    if displayable_run(result, historical=True):
+                        return self.save(result, source='history')
+                except Exception:
+                    logger.warning('Unable to restore the latest published homepage', exc_info=True)
+                return {**saved, 'displaySyncError': '最新推荐暂时读取失败，当前保留上次已保存结果'}
         if self.db is not None:
             try:
                 if callable(getattr(self.db, 'list_yao_run_headers', None)):
@@ -803,6 +1091,8 @@ class LocalPicksDisplayStore:
             return {**response, 'displayRecovery': recovery} if recovery else response
 
     def save(self, run: dict[str, Any], *, source: str = "manual") -> dict[str, Any]:
+        if (run.get('publishedPicks') or {}).get('status') == 'superseded':
+            return self.read()
         if not displayable_run(run, historical=source in {"history", "migration"}):
             message = run.get("message") or {
                 "skipped_non_trading_day": "当前不是交易日，本轮未刷新，已保留上次结果",
@@ -825,6 +1115,11 @@ class LocalPicksDisplayStore:
                 except (TypeError, ValueError):
                     pass
             raise ValueError(message)
+        with _display_lock:
+            saved = self._read_saved()
+            if (saved.get('displayRunId') and saved.get('displayRunId') == (run.get('run_id') or run.get('runId'))
+                    and (saved['adaptive'].get('publishedPicks') or {}).get('status') == 'published'):
+                return saved
         generated_at = run.get("generatedAt") or run.get("as_of") or run.get("cutoff_at")
         payload = {
             "schemaVersion": STOCK_KING_SCHEMA_VERSION,
@@ -840,31 +1135,47 @@ class LocalPicksDisplayStore:
             "tiers": {}, "kechuang": [], "nonKeChuang": [],
             "cacheHit": False,
         }
-        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False)
         shown = _display_response(payload)
         with _display_lock:
             saved = self._read_saved()
-            if saved and _generated_at(saved["adaptive"]) > _generated_at(run):
+            if saved and (_generated_at(saved['adaptive']) > _generated_at(run) or (
+                    _generated_at(saved['adaptive']) == _generated_at(run) and saved.get('displayRunId') != payload['displayRunId'])):
                 return saved
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = None
-            try:
-                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
-                                                 prefix=".local-picks-", suffix=".tmp", delete=False) as handle:
-                    temporary = Path(handle.name)
-                    handle.write(encoded)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                written_stamp = self._file_stamp(temporary)
-                os.replace(temporary, self.path)
-                if self._file_stamp() == written_stamp:
-                    self._cache_saved(written_stamp, deepcopy(shown))
-                else:
-                    # Another process may publish between replace and stat.
-                    # Never associate our payload with that process's file ID.
-                    _display_cache.pop(self.storage_key, None)
-                    shown = self._read_saved()
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
+            written_stamp = None
+            def write_snapshot(publication):
+                nonlocal written_stamp
+                payload['adaptive'] = {**run, 'publishedPicks': publication}
+                shown['adaptive']['publishedPicks'] = publication
+                count = published_count(publication)
+                for target in (shown, payload):
+                    target.update(publishedPickCount=count, savedRecommendationCount=count, candidateCount=count)
+                encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
+                                                     prefix=".local-picks-", suffix=".tmp", delete=False) as handle:
+                        temporary = Path(handle.name)
+                        handle.write(encoded)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    written_stamp = self._file_stamp(temporary)
+                    os.replace(temporary, self.path)
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+            if payload['displayRunId']:
+                publication = publish_picks(self.path.parent, run, screen=shown['adaptive'].get('customScreen'),
+                    reason=source if source in {'history','migration'} else 'scan',
+                    persist=write_snapshot, current_only=True)
+                if publication is None:
+                    return self._read_saved()
+            else:
+                write_snapshot(missing_publication(run))
+            if self._file_stamp() == written_stamp:
+                self._write_projection(written_stamp, shown)
+                self._cache_saved(written_stamp, deepcopy(shown))
+            else:
+                _display_cache.pop(self.storage_key, None)
+                shown = self._read_saved()
         return shown

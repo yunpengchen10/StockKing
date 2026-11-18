@@ -24,6 +24,7 @@ from src.services.yao_scout import AdaptiveKingService, YaoScoutService
 from src.storage import DatabaseManager
 from src.services.yao_scout.local_opportunities import LocalOpportunityService
 from src.services.stock_king_display import LocalPicksDisplayStore
+from src.services.stock_king_publications import published_count
 
 router = APIRouter()
 _refresh_lock = threading.RLock()
@@ -158,7 +159,7 @@ def get_picks(
     config: Config = Depends(get_config_dep),
     db_manager: DatabaseManager = Depends(get_database_manager),
 ) -> Dict[str, Any]:
-    return StockKingService(config, db_manager).picks(
+    payload = StockKingService(config, db_manager).picks(
         max_per_board=request.max_per_board,
         force=request.force,
         scan_slot=request.scan_slot,
@@ -166,6 +167,8 @@ def get_picks(
         official=request.official,
         allow_missed=request.allow_missed,
     )
+    payload['publishedPickCount'] = published_count((payload.get('adaptive') or {}).get('publishedPicks'))
+    return payload
 
 
 @router.post("/picks/runs", status_code=202)
@@ -246,7 +249,22 @@ def get_adaptive_history(
     )
     if mode is None:
         rows = [row for row in rows if str(row.get("mode") or "").startswith("king_")][:limit]
+    store = LocalPicksDisplayStore(db_manager)
+    for row in rows:
+        run = row.get('result')
+        if isinstance(run, dict) and row.get('mode') not in {'king_review', 'king_weekly'}:
+            publication = store.publication(run)
+            row['result'] = {**run, 'publishedPicks': publication}
+            row['publishedPickCount'] = published_count(publication)
     return {"items": rows, "count": len(rows)}
+
+
+@router.get("/picks/history/{run_id}")
+def get_adaptive_snapshot(run_id: str, db_manager: DatabaseManager = Depends(get_database_manager)) -> JSONResponse:
+    row = LocalPicksDisplayStore(db_manager).history_snapshot(run_id)
+    if not row:
+        raise api_error(404, "stock_king_run_not_found", "未找到该轮精选快照")
+    return _picks_json_response(row)
 
 
 @router.get("/picks/learning")
@@ -263,18 +281,34 @@ def _signal_learning(config, db_manager):
 
 
 @router.get('/picks/records')
+def get_published_records(date: str = '', symbol: str = '', version: str = '', run_id: str = '',
+                          scope: Literal['current', 'history'] = 'current', compact: bool = False,
+                          db_manager: DatabaseManager = Depends(get_database_manager)):
+    records = LocalPicksDisplayStore(db_manager).records(
+        run_id=run_id, date=date, symbol=symbol, version=version, scope=scope)
+    return _picks_json_response(records) if compact else records
+
+
+@router.get('/picks/research-records')
 def get_signal_records(date: str = '', symbol: str = '', version: str = '',
     compact: bool = False, include_controls: bool = True, run_id: str = '',
     config: Config = Depends(get_config_dep), db_manager: DatabaseManager = Depends(get_database_manager)):
-    return _signal_learning(config, db_manager).history({'date': date, 'symbol': symbol, 'version': version,
-                                                        'compact': compact, 'include_controls': include_controls,
-                                                        'run_id': run_id})
+    from src.services.yao_scout.theme_feedback import ThemeFeedbackStore
+    service = _signal_learning(config, db_manager)
+    records = service.history({'date': date, 'symbol': symbol, 'version': version,
+                               'compact': compact, 'include_controls': include_controls, 'run_id': run_id})
+    if any(s.get('marketBriefFocus') for run in records.get('items', []) for s in run.get('signals', [])):
+        ThemeFeedbackStore(service.data_dir).record_close_reviews(records, service.clock())
+    return _picks_json_response(records) if compact else records
 
 
 @router.get('/picks/reviews')
-def get_signal_reviews(date: str = '', symbol: str = '', version: str = '',
+def get_signal_reviews(date: str = '', symbol: str = '', version: str = '', compact: bool = False,
+    limit: int | None = Query(default=None, ge=1, le=5000),
     config: Config = Depends(get_config_dep), db_manager: DatabaseManager = Depends(get_database_manager)):
-    return _signal_learning(config, db_manager).reviews({'date': date, 'symbol': symbol, 'version': version})
+    return _picks_json_response(_signal_learning(config, db_manager).reviews({
+        'date': date, 'symbol': symbol, 'version': version, 'compact': compact,
+        'limit': limit or (120 if compact else 1000)}))
 
 
 @router.post("/advice")

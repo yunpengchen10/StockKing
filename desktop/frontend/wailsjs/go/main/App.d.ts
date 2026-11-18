@@ -264,6 +264,8 @@ export function GetInvestmentTrades(arg1:number):Promise<Record<string, any>>;
 
 export function GetKingPicks(arg1:number,arg2:boolean):Promise<Record<string, any>>;
 
+export function GetKingPicksSnapshot(arg1:string):Promise<Record<string, any>>;
+
 export function GetKingPicksHistory(arg1:number):Promise<Record<string, any>>;
 
 export function GetKingPicksRefreshTask(arg1:string):Promise<Record<string, any>>;

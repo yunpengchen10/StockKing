@@ -52,7 +52,8 @@ function updateTab(name) {
       <n-tab-pane name="AI分析报告">
         <ResearchReport/>
       </n-tab-pane>
-      <n-tab-pane name="股票推荐记录">
+      <n-tab-pane name="股票推荐记录" tab="AI 与旧版推荐记录">
+        <p>此处收录 AI 报告和旧版策略留下的记录。<router-link :to="{ name: 'kingPicks', query: { view: 'records' } }">查看本地精选的同轮记录</router-link></p>
         <AiRecommendStocksList/>
       </n-tab-pane>
       <n-tab-pane name="异动监控">

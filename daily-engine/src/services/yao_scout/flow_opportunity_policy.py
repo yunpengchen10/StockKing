@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 import math
 from statistics import median
 
+from .limit_entry import assess_limit_entry
+
 
 VERSION = 'opportunity-flow-20261103-v1'
 PARAMETERS = {
@@ -67,7 +69,8 @@ def policy_contract():
         'thresholdSource': 'explicit_uncalibrated_research_constraints_not_fitted_or_profit_validated',
         'required': ['verified_completed_30m_path', 'same_provider_version_stock_and_sector_flow',
                      'positive_stock_and_sector_net_flow',
-                     'aligned_previous_session_unadjusted_atr14', 'fresh_normal_order_book'],
+                     'aligned_previous_session_unadjusted_atr14', 'fresh_normal_order_book',
+                     'verified_pre_limit_offer'],
         'notRequired': ['positive_1m_3m_5m_returns', 'positive_recent_5m_net_flow', 'price_acceleration', 'trained_model', 'complete_60m_window'],
         'missingPolicy': 'missing_required_evidence_means_observation_never_fabricated_qualification',
         'hardVetoes': ['stale_or_conflicting_quote', 'tainted_current_market_data', 'no_buy_window',
@@ -228,12 +231,19 @@ def assess_flow_policy(row, minute, daily, quote, buy, trend, cutoff, now, stock
     elif spread > PARAMETERS['maximumSpreadPct'] or spread < 0:
         counter.append('盘口点差超过0.3%研究约束或为负')
         failures.append('spread_outside_constraint')
+    entry = assess_limit_entry(code, quote, now)
+    if not entry['eligible']:
+        failures.append('pre_limit_entry_' + entry['status'])
+        if entry['status'] == 'unavailable':
+            missing.append(entry['reason'])
+        else:
+            counter.append(entry['reason'])
     if not failures:
         support.append('30分钟资金与趋势通过公开约束；允许短暂回落，不要求加速')
     return {
         'qualified': not failures, 'selectionMode': ('flow_pullback' if pullback and pullback > 0 else 'flow_trend') if not failures else 'observation',
         'missing': list(dict.fromkeys(missing)), 'counterEvidence': counter, 'support': support,
-        'failedConditions': list(dict.fromkeys(failures)),
+        'failedConditions': list(dict.fromkeys(failures)), 'limitEntry': entry,
         'sectorKey': str((sector_flow.get('sector') or {}).get('code') or '') if valid_sector else None,
         'sector': deepcopy(sector_flow.get('sector')) if valid_sector else None,
         'rankingValues': {'sectorNetFlowRatio': sector_ratio, 'stockNetFlowRatio': stock_ratio,

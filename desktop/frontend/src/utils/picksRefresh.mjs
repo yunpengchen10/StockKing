@@ -52,10 +52,10 @@ export function selectDisplayedPicks(local, remote) {
 export function createPicksRefreshController({
   startTask, getTask, getDisplay, storage, onState = () => {}, onResult = () => {},
   now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout,
-  timeoutMs = 30 * 60_000, requestTimeoutMs = 20_000, pollMs = 1000,
+  timeoutMs = 30 * 60_000, requestTimeoutMs = 20_000, displayRequestTimeoutMs = 50_000, pollMs = 1000,
 }) {
   let disposed = false, generation = 0, pollTimer = null, clockTimer = null, cancelRequest = null
-  let startedAt = 0, initialRecoveryProbe = false, retryCount = 0
+  let startedAt = 0, waitStartedAt = 0, initialRecoveryProbe = false, retryCount = 0, restartMissingWith = null
   let state = { loading: false, taskId: '', progress: 0, message: '', elapsedSeconds: 0, error: '' }
   const emit = patch => { state = { ...state, ...patch }; if (!disposed) onState({ ...state }) }
   const current = token => !disposed && state.loading && generation === token
@@ -72,14 +72,14 @@ export function createPicksRefreshController({
     if (clearStored) remove(storage, REFRESH_TASK_KEY)
     emit({ loading: false, error })
   }
-  const timeoutMessage = `本次扫描超过 ${Math.ceil(timeoutMs / 60_000)} 分钟，已停止等待；后台任务不会因此取消。可点击“读取已保存结果”，或点击“刷新扫描”恢复查询同一任务。`
+  const timeoutMessage = `本次等待超过 ${Math.ceil(timeoutMs / 60_000)} 分钟，已停止等待；后台任务不会因此取消。可点击“读取已保存结果”，或点击“刷新扫描”恢复查询同一任务。`
   function tick(token) {
     if (!current(token)) return
     emit({ elapsedSeconds: Math.max(0, Math.floor((now() - startedAt) / 1000)) })
-    if (!initialRecoveryProbe && now() - startedAt >= timeoutMs) { finish(timeoutMessage); return }
+    if (!initialRecoveryProbe && now() - waitStartedAt >= timeoutMs) { finish(timeoutMessage); return }
     clockTimer = setTimer(() => tick(token), 1000)
   }
-  function request(operation) {
+  function request(operation, deadlineMs = requestTimeoutMs) {
     return new Promise((resolve, reject) => {
       let settled = false
       const settle = (callback, value) => {
@@ -89,7 +89,7 @@ export function createPicksRefreshController({
         cancelRequest = null
         callback(value)
       }
-      const timer = setTimer(() => settle(reject, new Error('扫描状态连接超时')), requestTimeoutMs)
+      const timer = setTimer(() => settle(reject, new Error('扫描状态连接超时')), deadlineMs)
       cancelRequest = () => settle(reject, new Error('页面已停止等待'))
       Promise.resolve().then(operation).then(value => settle(resolve, value), error => settle(reject, error))
     })
@@ -102,7 +102,7 @@ export function createPicksRefreshController({
       const legacyResult = isSavedPicks(saved)
       if (!legacyResult && task.resultPersisted && typeof getDisplay === 'function') {
         emit({ message: '扫描已完成并保存，正在读取结果' })
-        saved = await request(getDisplay)
+        saved = await request(getDisplay, displayRequestTimeoutMs)
         if (!current(token)) return true
         const expectedId = task.displayRunId
         const receivedId = saved?.displayRunId || saved?.adaptive?.run_id || saved?.adaptive?.runId
@@ -133,28 +133,39 @@ export function createPicksRefreshController({
       if (await handleTask(task, token)) return
       initialRecoveryProbe = false
       retryCount = 0
-      if (now() - startedAt >= timeoutMs) { finish(timeoutMessage); return }
+      if (now() - waitStartedAt >= timeoutMs) { finish(timeoutMessage); return }
       pollTimer = setTimer(() => poll(token), pollMs)
     } catch (error) {
       if (current(token)) {
         const detail = error?.message || String(error)
         const missing = /\b404\b|not[ _-]?found|不存在|已过期/i.test(detail)
         initialRecoveryProbe = false
+        // An explicit refresh must still work after the engine was restarted.
+        // A confirmed missing task is safe to replace; a network failure is not.
+        if (missing && restartMissingWith !== null) {
+          const maxPerBoard = restartMissingWith
+          restartMissingWith = null
+          finish('', true)
+          await start(maxPerBoard)
+          return
+        }
         const transient = /timeout|timed out|deadline exceeded|超时|network|failed to fetch|connection (?:reset|refused)|ECONN|\b50[234]\b/i.test(detail)
-        if (!missing && transient && now() - startedAt < timeoutMs) {
+        if (!missing && transient && now() - waitStartedAt < timeoutMs) {
           emit({ message: '状态连接暂时中断，后台任务继续运行，正在恢复查询；也可点击“读取已保存结果”。', error: '' })
           pollTimer = setTimer(() => poll(token), Math.min(5000, pollMs * 2 ** Math.min(++retryCount, 3)))
           return
         }
         finish(missing ? '上次扫描任务已结束或软件重启后已失效，已保存推荐仍保留。请点击“刷新扫描”重新开始。'
-          : now() - startedAt >= timeoutMs ? timeoutMessage : `${detail} 已保存推荐仍保留，可点击“读取已保存结果”。`, missing)
+          : now() - waitStartedAt >= timeoutMs ? timeoutMessage : `${detail} 已保存推荐仍保留，可点击“读取已保存结果”。`, missing)
       }
     }
   }
-  function begin(taskId = '', since = now(), recovering = false) {
+  function begin(taskId = '', since = now(), recovering = false, freshWait = false) {
     startedAt = since
+    waitStartedAt = freshWait ? now() : since
     initialRecoveryProbe = recovering
     retryCount = 0
+    restartMissingWith = null
     const token = ++generation
     emit({ loading: true, taskId, error: '', progress: 0, message: recovering ? '正在恢复上次扫描进度' : '正在提交本地扫描', elapsedSeconds: Math.max(0, Math.floor((now() - since) / 1000)) })
     tick(token)
@@ -164,7 +175,7 @@ export function createPicksRefreshController({
     if (disposed || state.loading) return false
     // A timed-out status read does not cancel its server task. Reuse its id
     // before considering another POST, including after reopening this page.
-    if (resume(null, { force: true })) return true
+    if (resume(null, { force: true, restartIfMissing: maxPerBoard })) return true
     const token = begin()
     try {
       const task = await request(() => startTask(maxPerBoard))
@@ -179,7 +190,7 @@ export function createPicksRefreshController({
       return false
     }
   }
-  function resume(serverTask = null, { force = false } = {}) {
+  function resume(serverTask = null, { force = false, restartIfMissing = null } = {}) {
     if (disposed || state.loading) return false
     const cached = readJSON(storage, REFRESH_TASK_KEY)
     const task = serverTask?.task_id ? serverTask : cached
@@ -191,7 +202,8 @@ export function createPicksRefreshController({
     const parsed = typeof rawStartedAt === 'number' ? rawStartedAt : Date.parse(rawStartedAt || '')
     const cachedStart = cached?.task_id === task.task_id ? cached.startedAt : null
     const since = Number.isFinite(parsed) ? parsed : Number.isFinite(cachedStart) ? cachedStart : now()
-    const token = begin(task.task_id, Math.min(now(), since), true)
+    const token = begin(task.task_id, Math.min(now(), since), true, force)
+    restartMissingWith = restartIfMissing
     writeJSON(storage, REFRESH_TASK_KEY, { task_id: task.task_id, startedAt })
     void poll(token)
     return true

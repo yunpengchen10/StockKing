@@ -9,6 +9,7 @@ from __future__ import annotations
 from contextlib import closing
 from datetime import date, datetime, time
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -126,6 +127,40 @@ def _call_before_deadline(fetch, deadline):
     if monotonic() >= deadline:
         raise TimeoutError('history_preparation_budget_exhausted')
     return result[0]
+
+
+def validated_daily_anchor(anchor, code, day, as_of):
+    """Accept an identified unadjusted completed OHLC bar known by the review cutoff."""
+    if not isinstance(anchor, dict):
+        return None
+    try:
+        day = date.fromisoformat(str(day))
+        def aware(value):
+            stamp = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+            if stamp.tzinfo is None:
+                raise ValueError('timezone_missing')
+            return stamp
+        end = datetime.combine(day, time(15), SHANGHAI)
+        observed = aware(anchor.get('observed_at'))
+        known = aware(anchor['known_at']) if anchor.get('known_at') is not None else observed
+        if not end <= observed <= known <= aware(as_of):
+            return None
+        if anchor.get('source_time') is not None and not end <= aware(anchor['source_time']) <= observed:
+            return None
+        if (anchor.get('kind') != 'daily_ohlc' or anchor.get('day') != day.isoformat()
+                or anchor.get('code') != code or not str(anchor.get('source') or '').strip()
+                or anchor.get('price_basis') != 'unadjusted' or anchor.get('complete') is not True
+                or anchor.get('corporate_action') is True):
+            return None
+        raw = [anchor.get(k) for k in ('open', 'high', 'low', 'close')]
+        if any(isinstance(v, bool) for v in raw):
+            return None
+        opening, high, low, close = values = [float(v) for v in raw]
+        if not all(math.isfinite(v) and v > 0 for v in values):
+            return None
+        return anchor if low <= min(opening, close) <= max(opening, close) <= high else None
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def fetch_daily_anchors(code, days, cutoff, *, timeout=10, getter=None):

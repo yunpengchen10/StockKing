@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from api.deps import get_config_dep, get_database_manager
 from api.v1.endpoints import stock_king as endpoint
 from src.services.stock_king_display import LocalPicksDisplayStore
+from src.services.stock_king_publications import missing_publication
 from src.services.stock_king_service import StockKingService
 from src.services.task_queue import AnalysisTaskQueue
 
@@ -83,7 +84,7 @@ def completed_response(client, queue, accepted):
 def test_refresh_is_async_deduplicated_and_reopen_resumes(runtime, monkeypatch):
     client, db, _, queue = runtime
     store = LocalPicksDisplayStore(db)
-    old = store.save(scan())
+    old = store.save(scan(generatedAt="2026-09-29T10:29:59+08:00"))
     gate, started = Event(), Event()
     calls = install_scan(monkeypatch, scan("600002"), gate=gate, started=started)
     try:
@@ -116,7 +117,7 @@ def test_refresh_is_async_deduplicated_and_reopen_resumes(runtime, monkeypatch):
     assert shown["adaptive"]["candidates"][0]["code"] == "600002"
     assert calls == [("live", {"top_n": 5, "official": False})]
     assert LocalPicksDisplayStore(db).read() == {
-        key: value for key, value in shown.items() if key != "currentPrimaryReadiness"}
+        key: value for key, value in shown.items() if key not in ("currentPrimaryReadiness", "currentThemeFeedback")}
 
 
 @pytest.mark.parametrize("result", [
@@ -137,13 +138,13 @@ def test_failed_or_skipped_refresh_preserves_previous_display(runtime, monkeypat
     assert done["status"] == "failed" and done["result"] is None and done["error"]
     assert store.path.read_bytes() == original
     shown = client.get("/picks/display").json()
-    assert {key: value for key, value in shown.items() if key != 'currentPrimaryReadiness'} == old
+    assert {key: value for key, value in shown.items() if key not in ('currentPrimaryReadiness', 'currentThemeFeedback')} == old
     assert shown['currentPrimaryReadiness']['stateScope'] == 'current_registry'
 
 
 def test_valid_empty_manual_refresh_is_not_repopulated_by_equal_or_older_history(runtime, monkeypatch):
     client, db, rows, queue = runtime
-    LocalPicksDisplayStore(db).save(scan())
+    LocalPicksDisplayStore(db).save(scan(generatedAt="2026-09-29T10:29:59+08:00"))
     install_scan(monkeypatch, scan(None))
     done = completed_response(client, queue, client.post("/picks/refresh", json={}))
     assert done["status"] == "completed"
@@ -167,9 +168,9 @@ def test_display_uses_latest_valid_empty_history_then_newer_completed_scan_witho
     latest = scan("600008", generatedAt="2026-09-30T10:30:00+08:00")
     rows.insert(0, {"mode": "king_1030", "result": latest})
     shown = client.get("/picks/display").json()
-    assert shown["adaptive"] == latest and shown["displaySource"] == "history"
+    assert shown["adaptive"] == {**latest, "publishedPicks": missing_publication(latest)} and shown["displaySource"] == "history"
     assert LocalPicksDisplayStore(None).read() == {
-        key: value for key, value in shown.items() if key != 'currentPrimaryReadiness'}
+        key: value for key, value in shown.items() if key not in ('currentPrimaryReadiness','currentThemeFeedback')}
 
 
 def test_newer_scheduled_empty_replaces_manual_candidates_and_invalid_runs_are_ignored(runtime, monkeypatch):
@@ -188,8 +189,8 @@ def test_newer_scheduled_empty_replaces_manual_candidates_and_invalid_runs_are_i
         {"mode": "yao_scout", "result": scan("600008", generatedAt="2026-10-05T10:30:00+08:00")},
     ])
     shown = client.get("/picks/display").json()
-    assert shown["adaptive"] == latest
-    assert shown["savedRecommendationCount"] == 0 and shown["displaySource"] == "history"
+    assert shown["adaptive"] == {**latest, "publishedPicks": missing_publication(latest)}
+    assert shown["savedRecommendationCount"] is None and shown["displaySource"] == "history"
 
 
 @pytest.mark.parametrize("older_stamp", ["2026-09-29T02:20:00Z", "2026-09-29T10:20:00", "invalid"])
@@ -212,7 +213,7 @@ def test_completion_timestamp_wins_over_history_order_and_offsets(runtime):
         {"mode": "king_1030", "result": scan("600002", generatedAt="2026-09-29T10:45:00+08:00")},
         {"mode": "king_live", "result": latest},
     ])
-    assert store.read()["adaptive"] == latest
+    assert store.read()["adaptive"] == {**latest, "publishedPicks": missing_publication(latest)}
 
 
 def test_history_database_error_preserves_durable_display(runtime):
@@ -246,7 +247,7 @@ def test_display_projection_preserves_recommendations_and_full_durable_evidence(
         "precisionDecision": {"profiles": {"regular": {"entryEligible": False, "reasons": ["等待确认"]}}},
     }]
     assert "controls" not in shown["adaptive"] and "windvanes" not in shown["adaptive"]
-    assert json.loads(store.path.read_text(encoding="utf-8"))["adaptive"] == result
+    assert json.loads(store.path.read_text(encoding="utf-8"))["adaptive"] == {**result, "publishedPicks": shown['adaptive']['publishedPicks']}
     assert store.read() == shown
 
 
@@ -311,9 +312,9 @@ def test_history_filters_before_limit_so_other_runs_do_not_hide_latest_picks(tmp
             reads.append(run_id)
             return get_run(run_id)
         db.get_yao_run = fetch
-        assert LocalPicksDisplayStore(db).read()["adaptive"] == latest
+        assert LocalPicksDisplayStore(db).read()["adaptive"] == {**latest, "publishedPicks": missing_publication(latest)}
         assert reads == ["latest-picks"]
-        assert LocalPicksDisplayStore(db).read()["adaptive"] == latest
+        assert LocalPicksDisplayStore(db).read()["adaptive"] == {**latest, "publishedPicks": missing_publication(latest)}
         assert reads == ["latest-picks"], "unchanged scans must not refetch their full payload"
     finally:
         engine.dispose()
@@ -322,7 +323,7 @@ def test_history_filters_before_limit_so_other_runs_do_not_hide_latest_picks(tmp
 def test_no_history_is_empty_and_successful_empty_history_can_migrate(runtime):
     client, _, rows, _ = runtime
     first = client.get("/picks/display").json()
-    assert set(first) == {'currentPrimaryReadiness'}
+    assert set(first) == {'currentPrimaryReadiness','currentThemeFeedback'}
     assert first['currentPrimaryReadiness']['modelUsableNow'] is False
     rows.append({"mode": "king_live", "result": scan(None)})
     shown = client.get("/picks/display").json()
@@ -425,7 +426,7 @@ def test_premarket_missing_quotes_explains_why_and_atomic_write_failure_preserve
     import src.services.stock_king_display as module
     monkeypatch.setattr(module.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("disk failed")))
     with pytest.raises(OSError, match="disk failed"):
-        store.save(scan("600008"))
+        store.save(scan("600008", generatedAt="2026-09-29T10:30:01+08:00"))
     assert store.read() == old
     assert list(store.path.parent.glob("*.tmp")) == []
 

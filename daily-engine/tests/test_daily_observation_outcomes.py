@@ -480,3 +480,49 @@ def test_upgrade_recovers_matured_not_matured_labels_before_new_future_planning(
     with svc._connect() as db:
         observed = db.execute("SELECT s.code FROM daily_observation_signals s JOIN daily_observation_outcomes o USING(observation_id) WHERE o.status='observed'").fetchone()[0]
     assert observed == '600001'
+
+
+def test_published_closes_get_a_turn_before_due_controls_and_corroborate_tainted_days(tmp_path):
+    from src.services.yao_scout.daily_observation_queue import review_published_closes
+    clock = [NOW]
+    svc = service(tmp_path, clock=lambda: clock[0])
+    record = scan(candidate(), candidate('600002'))
+    record['opportunityChannels'] = {'version': 'offline', 'recommendations': [candidate('600009')]}
+    svc.persist_scan(record, '1030', NOW, True)
+    clock[0] = NOW.replace(day=29, hour=16)
+    fixture_close(tmp_path, '600009', DAYS[1], 12, status='tainted')
+    assert mod.review(svc, clock[0], max_labels=1)['checked'] == 1
+    with svc._connect() as db:
+        assert db.execute('SELECT first_category FROM daily_observation_outcomes '
+                          'JOIN daily_observation_signals USING(observation_id)').fetchone()[0] == 'opportunity_recommendation'
+    calls = []
+    def anchors(code, days, cutoff, source='sina'):
+        calls.append((code, days, source))
+        return {day: dict(code=code, day=day, kind='daily_ohlc', source=source, price_basis='unadjusted',
+                    complete=True, open=11., high=13., low=10., close=12., observed_at=clock[0].isoformat())
+                for day in days}
+    def mismatched(code, days, cutoff):
+        return {day: {**entry, 'close': 11.} for day, entry in anchors(code, days, cutoff, 'tencent').items()}
+    review_published_closes(svc, daily_fetcher=anchors, confirmation_fetcher=mismatched)
+    with svc._connect() as db:
+        rows = db.execute('SELECT horizon,status,gross_reference_change_pct,details_json FROM daily_observation_outcomes '
+            'JOIN daily_observation_signals USING(observation_id) WHERE first_category=? ORDER BY horizon',
+            ('opportunity_recommendation',)).fetchall()
+    assert [r[1] for r in rows] == ['unverified_close', 'observed', 'observed']
+    assert 'independent_daily_close_not_corroborated' in json.loads(rows[0][3])['gaps']
+    assert all(code == '600009' for code, _, _ in calls)
+    review_published_closes(svc, daily_fetcher=anchors, confirmation_fetcher=lambda c, d, t: anchors(c, d, t, 'tencent'))
+    with svc._connect() as db:
+        final = db.execute("SELECT status,observed_close,gross_reference_change_pct,net_return,details_json "
+                           "FROM daily_observation_outcomes WHERE horizon=1").fetchone()
+    assert tuple(final[:4]) == ('observed', 12., pytest.approx(20.), None)
+    evidence = json.loads(final[4])['closeEvidence']
+    assert evidence['verification']['source'] == 'sina' and evidence['corroboration']['source'] == 'tencent'
+    assert evidence['minuteArchiveStatus'] == 'tainted'
+    top = svc.daily_observation_reviews(as_of=clock[0], limit=1)
+    assert len(top['items']) == 1 and top['items'][0]['first_category'] == 'opportunity_recommendation'
+    assert top['total'] > 1 and top['truncated']
+    compact = svc.daily_observation_reviews(as_of=clock[0], limit=1, filters={'compact': True})
+    assert compact['groups'] == top['groups'] and compact['total'] == top['total']
+    assert compact['items'][0] == {k: v for k, v in top['items'][0].items()
+                                   if k not in ('appearances', 'snapshot', 'created_at', 'first_run_id')}
