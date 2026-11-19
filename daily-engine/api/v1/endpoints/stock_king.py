@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import uuid
 import threading
+from copy import deepcopy
+import hashlib
+import json
 from typing import Any, Dict, Literal
 
 from fastapi import APIRouter, Depends, Query
@@ -19,7 +22,7 @@ from api.v1.errors import api_error
 from src.config import Config
 from src.services.task_queue import TaskStatus as QueueTaskStatus
 from src.services.task_queue import get_task_queue
-from src.services.stock_king_service import StockKingService
+from src.services.stock_king_service import StockKingService, STOCK_KING_SCHEMA_VERSION
 from src.services.yao_scout import AdaptiveKingService, YaoScoutService
 from src.storage import DatabaseManager
 from src.services.yao_scout.local_opportunities import LocalOpportunityService
@@ -29,6 +32,7 @@ from src.services.stock_king_publications import published_count
 router = APIRouter()
 _refresh_lock = threading.RLock()
 _refresh_tasks: dict[str, str] = {}
+_refresh_strategies: dict[str, Dict[str, Any]] = {}
 
 
 def _picks_json_response(payload: Dict[str, Any]) -> JSONResponse:
@@ -44,6 +48,7 @@ class PicksRequest(BaseModel):
     top_n: int = Field(5, ge=0, le=5)
     official: bool | None = None
     allow_missed: bool = False
+    strategy_id: str = Field('all', min_length=1, max_length=80, pattern=r'^[a-zA-Z0-9_.-]+$')
 
 
 class AdaptiveRunRequest(BaseModel):
@@ -81,6 +86,8 @@ def _refresh_task_payload(task) -> Dict[str, Any]:
         "resultPersisted": completed and bool(result),
         "displayRunId": result.get("displayRunId") or adaptive.get("run_id") or adaptive.get("runId"),
         "displayGeneratedAt": result.get("displayGeneratedAt") or result.get("generatedAt") or adaptive.get("generatedAt"),
+        **{key: result[key] for key in ('scanRunId', 'publishedRunId', 'publicationStatus') if key in result},
+        **_refresh_strategies.get(task.task_id, {}),
     }
 
 
@@ -90,6 +97,92 @@ def _active_refresh(queue, storage_key):
     return task if task and task.status in (QueueTaskStatus.PENDING, QueueTaskStatus.PROCESSING) else None
 
 
+def _strategy_store(display_store):
+    from src.services.yao_scout.strategy_channels import StrategyRuleStore
+    return StrategyRuleStore(display_store.path.parent / 'strategy-rules-v1.sqlite3')
+
+
+def _strategy_identity(catalog, strategy_id):
+    from src.services.yao_scout.strategy_channels import VERSION
+    selected = next((row for row in catalog if row['id'] == strategy_id), None)
+    if strategy_id == 'all':
+        selected = {'id': 'all', 'name': '全部打法', 'version': VERSION}
+    if selected is None or (strategy_id != 'all' and not selected.get('enabled')):
+        raise api_error(422, 'stock_king_strategy_unavailable', '所选打法不存在或尚未启用，请重新选择')
+    relevant = [{key: row[key] for key in ('id', 'name', 'version', 'baseStrategy', 'conditions', 'rankBy', 'description', 'enabled')
+                 if key in row} for row in ([row for row in catalog if row.get('enabled')] if strategy_id == 'all' else [selected])]
+    fingerprint = hashlib.sha256(json.dumps(relevant, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    return {'strategyId': selected['id'], 'strategyName': selected['name'],
+            'strategyVersion': selected['version'], 'strategyFingerprint': fingerprint}
+
+
+def _capture_strategy(display_store, strategy_id):
+    from src.services.yao_scout.strategy_channels import catalog_rules
+    rules = _strategy_store(display_store).list()
+    return deepcopy(rules), _strategy_identity(catalog_rules(rules), strategy_id)
+
+
+@router.get('/picks/strategies')
+def get_picks_strategies(db_manager: DatabaseManager = Depends(get_database_manager)):
+    from src.services.yao_scout.strategy_channels import catalog_rules, FIELDS
+    catalog = catalog_rules(_strategy_store(LocalPicksDisplayStore(db_manager)).list())
+    fingerprints = {key: _strategy_identity(catalog, key)['strategyFingerprint']
+                    for key in ['all', *[row['id'] for row in catalog if row.get('enabled')]]}
+    return {'items': [{**row, 'strategyFingerprint': fingerprints.get(row['id'])} for row in catalog],
+            'availableFields': FIELDS, 'defaultStrategyId': 'all',
+            'defaultStrategyFingerprint': fingerprints['all'], 'strategyFingerprints': fingerprints}
+
+
+@router.post('/picks/strategies/import')
+def import_picks_strategy(document: Dict[str, Any], db_manager: DatabaseManager = Depends(get_database_manager)):
+    try:
+        return {'strategy': _strategy_store(LocalPicksDisplayStore(db_manager)).import_rule(document)}
+    except ValueError as error:
+        raise api_error(422, 'stock_king_strategy_invalid', str(error)) from error
+
+
+class StrategyPreviewRequest(BaseModel):
+    strategy_id: str = Field(..., min_length=1, max_length=80)
+    run_id: str = Field('', max_length=150)
+
+
+@router.post('/picks/strategies/preview')
+def preview_picks_strategy(request: StrategyPreviewRequest,
+                           db_manager: DatabaseManager = Depends(get_database_manager)):
+    store = LocalPicksDisplayStore(db_manager)
+    latest = store.publications.latest() if not request.run_id else None
+    run_id = request.run_id or (latest or {}).get('runId')
+    row = db_manager.get_yao_run(run_id) if run_id else None
+    run = (row or {}).get('result')
+    if not isinstance(run, dict):
+        raise api_error(404, 'stock_king_preview_source_missing', '暂无可试跑的完整扫描，请先完成一次扫描')
+    try:
+        result = _strategy_store(store).preview(run, request.strategy_id)
+        return {**result, 'runId': run_id, 'status': 'previewed'}
+    except ValueError as error:
+        raise api_error(422, 'stock_king_strategy_preview_invalid', str(error)) from error
+
+
+class StrategyEnableRequest(BaseModel):
+    confirm: bool = False
+    enabled: bool = True
+    expected_version: str | None = Field(None, max_length=32)
+    expected_fingerprint: str | None = Field(None, max_length=128)
+
+
+@router.post('/picks/strategies/{strategy_id}/enable')
+def enable_picks_strategy(strategy_id: str, request: StrategyEnableRequest,
+                         db_manager: DatabaseManager = Depends(get_database_manager)):
+    if request.confirm is not True:
+        raise api_error(422, 'stock_king_strategy_confirmation_required', '请先查看试跑结果并确认启用')
+    try:
+        expected = {key: value for key, value in (
+            ('expected_version', request.expected_version), ('expected_fingerprint', request.expected_fingerprint)) if value is not None}
+        return {'strategy': _strategy_store(LocalPicksDisplayStore(db_manager)).set_enabled(strategy_id, request.enabled, **expected)}
+    except ValueError as error:
+        raise api_error(422, 'stock_king_strategy_enable_invalid', str(error)) from error
+
+
 @router.post("/picks/refresh", status_code=202)
 def refresh_local_picks(
     request: PicksRequest,
@@ -97,10 +190,14 @@ def refresh_local_picks(
     db_manager: DatabaseManager = Depends(get_database_manager),
 ) -> Dict[str, Any]:
     store = LocalPicksDisplayStore(db_manager)
+    rules, strategy = _capture_strategy(store, request.strategy_id)
     queue = get_task_queue()
     with _refresh_lock:
         active = _active_refresh(queue, store.storage_key)
         if active:
+            active_strategy = _refresh_strategies.get(active.task_id, {'strategyId': 'all', 'strategyVersion': 'all'})
+            if (active_strategy.get('strategyId'), active_strategy.get('strategyFingerprint')) != (strategy['strategyId'], strategy['strategyFingerprint']):
+                raise api_error(409, 'stock_king_other_strategy_running', '另一打法正在扫描，请等待完成后再提交所选打法')
             return _refresh_task_payload(active)
         task_id = uuid.uuid4().hex
 
@@ -110,7 +207,8 @@ def refresh_local_picks(
             report(10, "正在读取历史记录，准备本地精选刷新")
             result = LocalOpportunityService(
                 YaoScoutService(config=config, db_manager=db_manager), progress_callback=report,
-            ).run("live", top_n=request.top_n, official=False)
+            ).run("live", top_n=request.top_n, official=False,
+                  strategy_id=strategy['strategyId'], strategy_rules=rules)
             report(98, "扫描完成，正在保存本次展示结果")
             saved = store.save(result)
             # Persistence is the completion boundary. The task queue retains
@@ -119,6 +217,10 @@ def refresh_local_picks(
                 "resultPersisted": True,
                 "displayRunId": saved.get("displayRunId"),
                 "displayGeneratedAt": saved.get("generatedAt"),
+                **({'scanRunId': result.get('run_id'),
+                    'publishedRunId': result['publishedPicks'].get('runId') if result['publishedPicks'].get('status') == 'published' else None,
+                    'publicationStatus': result['publishedPicks'].get('status')}
+                   if isinstance(result.get('publishedPicks'), dict) else {}),
             }
 
         task = queue.submit_background_task(
@@ -127,6 +229,7 @@ def refresh_local_picks(
             task_id=task_id, trace_id=task_id,
         )
         _refresh_tasks[store.storage_key] = task_id
+        _refresh_strategies[task_id] = strategy
         return _refresh_task_payload(task)
 
 
@@ -140,10 +243,21 @@ async def get_local_picks_refresh_task(task_id: str) -> JSONResponse:
 
 @router.get("/picks/display")
 def get_local_picks_display(
+    strategy_id: str = '',
     db_manager: DatabaseManager = Depends(get_database_manager),
 ) -> JSONResponse:
     store = LocalPicksDisplayStore(db_manager)
-    payload = store.with_current_primary_readiness(store.read())
+    if strategy_id:
+        latest = store.publications.latest(strategy_id)
+        snapshot = store.history_snapshot(latest['runId']) if latest else None
+        payload = ({'adaptive': snapshot['result'], 'displayRunId': snapshot['run_id'],
+                    'generatedAt': snapshot['result'].get('generatedAt'), 'displaySnapshotVersion': 1,
+                    'schemaVersion': STOCK_KING_SCHEMA_VERSION, 'displaySource': 'strategy_history',
+                    'candidateCount': snapshot['publishedPickCount'], 'savedRecommendationCount': snapshot['publishedPickCount'],
+                    'publishedPickCount': snapshot['publishedPickCount']} if snapshot else {})
+    else:
+        payload = store.read()
+    payload = store.with_current_primary_readiness(payload)
     with _refresh_lock:
         active = _active_refresh(get_task_queue(), store.storage_key)
         if active:
@@ -166,6 +280,7 @@ def get_picks(
         top_n=request.top_n,
         official=request.official,
         allow_missed=request.allow_missed,
+        strategy_id=request.strategy_id,
     )
     payload['publishedPickCount'] = published_count((payload.get('adaptive') or {}).get('publishedPicks'))
     return payload
@@ -284,8 +399,12 @@ def _signal_learning(config, db_manager):
 def get_published_records(date: str = '', symbol: str = '', version: str = '', run_id: str = '',
                           scope: Literal['current', 'history'] = 'current', compact: bool = False,
                           db_manager: DatabaseManager = Depends(get_database_manager)):
-    records = LocalPicksDisplayStore(db_manager).records(
+    store = LocalPicksDisplayStore(db_manager)
+    records = store.records(
         run_id=run_id, date=date, symbol=symbol, version=version, scope=scope)
+    if scope == 'history' and not run_id and any(doc.get('ruleSnapshots') for doc in records['items']):
+        from src.services.yao_scout.strategy_outcomes import summarize_strategy_outcomes
+        records['strategyOutcomes'] = summarize_strategy_outcomes(records['items'], store.path.parent)
     return _picks_json_response(records) if compact else records
 
 

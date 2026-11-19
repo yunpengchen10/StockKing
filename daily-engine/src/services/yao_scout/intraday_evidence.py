@@ -76,14 +76,16 @@ def _session(stamp: datetime) -> str | None:
     return None
 
 
-def parse_tencent_intraday(payload: dict, code: str) -> list[dict]:
+def parse_tencent_intraday(payload: dict, code: str, *, market_symbol: str | None = None) -> list[dict]:
     """Parse either actually observed Tencent response shape, preserving dates.
 
     No top-level quote timestamp, request time or today's date is substituted
     for a missing minute date. Malformed numeric amount/volume remain None so
     valid price evidence can survive a provider field omission.
     """
-    symbol = _symbol(code)
+    symbol = market_symbol or _symbol(code)
+    if symbol[2:] != code or not re.fullmatch(r'(?:sh|sz)[0-9]{6}', symbol):
+        raise ValueError("Tencent minute symbol does not match requested security")
     if not isinstance(payload, dict) or payload.get("code") not in (0, "0"):
         raise ValueError("Tencent minute response reports an error or lacks code=0")
     root = (payload.get("data") or {}).get(symbol)

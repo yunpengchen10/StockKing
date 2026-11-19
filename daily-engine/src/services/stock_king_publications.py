@@ -47,13 +47,15 @@ class PicksPublications:
             row = db.execute('SELECT document FROM publications WHERE run_id=?', (run_id,)).fetchone()
         return json.loads(row[0]) if row else None
 
-    def latest(self):
+    def latest(self, strategy_id=''):
         if not self.path.exists():
             return None
         with closing(sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True, timeout=30)) as db:
             if not _initialized(db):
                 return None
-            row = db.execute('SELECT document FROM publications ORDER BY julianday(as_of) DESC,rowid DESC LIMIT 1').fetchone()
+            where = " WHERE COALESCE(json_extract(document, '$.strategyId'), 'all')=?" if strategy_id else ''
+            row = db.execute('SELECT document FROM publications' + where + ' ORDER BY julianday(as_of) DESC,rowid DESC LIMIT 1',
+                             (strategy_id,) if strategy_id else ()).fetchone()
         return json.loads(row[0]) if row else None
 
     def publish(self, run, make_items, *, reason, persist=None, current_only=False):
@@ -93,6 +95,13 @@ class PicksPublications:
                     doc = {**missing_publication(run), 'version': VERSION, 'items': items,
                            'publishedAt': datetime.now(TZ).isoformat(), 'status': 'published',
                            'publicationReason': reason}
+                    if isinstance(run.get('official'), bool):
+                        doc['official'] = run['official']
+                    selection = run.get('strategySelection')
+                    if isinstance(selection, dict):
+                        doc.update({key: selection[key] for key in ('strategyId', 'strategyName', 'strategyVersion',
+                            'channels', 'ruleSnapshots', 'selectionPolicy') if key in selection})
+                        doc['version'] = selection['version']
                 codes = [item['code'] for item in doc['items']]
                 if (len(codes) != len(set(codes)) or len(codes) > 5
                         or [item['rank'] for item in doc['items']] != list(range(1, len(codes) + 1))):

@@ -273,6 +273,14 @@ func (a *App) GetKingPicks(maxPerBoard int, force bool) (map[string]any, error) 
 // StartKingPicksRefresh starts only the local picks scan. The short request
 // returns a task ID; polling never holds a Wails call open for the full scan.
 func (a *App) StartKingPicksRefresh(maxPerBoard int) (map[string]any, error) {
+	return a.StartKingPicksStrategyRefresh(maxPerBoard, "all")
+}
+
+func (a *App) StartKingPicksStrategyRefresh(maxPerBoard int, strategyID string) (map[string]any, error) {
+	strategyID = strings.TrimSpace(strategyID)
+	if strategyID == "" {
+		strategyID = "all"
+	}
 	if maxPerBoard < 5 {
 		maxPerBoard = 5
 	}
@@ -280,8 +288,35 @@ func (a *App) StartKingPicksRefresh(maxPerBoard int) (map[string]any, error) {
 		maxPerBoard = 50
 	}
 	return a.kingPicksControl(http.MethodPost, "/api/v1/stock-king/picks/refresh", map[string]any{
-		"max_per_board": maxPerBoard, "force": true, "scan_slot": "live", "top_n": 5, "official": false,
+		"max_per_board": maxPerBoard, "force": true, "scan_slot": "live", "top_n": 5, "official": false, "strategy_id": strategyID,
 	})
+}
+
+func (a *App) GetKingPicksStrategies() (map[string]any, error) {
+	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/strategies", nil)
+}
+
+func (a *App) ImportKingPicksStrategy(definition map[string]any) (map[string]any, error) {
+	return a.kingPicksControl(http.MethodPost, "/api/v1/stock-king/picks/strategies/import", definition)
+}
+
+func (a *App) PreviewKingPicksStrategy(strategyID, runID string) (map[string]any, error) {
+	return a.kingPicksControlTimeout(http.MethodPost, "/api/v1/stock-king/picks/strategies/preview", map[string]any{"strategy_id": strategyID, "run_id": runID}, 45*time.Second)
+}
+
+func (a *App) EnableKingPicksStrategy(strategyID string) (map[string]any, error) {
+	return a.SetKingPicksStrategyEnabled(strategyID, true, "", "")
+}
+
+func (a *App) SetKingPicksStrategyEnabled(strategyID string, enabled bool, expectedVersion, expectedFingerprint string) (map[string]any, error) {
+	body := map[string]any{"confirm": true, "enabled": enabled}
+	if expectedVersion != "" {
+		body["expected_version"] = expectedVersion
+	}
+	if expectedFingerprint != "" {
+		body["expected_fingerprint"] = expectedFingerprint
+	}
+	return a.kingPicksControl(http.MethodPost, "/api/v1/stock-king/picks/strategies/"+url.PathEscape(strategyID)+"/enable", body)
 }
 
 func (a *App) GetKingPicksRefreshTask(taskID string) (map[string]any, error) {
@@ -355,7 +390,7 @@ func (a *App) GetKingPicksHistory(limit int) (map[string]any, error) {
 }
 
 func (a *App) GetKingPicksSnapshot(runID string) (map[string]any, error) {
-	return a.kingPicksControl(http.MethodGet, "/api/v1/stock-king/picks/history/"+url.PathEscape(runID), nil)
+	return a.kingPicksControlTimeout(http.MethodGet, "/api/v1/stock-king/picks/history/"+url.PathEscape(runID), nil, 45*time.Second)
 }
 
 func (a *App) GetStockKingRecommendationHistory(date, symbol, version string, includeControls bool, runId string) (map[string]any, error) {

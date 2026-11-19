@@ -553,6 +553,12 @@ export function SetTradingPrice(arg1:string,arg2:number,arg3:number,arg4:number,
 export function StartFeishuBot():Promise<string>;
 
 export function StartKingPicksRefresh(arg1:number):Promise<Record<string, any>>;
+export function StartKingPicksStrategyRefresh(arg1:number,arg2:string):Promise<Record<string, any>>;
+export function GetKingPicksStrategies():Promise<Record<string, any>>;
+export function ImportKingPicksStrategy(arg1:Record<string, any>):Promise<Record<string, any>>;
+export function PreviewKingPicksStrategy(arg1:string,arg2:string):Promise<Record<string, any>>;
+export function EnableKingPicksStrategy(arg1:string):Promise<Record<string, any>>;
+export function SetKingPicksStrategyEnabled(arg1:string,arg2:boolean,arg3:string,arg4:string):Promise<Record<string, any>>;
 
 export function StartQuantBacktest(arg1:Array<number>):Promise<Record<string, any>>;
 

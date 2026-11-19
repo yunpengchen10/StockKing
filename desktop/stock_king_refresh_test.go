@@ -67,3 +67,64 @@ func TestLocalPicksControlHonorsShutdown(t *testing.T) {
 		t.Fatal("empty task ID must fail without a request")
 	}
 }
+
+func TestStrategyRefreshAndImportRoutesUseExplicitSelection(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			switch r.URL.Path {
+			case "/api/v1/stock-king/picks/refresh":
+				if body["strategy_id"] != "theme_lead" || body["top_n"] != float64(5) {
+					t.Errorf("selection lost: %#v", body)
+				}
+			case "/api/v1/stock-king/picks/strategies/import":
+				if body["id"] != "custom.mine" {
+					t.Errorf("definition lost: %#v", body)
+				}
+			case "/api/v1/stock-king/picks/strategies/preview":
+				if body["strategy_id"] != "custom.mine" || body["run_id"] != "frozen-run" {
+					t.Errorf("preview source lost: %#v", body)
+				}
+			case "/api/v1/stock-king/picks/strategies/custom.mine/enable":
+				if body["confirm"] != true {
+					t.Errorf("confirmation missing: %#v", body)
+				}
+				if body["enabled"] == false && (body["expected_version"] != "2" || body["expected_fingerprint"] != "reviewed-definition") {
+					t.Errorf("version-bound disable missing: %#v", body)
+				}
+			default:
+				t.Errorf("unexpected mutation: %s", r.URL.Path)
+			}
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	app := &App{ctx: context.Background(), sidecar: &SidecarManager{port: server.Listener.Addr().(*net.TCPAddr).Port, status: EngineStatus{Ready: true}, client: server.Client()}}
+	if _, err := app.StartKingPicksStrategyRefresh(5, "theme_lead"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.GetKingPicksStrategies(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ImportKingPicksStrategy(map[string]any{"id": "custom.mine"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.PreviewKingPicksStrategy("custom.mine", "frozen-run"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.EnableKingPicksStrategy("custom.mine"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.SetKingPicksStrategyEnabled("custom.mine", false, "2", "reviewed-definition"); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 6 {
+		t.Fatalf("unexpected calls: %v", calls)
+	}
+}

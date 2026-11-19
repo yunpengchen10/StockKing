@@ -5,24 +5,43 @@ import { ledgerPercent, ledgerPrice, ledgerSigned, priceObservationPercent, stat
 import { withRecordReadTimeout } from '../utils/recordRead.mjs'
 import { learningTimeline, learningTaskLabel } from '../utils/learningStatus.mjs'
 import { dailyObservationRows, dailyObservationCategory, dailyObservationStatus, settlementHealthSummary } from '../utils/recommendationQuality.mjs'
-import { shanghaiDate } from '../utils/pickLedger.mjs'
+import { shanghaiDate, formatStrategyEvidence } from '../utils/pickLedger.mjs'
 
 // Keep historical filters, but follow the displayed persisted scan in current mode.
 const props = defineProps({ mode: { type: String, required: true }, active: { type: Boolean, default: true }, refreshToken: { type: Number, default: 0 }, recordsView: { type: String, default: 'current' }, displayRunId: { type: String, default: '' }, displayAsOf: { type: String, default: '' }, publication: { type: Object, default: null }, displayedStocks: { type: Array, default: null }, reviewFilter: { type: Object, default: null } })
 defineEmits(['open-chart', 'open-snapshot', 'open-review'])
 const date = ref(''), symbol = ref(''), version = ref(''), includeControls = ref(false)
 const recordsScope = ref(props.recordsView === 'history' ? 'history' : 'current')
+const channelFilter = ref('')
 const currentRecords = computed(() => props.mode === 'records' && recordsScope.value === 'current')
 const loading = ref(false), error = ref(''), payload = ref({ items: [] })
 const visibleGroupCount = ref(30)
 const queriedAt = ref(''), reviewLearning = ref({}), learningError = ref('')
 const quotesLoading = ref(false), quotesError = ref(''), quotes = ref({})
 let requestId = 0, disposed = false, initialized = false, quoteTimer = null, quoteUpdateGeneration = 0
+const savedRounds = computed(() => props.mode === 'records' && payload.value.recordsVersion === 'published-picks-v1' && Array.isArray(payload.value.items)
+  ? payload.value.items.filter(round => round?.status === 'published' && round.runId && Array.isArray(round.items)) : [])
+function channelKey(channel) { return JSON.stringify([channel.id, channel.version]) }
+const channelChoices = computed(() => {
+  const choices = new Map()
+  for (const round of savedRounds.value) {
+    for (const channel of round.channels || []) choices.set(channelKey(channel), channel.name + ' · ' + channel.version)
+  }
+  return [...choices.entries()]
+})
+const outcomeGroups = computed(() => (payload.value.strategyOutcomes?.groups || [])
+  .filter(group => !channelFilter.value || channelKey(group) === channelFilter.value))
+function rate(count, observed) { return observed ? (100 * count / observed).toFixed(1) + '%' : '—' }
 const publications = computed(() => {
   if (props.mode !== 'records') return []
-  const saved = payload.value.recordsVersion === 'published-picks-v1' && Array.isArray(payload.value.items)
-    ? payload.value.items.filter(round => round?.status === 'published' && round.runId && Array.isArray(round.items)) : []
-  if (!currentRecords.value) return saved
+  const saved = savedRounds.value
+  if (!currentRecords.value) {
+    if (!channelFilter.value) return saved
+    return saved.filter(round => (round.channels || []).some(c => channelKey(c) === channelFilter.value))
+      .map(round => ({ ...round,
+        items: round.items.filter(stock => (stock.strategyMatches || []).some(c => channelKey(c) === channelFilter.value)),
+      }))
+  }
   if (Array.isArray(props.displayedStocks)) {
     return props.publication?.status === 'published' && props.publication.runId === props.displayRunId && props.displayRunId ? [props.publication] : []
   }
@@ -141,6 +160,10 @@ watch(() => props.active, active => {
   else void updateQuotes()
 }, { immediate: true })
 watch(visibleGroupCount, () => { if (props.mode === 'records' && props.active) void refreshQuotes() })
+watch(channelFilter, () => {
+  visibleGroupCount.value = 30
+  if (props.active && !currentRecords.value) void refreshQuotes()
+})
 watch(recordsScope, () => { if (props.mode === 'records') void refresh() })
 watch(() => props.displayRunId, () => {
   if (props.mode !== 'records') return
@@ -166,7 +189,8 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
       <template v-if="mode !== 'learning' && !currentRecords">
         <label>信号日期<input v-model="date" type="date" aria-label="信号日期" /></label>
         <label>股票代码<n-input v-model:value="symbol" clearable placeholder="全部股票" style="width:145px" /></label>
-        <label>算法版本<n-input v-model:value="version" clearable placeholder="全部版本" style="width:205px" /></label>
+        <label>{{ mode === 'records' ? '发布版本' : '算法版本' }}<n-input v-model:value="version" clearable placeholder="全部版本" style="width:205px" /></label>
+        <label v-if="mode === 'records'">推荐打法<select v-model="channelFilter" aria-label="筛选历史推荐打法"><option value="">全部打法与旧版记录</option><option v-for="[key, label] in channelChoices" :value="key" :key="key">{{ label }}</option></select></label>
       </template>
       <n-button attr-type="submit" secondary :loading="loading">{{ mode === 'learning' ? '刷新学习状态' : '查询记录' }}</n-button>
       <n-button v-if="mode === 'records'" attr-type="button" secondary :loading="quotesLoading" :disabled="loading || !quoteCodes.length" @click="refreshQuotes">刷新报价</n-button>
@@ -177,15 +201,32 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
       <template v-if="mode === 'records'">
         <p v-if="currentRecords" class="ledger-note">与精选同步 · 当前查看轮次 {{ displayRunId || '尚无已发布轮次' }}</p>
         <p v-else class="ledger-note">按发布时间查看各轮推荐，轮内顺序沿用首页排名。</p>
+        <details v-if="!currentRecords && outcomeGroups.length" class="strategy-review">
+          <summary>比较各打法的次日表现</summary>
+          <p class="ledger-note">每次正式发布的一只股票计一次。同股命中多个打法时，各计入对应打法。按下一交易日已核验收盘价相对推荐价计算，未到期及缺价样本单列。以下为已发布样本的历史表现。</p>
+          <div class="review-table-wrap"><table class="review-table"><thead><tr><th>打法 / 版本</th><th>已核验 / 已推荐</th><th>待核验</th><th>上涨</th><th>涨幅 ≥5%</th><th>跌幅 ≥5%</th></tr></thead><tbody>
+            <tr v-for="group in outcomeGroups" :key="channelKey(group)"><td>{{ group.name }} · {{ group.version }}</td><td>{{ group.observed }} / {{ group.total }}</td><td>{{ group.total - group.observed }}</td><td>{{ rate(group.up, group.observed) }}</td><td>{{ rate(group.bigUp, group.observed) }}</td><td>{{ rate(group.bigDown, group.observed) }}</td></tr>
+          </tbody></table></div>
+        </details>
         <p v-if="quotesLoading" class="ledger-note" role="status">正在更新报价…</p>
         <n-alert v-if="quotesError" type="warning" :show-icon="false" class="quote-alert">报价提示：{{ quotesError }}</n-alert>
         <div v-if="visiblePublications.length" class="ledger-groups">
           <article v-for="round in visiblePublications" :key="round.runId" class="ledger-group">
             <header><div><b>扫描 {{ time(round.asOf) }}</b><span v-if="round.publishedAt">发布 {{ time(round.publishedAt) }}</span><span v-else-if="round.recordedAt">补录 {{ time(round.recordedAt) }}</span></div><n-button size="small" secondary @click="$emit('open-snapshot', round.runId)">查看该轮精选</n-button></header>
-            <p v-if="!round.items.length" class="ledger-note">本轮发布了空名单。</p>
+            <p class="ledger-note"><template v-if="typeof round.official === 'boolean'">{{ round.official ? '定时扫描' : '手动扫描' }} · </template><template v-if="round.scanSlot">{{ round.scanSlot }} · </template>{{ round.strategyName || '历史轮次未记录打法' }} · {{ round.version }}</p>
+            <details v-if="round.ruleSnapshots?.length" class="frozen-rules"><summary>查看本轮规则与通道结果</summary>
+              <p v-for="channel in round.channels" :key="channelKey(channel)">{{ channel.name }} · {{ channel.version }} · {{ channel.reason || ('命中 ' + channel.count + ' 只') }}</p>
+              <details v-for="rule in round.ruleSnapshots" :key="channelKey(rule)"><summary>{{ rule.name }} · {{ rule.version }} 规则原文</summary><pre>{{ JSON.stringify(rule, null, 2) }}</pre></details>
+            </details>
+            <p v-if="!round.items.length" class="ledger-note">{{ channelFilter && !currentRecords ? '本轮该打法没有进入正式推荐名单的股票。' : '本轮发布了空名单。' }}</p>
             <section v-for="stock in round.items" :key="stock.code" class="signal-row">
               <header><div><b>{{ stock.rank === 1 ? '首选' : '第 ' + stock.rank + ' 名' }} · {{ stock.name }}</b><code>{{ stock.code }}</code></div><n-button size="small" secondary @click="$emit('open-chart', stock)">图表</n-button></header>
               <p v-for="reason in stock.reasons" :key="reason">{{ reason }}</p>
+              <details v-for="match in stock.strategyMatches || []" :key="channelKey(match)" class="match-evidence">
+                <summary>{{ match.name }} · 通道第 {{ match.rank }} 名 · 版本 {{ match.version }}</summary>
+                <p v-for="reason in match.reasons" :key="reason">{{ reason }}</p>
+                <dl v-if="match.evidence?.length"><template v-for="(point, index) in match.evidence" :key="index"><dt>{{ point.label }}</dt><dd>{{ formatStrategyEvidence(point.value) }}{{ point.unit }} <small>{{ point.source }} <template v-if="point.sourceTime">· {{ time(point.sourceTime) }}</template></small></dd></template></dl>
+              </details>
               <p v-if="stock.risk">风险：{{ stock.risk }}</p>
               <div class="record-price-comparison" aria-label="推荐价与最新价比较">
                 <div><span>推荐参考价</span><strong>¥{{ ledgerPrice(stock.comparison.baseline) }}</strong><small>{{ stock.basisLabel || '扫描参考价' }} · {{ stock.source }} · {{ time(stock.sourceTime) }}</small></div>
@@ -246,6 +287,7 @@ onBeforeUnmount(() => { disposed = true; requestId++; stopQuoteUpdates(); quoteL
 </template>
 
 <style scoped>
+.strategy-review,.frozen-rules,.match-evidence{margin:10px 0;font-size:12px;line-height:1.7}.strategy-review summary,.frozen-rules summary,.match-evidence summary{cursor:pointer;color:var(--sk-accent)}.frozen-rules pre{white-space:pre-wrap;overflow-wrap:anywhere}.match-evidence dl{margin:7px 0}.strategy-review{border:1px solid var(--sk-border);border-radius:8px;padding:12px 14px}
 .record-price-comparison { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin: 12px 0; padding: 14px; border-radius: 8px; background: var(--sk-surface-2); font-variant-numeric: tabular-nums; }
 .record-price-comparison > div { display: flex; flex-direction: column; gap: 6px; }
 .record-price-comparison span, .record-price-comparison small { color: var(--sk-text-muted); font-size: 12px; }

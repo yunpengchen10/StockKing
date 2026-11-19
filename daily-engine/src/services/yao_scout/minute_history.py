@@ -1065,6 +1065,8 @@ def read_bar_evidence(code, cutoff, cache_dir, *, required_days=None):
         if len(dates) == FORMAL_HISTORY_DAYS:
             feature_rows = _read_feature_windows(cache_dir, code, dates, current_end)
     result = compute_bar_evidence(feature_rows + rows, cutoff, expected_dates=dates)
+    from .strategy_market import archived_path
+    result['strategyMinutePath'] = archived_path(code, rows[-35:], cutoff)
     dependency_days = required_days or result['dependencyDays']
     result.update(code=code, archivePath=str(Path(cache_dir) / 'minute-bars-v2.sqlite3'),
                   dataLineage=read_archive_lineage(cache_dir, code, dependency_days, cutoff=cutoff))

@@ -1098,6 +1098,25 @@ export function StartKingPicksRefresh(arg1) {
   return window['go']['main']['App']['StartKingPicksRefresh'](arg1);
 }
 
+export function StartKingPicksStrategyRefresh(arg1, arg2) {
+  return window['go']['main']['App']['StartKingPicksStrategyRefresh'](arg1, arg2);
+}
+export function GetKingPicksStrategies() {
+  return window['go']['main']['App']['GetKingPicksStrategies']();
+}
+export function ImportKingPicksStrategy(arg1) {
+  return window['go']['main']['App']['ImportKingPicksStrategy'](arg1);
+}
+export function PreviewKingPicksStrategy(arg1, arg2) {
+  return window['go']['main']['App']['PreviewKingPicksStrategy'](arg1, arg2);
+}
+export function EnableKingPicksStrategy(arg1) {
+  return window['go']['main']['App']['EnableKingPicksStrategy'](arg1);
+}
+export function SetKingPicksStrategyEnabled(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['SetKingPicksStrategyEnabled'](arg1, arg2, arg3, arg4);
+}
+
 export function StartQuantBacktest(arg1) {
   return window['go']['main']['App']['StartQuantBacktest'](arg1);
 }

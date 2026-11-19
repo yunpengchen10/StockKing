@@ -115,7 +115,7 @@ def test_refresh_is_async_deduplicated_and_reopen_resumes(runtime, monkeypatch):
     }
     shown = client.get("/picks/display").json()
     assert shown["adaptive"]["candidates"][0]["code"] == "600002"
-    assert calls == [("live", {"top_n": 5, "official": False})]
+    assert calls == [("live", {"top_n": 5, "official": False, 'strategy_id': 'all', 'strategy_rules': []})]
     assert LocalPicksDisplayStore(db).read() == {
         key: value for key, value in shown.items() if key not in ("currentPrimaryReadiness", "currentThemeFeedback")}
 

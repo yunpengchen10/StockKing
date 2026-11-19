@@ -17,6 +17,32 @@ function publication(runId, codes = ['600001'], asOf = '2026-10-08T10:30:00+08:0
 }
 const records = (...scans) => ({ recordsVersion: 'published-picks-v1', items: scans })
 
+test('channel filtering uses frozen hits and keeps both channel ranks, source and the original recommendation price', async () => {
+  const round = publication('channels', ['600001', '600002'])
+  const legacy = publication('legacy', ['600003'])
+  const channels = [{ id: 'trend_space', name: '趋势空间', version: '1', rank: 2 },
+    { id: 'countertrend_leader', name: '逆势领涨', version: '2', rank: 1 }]
+  Object.assign(round, { official: true, strategyName: '全部打法', ruleSnapshots: channels, channels })
+  for (const [i, row] of round.items.entries()) row.strategyMatches = (i ? channels.slice(0, 1) : channels)
+    .map(match => ({ ...match, reasons: ['当时触发'], evidence: [{ label: '分钟成交额', value: 900, unit: '元', source: '归档' }] }))
+  const response = { ...records(round, legacy), strategyOutcomes: { groups: [
+    { ...channels[1], total: 2, observed: 1, up: 1, bigUp: 0, bigDown: 0 }] } }
+  const mount = mountLedger({ GetStockKingRecommendationHistory: async () => structuredClone(response),
+    GetStockKingRecordQuotes: async () => ({ quotes: {} }) })
+  try {
+    await flush()
+    assert.match(mount.text(), /历史轮次未记录打法/)
+    let state = mount.state()
+    state.channelFilter = JSON.stringify(['countertrend_leader', '2'])
+    await flush()
+    assert.deepEqual(state.quoteCodes, ['600001'])
+    assert.equal(state.publications[0].items[0].price, 10)
+    assert.equal(state.payload.items[0].items.length, 2)
+    for (const label of ['定时扫描', '趋势空间 · 通道第 2 名', '逆势领涨 · 通道第 1 名', '分钟成交额', '100.0%', '900元']) assert.ok(mount.text().includes(label), label)
+    assert.doesNotMatch(mount.text(), /已发布600002|已发布600003/)
+  } finally { mount.dispose() }
+})
+
 // Run the real SFC setup and Vue watchers without a browser or the Wails bridge.
 function mountLedger(api, initialMode = 'records', options = {}) {
   const source = readFileSync(new URL('../components/PicksLedger.vue', import.meta.url), 'utf8')

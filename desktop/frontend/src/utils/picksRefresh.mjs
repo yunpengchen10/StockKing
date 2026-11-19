@@ -50,13 +50,16 @@ export function selectDisplayedPicks(local, remote) {
 }
 
 export function createPicksRefreshController({
-  startTask, getTask, getDisplay, storage, onState = () => {}, onResult = () => {},
+  startTask, getTask, getDisplay, getSnapshot, storage, onState = () => {}, onResult = () => {},
   now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout,
   timeoutMs = 30 * 60_000, requestTimeoutMs = 20_000, displayRequestTimeoutMs = 50_000, pollMs = 1000,
 }) {
   let disposed = false, generation = 0, pollTimer = null, clockTimer = null, cancelRequest = null
   let startedAt = 0, waitStartedAt = 0, initialRecoveryProbe = false, retryCount = 0, restartMissingWith = null
-  let state = { loading: false, taskId: '', progress: 0, message: '', elapsedSeconds: 0, error: '' }
+  let activeStrategy = 'all'
+  let activeVersion = ''
+  let activeFingerprint = ''
+  let state = { loading: false, taskId: '', progress: 0, message: '', elapsedSeconds: 0, error: '', notice: '' }
   const emit = patch => { state = { ...state, ...patch }; if (!disposed) onState({ ...state }) }
   const current = token => !disposed && state.loading && generation === token
   function clearWork() {
@@ -95,26 +98,41 @@ export function createPicksRefreshController({
     })
   }
   async function handleTask(task, token) {
+    if (task?.strategyId && task.strategyId !== activeStrategy) throw new Error('扫描任务的策略与本次请求不一致，请重新读取已保存结果。')
+    if (activeVersion && task?.strategyVersion && task.strategyVersion !== activeVersion) throw new Error('扫描任务的策略版本已变化，请重新刷新。')
+    if (activeFingerprint && task?.strategyFingerprint && task.strategyFingerprint !== activeFingerprint) throw new Error('扫描任务的规则配置已变化，请重新刷新。')
     const status = String(task?.status || '')
-    emit({ progress: Math.min(100, Math.max(0, Number(task?.progress) || 0)), message: task?.message || '正在扫描' })
+    emit({ progress: Math.min(100, Math.max(0, Number(task?.progress) || 0)), message: task?.message || '正在扫描', strategyId: activeStrategy, strategyName: task?.strategyName || '', strategyVersion: activeVersion })
     if (['completed', 'succeeded', 'done'].includes(status)) {
+      const superseded = task.publicationStatus === 'superseded'
       let saved = task.result
       const legacyResult = isSavedPicks(saved)
       if (!legacyResult && task.resultPersisted && typeof getDisplay === 'function') {
         emit({ message: '扫描已完成并保存，正在读取结果' })
         saved = await request(getDisplay, displayRequestTimeoutMs)
         if (!current(token)) return true
-        const expectedId = task.displayRunId
+        const expectedId = superseded ? task.displayRunId : task.publishedRunId || task.scanRunId || task.displayRunId
         const receivedId = saved?.displayRunId || saved?.adaptive?.run_id || saved?.adaptive?.runId
         const expectedTime = Date.parse(task.displayGeneratedAt || '') || 0
+        if (expectedId && receivedId !== expectedId && typeof getSnapshot === 'function') {
+          const frozen = await request(() => getSnapshot(expectedId), displayRequestTimeoutMs)
+          if (!current(token)) return true
+          saved = frozen?.adaptive ? frozen : { displayRunId: frozen?.run_id, generatedAt: frozen?.result?.generatedAt || frozen?.as_of, adaptive: frozen?.result }
+          if ((saved?.displayRunId || saved?.adaptive?.run_id) !== expectedId) throw new Error('未取得本次扫描对应的已保存结果。')
+        }
         // A later scheduled scan may already have replaced this manual scan.
         // Otherwise, never label an older saved view as this task's result.
-        if (expectedId && receivedId !== expectedId && !(expectedTime && snapshotTime(saved) > expectedTime)) {
+        if (expectedId && (saved?.displayRunId || saved?.adaptive?.run_id || saved?.adaptive?.runId) !== expectedId && !(expectedTime && snapshotTime(saved) > expectedTime)) {
           throw new Error('扫描结果已保存，但展示版本尚未同步。请点击“读取已保存结果”重试。')
         }
       }
       if (!isSavedPicks(saved)) throw new Error('扫描返回的推荐快照不完整，上次推荐仍保留，请点击“读取已保存结果”重试。')
+      const savedStrategy = saved?.adaptive?.publishedPicks?.strategyId || saved?.strategyId || saved?.adaptive?.strategyId
+      if (!superseded && savedStrategy && savedStrategy !== activeStrategy) throw new Error('保存结果的策略与本次扫描不一致，已保留原结果。')
+      const savedVersion = saved?.adaptive?.publishedPicks?.strategyVersion
+      if (!superseded && savedVersion && activeVersion && savedVersion !== activeVersion) throw new Error('保存结果的策略版本与本次扫描不一致，已保留原结果。')
       if (!current(token)) return true
+      if (superseded) emit({notice:'本次扫描完成时已有更新一轮推荐，本次结果未发布；当前显示较新的已发布推荐。'})
       onResult({ ...saved, displaySnapshotVersion: 1, ...(legacyResult ? { displaySource: 'manual' } : {}) })
       finish('', true)
       return true
@@ -143,10 +161,10 @@ export function createPicksRefreshController({
         // An explicit refresh must still work after the engine was restarted.
         // A confirmed missing task is safe to replace; a network failure is not.
         if (missing && restartMissingWith !== null) {
-          const maxPerBoard = restartMissingWith
+          const { maxPerBoard, strategyId, strategyVersion, strategyFingerprint } = restartMissingWith
           restartMissingWith = null
           finish('', true)
-          await start(maxPerBoard)
+          await start(maxPerBoard, strategyId, strategyVersion, strategyFingerprint)
           return
         }
         const transient = /timeout|timed out|deadline exceeded|超时|network|failed to fetch|connection (?:reset|refused)|ECONN|\b50[234]\b/i.test(detail)
@@ -167,22 +185,32 @@ export function createPicksRefreshController({
     retryCount = 0
     restartMissingWith = null
     const token = ++generation
-    emit({ loading: true, taskId, error: '', progress: 0, message: recovering ? '正在恢复上次扫描进度' : '正在提交本地扫描', elapsedSeconds: Math.max(0, Math.floor((now() - since) / 1000)) })
+    emit({ loading: true, taskId, strategyId: activeStrategy, strategyName: '', strategyVersion: activeVersion, error: '', notice: '', progress: 0, message: recovering ? '正在恢复上次扫描进度' : '正在提交本地扫描', elapsedSeconds: Math.max(0, Math.floor((now() - since) / 1000)) })
     tick(token)
     return token
   }
-  async function start(maxPerBoard) {
+  async function start(maxPerBoard, strategyId = 'all', strategyVersion = '', strategyFingerprint = '') {
     if (disposed || state.loading) return false
+    activeStrategy = strategyId || 'all'
+    activeVersion = strategyVersion || ''
+    activeFingerprint = strategyFingerprint || ''
     // A timed-out status read does not cancel its server task. Reuse its id
     // before considering another POST, including after reopening this page.
-    if (resume(null, { force: true, restartIfMissing: maxPerBoard })) return true
+    const cached = readJSON(storage, REFRESH_TASK_KEY)
+    if ((cached?.strategyId || 'all') === activeStrategy && (!activeVersion || cached?.strategyVersion === activeVersion)
+      && (!activeFingerprint || cached?.strategyFingerprint === activeFingerprint)
+      && resume(null, { force: true, restartIfMissing: { maxPerBoard, strategyId: activeStrategy, strategyVersion: activeVersion, strategyFingerprint: activeFingerprint } })) return true
     const token = begin()
     try {
-      const task = await request(() => startTask(maxPerBoard))
+      const task = await request(() => startTask(maxPerBoard, activeStrategy))
       if (!current(token)) return false
       if (!task?.task_id) throw new Error(task?.error || task?.message || '无法启动扫描任务，请重试。')
+      if (task.strategyId && task.strategyId !== activeStrategy) throw new Error('扫描任务的策略与本次请求不一致，请重新读取已保存结果。')
+      if (activeVersion && task.strategyVersion && task.strategyVersion !== activeVersion) throw new Error('扫描任务的策略版本已变化，请重新刷新。')
+      if (!activeVersion) activeVersion = task.strategyVersion || ''
+      activeFingerprint = task.strategyFingerprint || activeFingerprint
       emit({ taskId: task.task_id })
-      writeJSON(storage, REFRESH_TASK_KEY, { task_id: task.task_id, startedAt })
+      writeJSON(storage, REFRESH_TASK_KEY, { task_id: task.task_id, startedAt, strategyId: activeStrategy, strategyVersion: activeVersion, strategyFingerprint: activeFingerprint })
       if (!await handleTask(task, token)) void poll(token)
       return true
     } catch (error) {
@@ -195,6 +223,9 @@ export function createPicksRefreshController({
     const cached = readJSON(storage, REFRESH_TASK_KEY)
     const task = serverTask?.task_id ? serverTask : cached
     if (!task?.task_id) return false
+    activeStrategy = task.strategyId || 'all'
+    activeVersion = task.strategyVersion || ''
+    activeFingerprint = task.strategyFingerprint || ''
     // Periodic display reads must not restart an exhausted/error wait forever.
     // An explicit refresh click may make one new recovery probe.
     if (!force && state.taskId === task.task_id && state.error) return false
@@ -204,7 +235,7 @@ export function createPicksRefreshController({
     const since = Number.isFinite(parsed) ? parsed : Number.isFinite(cachedStart) ? cachedStart : now()
     const token = begin(task.task_id, Math.min(now(), since), true, force)
     restartMissingWith = restartIfMissing
-    writeJSON(storage, REFRESH_TASK_KEY, { task_id: task.task_id, startedAt })
+    writeJSON(storage, REFRESH_TASK_KEY, { task_id: task.task_id, startedAt, strategyId: activeStrategy, strategyVersion: activeVersion, strategyFingerprint: activeFingerprint })
     void poll(token)
     return true
   }

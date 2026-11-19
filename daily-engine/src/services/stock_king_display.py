@@ -245,7 +245,8 @@ def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
     from src.services.yao_scout.limit_entry import assess_limit_entry
     from src.services.yao_scout.theme_rotation import _at
     published = _at(run.get('generatedAt') or run.get('as_of') or run.get('generated_at'))
-    omitted = {"controls", "windvanes", "morningResearch", "dailyObservationResearch", "dailyObservationQuotes", "themeResearchUniverse"}
+    omitted = {"controls", "windvanes", "morningResearch", "dailyObservationResearch",
+               "dailyObservationQuotes", "themeResearchUniverse", "strategyMarketEvidence"}
     shown = {key: value for key, value in run.items() if key not in omitted}
     screen = _custom_screen(run, published)
     if screen is not None:
@@ -323,6 +324,9 @@ def _display_response(payload: dict[str, Any]) -> dict[str, Any]:
 def publish_picks(root, run, *, screen=None, reason='scan', persist=None, current_only=False):
     from src.services.yao_scout.potential_picks import select_potential_picks
     def make_items():
+        selection = run.get('strategySelection')
+        if isinstance(selection, dict):
+            return deepcopy(selection['items'])
         frozen_screen = screen if screen is not None else _custom_screen(run, _generated_at(run).astimezone(_SHANGHAI_TZ))
         return select_potential_picks(run, frozen_screen)
     return PicksPublications(root).publish(run, make_items, reason=reason, persist=persist, current_only=current_only)
@@ -661,6 +665,17 @@ def displayable_run(run: Any, *, historical: bool = False) -> bool:
         # A valid daily branch cannot publish an unsupported or old opportunity
         # contract as a new result. Historical reads retain the recorded version.
         return False
+    selection = run.get('strategySelection')
+    if isinstance(selection, dict) and isinstance(selection.get('items'), list):
+        publication = run.get('publishedPicks') or {}
+        if (selection.get('sourceRunId') == (run.get('run_id') or run.get('runId'))
+                and selection.get('sourceTime') == (run.get('generatedAt') or run.get('as_of'))
+                and isinstance(selection.get('ruleSnapshots'), list)
+                and len(selection['items']) <= 5
+                and (run.get('dataQuality') or {}).get('snapshot_count', 0) > 0
+                and ((not historical and bool(selection['items'])) or (historical
+                    and publication.get('status') == 'published' and publication.get('items') == selection['items']))):
+            return True
     if run.get('potentialAssessment'):
         from src.services.yao_scout.potential_picks import reference_assessment_valid
         if reference_assessment_valid(run, historical=historical):

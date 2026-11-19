@@ -86,6 +86,21 @@ export function priceObservationPercent(value) {
   return present(value) && Number.isFinite(Number(value)) ? `${Number(value).toFixed(2)}%` : '未取得'
 }
 export function ledgerPrice(value) { return present(value) && Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value).toFixed(2) : '—' }
+
+const evidenceClock = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+const evidenceNumber = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 })
+export function formatStrategyEvidence(value) {
+  if (value == null) return '未取得'
+  if (Array.isArray(value)) {
+    if (value.length && value.every(p => p && Number.isFinite(p.price) && Number.isFinite(Date.parse(p.sourceTime)))) {
+      return value.map(p => evidenceClock.format(new Date(p.sourceTime)) + ' ' + ledgerPrice(p.price)).join(' → ')
+    }
+    return value.map(formatStrategyEvidence).join('、')
+  }
+  if (typeof value === 'number') return evidenceNumber.format(value)
+  if (typeof value === 'object') return Object.entries(value).map(([key, item]) => key + ' = ' + formatStrategyEvidence(item)).join('，')
+  return String(value)
+}
 export function recordQuoteCode(value) {
   const raw = String(value || '').trim().toUpperCase()
   const match = /^(?:(SH|SZ))?([036]\d{5})(?:\.(SH|SZ))?$/.exec(raw)

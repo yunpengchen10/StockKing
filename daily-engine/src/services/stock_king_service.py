@@ -63,6 +63,7 @@ class StockKingService:
         top_n: int = 5,
         official: bool | None = None,
         allow_missed: bool = False,
+        strategy_id: str = 'all',
     ) -> Dict[str, Any]:
         """Return Schema 4 with a fresh adaptive scan and v2.2 classic fields.
 
@@ -82,6 +83,7 @@ class StockKingService:
                 top_n=top_n,
                 official=official,
                 allow_missed=allow_missed,
+                **({'strategy_id': strategy_id} if strategy_id != 'all' else {}),
             )
         except Exception as exc:
             logger.exception("Adaptive King Picks scan unavailable: %s", exc)

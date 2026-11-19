@@ -43,6 +43,21 @@ def allocate_profile_candidates(ordered, profile, limit):
 
 class LocalOpportunityService(DailyOpportunityService):
     persistent_claims = True
+
+    def _run(self, scan_slot='live', *, strategy_id='all', strategy_rules=None, **kwargs):
+        from copy import deepcopy
+        from .strategy_channels import StrategyRuleStore, catalog_rules
+        official = kwargs.get('official')
+        if official is True or (official is None and scan_slot != 'live'):
+            strategy_id = 'all'
+        rules = (StrategyRuleStore(self.yao.data_dir / 'strategy-rules-v1.sqlite3').list()
+                 if strategy_rules is None else deepcopy(strategy_rules))
+        catalog = catalog_rules(rules)
+        if strategy_id != 'all' and not any(row['id'] == strategy_id and row.get('enabled') for row in catalog):
+            raise ValueError('所选打法不存在或尚未启用，请重新选择')
+        self._strategy_context = {'id': strategy_id, 'rules': deepcopy(rules)}
+        return super()._run(scan_slot, **kwargs)
+
     def __init__(self, yao, ai_config=None, *, minute_fetcher=None, sector_fetcher=None, fund_fetcher=None, context_provider=None, theme_fetcher=None, progress_callback=None, selection_mode='auto', opportunity_research=True, **kwargs):
         super().__init__(yao, None, **kwargs)
         self.minute_fetcher = minute_fetcher
@@ -821,6 +836,9 @@ class LocalOpportunityService(DailyOpportunityService):
         # deadline, leaving the final quote reserve untouched.
         shared_evidence_budget = budget_for('parallel_evidence', 40)
         shared_evidence_deadline = monotonic()+shared_evidence_budget
+        paths = {code: packet.pop('strategyMinutePath') for code, packet in intraday.items()
+                 if packet.get('strategyMinutePath')}
+        strategy_market = {'cutoffAt': minute_cutoff.isoformat(), 'stocks': {}, 'benchmark': {}}
         quality['parallelEvidenceCollection'] = {'enabled': True,
             'sharedCutoffAt': minute_cutoff.isoformat(), 'stageTimingsMs': {},
             'sharedDeadlineAt': (self.clock()+timedelta(seconds=shared_evidence_budget)).isoformat(),
@@ -834,11 +852,25 @@ class LocalOpportunityService(DailyOpportunityService):
                                    else min(shared_evidence_deadline, began+timeout))
             finally:
                 quality['parallelEvidenceCollection']['stageTimingsMs'][name] = round((monotonic()-began)*1000)
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix='scan-aligned-evidence') as pool:
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix='scan-aligned-evidence') as pool:
+            market_job = None
+            if (self.opportunity_research and self.minute_fetcher is None and software_market.available
+                    and getattr(self, '_strategy_context', {}).get('id', 'all') != 'trend_space'):
+                from .strategy_market import fetch_strategy_paths
+                market_job = pool.submit(fetch_strategy_paths, codes, run.get('themeBoard') or {}, minute_cutoff,
+                                         paths, min(shared_evidence_deadline, monotonic()+10))
             fund_job = pool.submit(collect_parallel, 'fund_evidence', funds_for, fund_codes,
                                    40 if self.opportunity_research else 20, 8)
             sector_job = pool.submit(collect_parallel, 'sector_evidence', sectors_for, [None], 40, 1)
             sector_packets, fund_packets = sector_job.result(), fund_job.result()
+            if market_job is not None:
+                try:
+                    strategy_market = market_job.result()
+                except (ValueError, TypeError, OSError) as exc:
+                    strategy_market['collectionError'] = type(exc).__name__
+        strategy_market['stocks'].update(paths)
+        if self.opportunity_research:
+            run['strategyMarketEvidence'] = strategy_market
         with sector_lock:
             sectors = dict(sector_partial)
             errors = list(sector_errors)
@@ -904,6 +936,7 @@ class LocalOpportunityService(DailyOpportunityService):
             if code in opportunity_minutes:
                 opportunity_minutes[code]['dataLineage'] = deepcopy(intraday[code]['dataLineage'])
             if intraday[code]['dataLineage'].get('status') == 'tainted':
+                strategy_market['stocks'].pop(code, None)
                 intraday[code].update(metrics={}, v11Inputs={})
                 intraday[code].setdefault('gaps',[]).append('独立报价核验发现分钟价格或计算版本冲突，本轮隔离')
         quality['independentMinuteVerification'] = verification
@@ -1444,11 +1477,26 @@ class LocalOpportunityService(DailyOpportunityService):
                 result['dailyObservationReview'] = {'status': 'failed', 'reason': type(error).__name__}
         from .potential_picks import prepare_reference_assessment
         prepare_reference_assessment(result)
+        context = getattr(self, '_strategy_context', None)
+        if context and result.get('status') in {'expired', 'completed_observations', 'no_candidates_with_coverage_limits'}:
+            from .strategy_channels import build_strategy_publication
+            # Build once from this scan and the rules captured at submission.
+            # Frozen historical publications never run through this path.
+            result['strategySelection'] = build_strategy_publication(
+                result, strategy_id=context['id'], custom_rules=context['rules'], top_n=5)
+            if result['strategySelection']['items'] and not result.get('official') and result.get('scanSlot') == 'live':
+                result.setdefault('legacySelectionStatus', result['status'])
+                result['status'] = 'completed_observations'
         from src.services.stock_king_display import LocalPicksDisplayStore, displayable_run, publish_picks
         if result.get('run_id') and displayable_run(result):
             def freeze_scan(publication):
                 result['publishedPicks'] = publication
                 result['publishedPickCount'] = len(publication['items']) if publication['status'] == 'published' else None
+                if publication.get('strategyId'):
+                    result['strategySelection'] = {key: publication[key] for key in ('version', 'items',
+                        'strategyId', 'strategyName', 'strategyVersion', 'channels', 'ruleSnapshots', 'selectionPolicy')
+                        if key in publication}
+                    result['strategySelection'].update(sourceRunId=publication['runId'], sourceTime=publication['asOf'])
                 self.db.save_yao_run(clean(result))
             publish_picks(self.yao.data_dir, result, persist=freeze_scan)
             if (result.get('publishedPicks') or {}).get('status') == 'published':

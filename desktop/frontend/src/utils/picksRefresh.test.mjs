@@ -401,3 +401,76 @@ test('receipt display migration can exceed the short task-control deadline and s
   assert.equal(controller.getState().error, '')
   assert.equal(clock.pending, 0)
 })
+
+test('choosing another strategy or version never resumes a cached task from the previous selection', async () => {
+  for (const previous of [{strategyId:'theme_lead',strategyVersion:'1'}, {strategyId:'custom.mine',strategyVersion:'1'}]) {
+    const storage = memoryStorage(), clock = fakeClock(), results = []
+    storage.setItem(REFRESH_TASK_KEY, JSON.stringify({task_id:'old-task',startedAt:0,...previous}))
+    const fresh = {...snapshot(),adaptive:{...snapshot().adaptive,publishedPicks:{strategyId:'custom.mine',strategyVersion:'2'}}}
+    const controller = createPicksRefreshController({...clock,storage,
+      startTask:async (max,strategy) => { assert.equal(max,5); assert.equal(strategy,'custom.mine'); return {task_id:'new-task',status:'pending',strategyId:strategy,strategyVersion:'2'} },
+      getTask:async id => { assert.equal(id,'new-task'); return {status:'completed',strategyId:'custom.mine',strategyVersion:'2',result:fresh} },
+      onResult:value=>results.push(value),
+    })
+    await controller.start(5,'custom.mine','2'); await flush()
+    assert.equal(results.length,1)
+    assert.equal(controller.getState().loading,false)
+    assert.equal(clock.pending,0)
+  }
+})
+
+test('a completed strategy task reads its frozen run if a different newer publication is current', async () => {
+  const storage=memoryStorage(),clock=fakeClock(),results=[]
+  const frozen={...snapshot(),displayRunId:'theme-run',adaptive:{...snapshot().adaptive,run_id:'theme-run',publishedPicks:{strategyId:'theme_lead',strategyVersion:'1'}}}
+  const current={...snapshot([], '2026-11-19T10:30:00+08:00'),displayRunId:'all-run',adaptive:{...snapshot().adaptive,publishedPicks:{strategyId:'all'}}}
+  const controller=createPicksRefreshController({...clock,storage,
+    startTask:async()=>({task_id:'job',status:'pending',strategyId:'theme_lead',strategyVersion:'1'}),
+    getTask:async()=>({status:'completed',strategyId:'theme_lead',strategyVersion:'1',resultPersisted:true,displayRunId:'theme-run'}),
+    getDisplay:async()=>current,
+    getSnapshot:async id=>{assert.equal(id,'theme-run');return {run_id:id,result:frozen.adaptive}},
+    onResult:value=>results.push(value),
+  })
+  await controller.start(5,'theme_lead','1'); await clock.advance(0)
+  assert.equal(results[0].displayRunId,'theme-run')
+  assert.equal(results[0].adaptive.publishedPicks.strategyId,'theme_lead')
+  assert.equal(clock.pending,0)
+})
+
+test('wrong-strategy receipts never replace the displayed recommendation', async () => {
+  const clock=fakeClock(),storage=memoryStorage()
+  const controller=createPicksRefreshController({...clock,storage,
+    startTask:async()=>({task_id:'wrong',status:'processing',strategyId:'all'}),
+    getTask:async()=>assert.fail('wrong strategy must not be polled'),
+    onResult:()=>assert.fail('wrong strategy must not be displayed'),
+  })
+  await controller.start(5,'theme_lead','1'); await flush()
+  assert.equal(controller.getState().loading,false)
+  assert.match(controller.getState().error,/策略.*不一致/)
+})
+
+test('an explicitly superseded scan shows the newer publication with a notice and never its unpublished rows', async () => {
+  const storage=memoryStorage(),clock=fakeClock(),results=[]
+  const newer={...snapshot(),displayRunId:'new-all',adaptive:{...snapshot().adaptive,publishedPicks:{strategyId:'all',strategyVersion:'new'}}}
+  const controller=createPicksRefreshController({...clock,storage,
+    startTask:async()=>({task_id:'slow',status:'pending',strategyId:'theme_lead'}),
+    getTask:async()=>({status:'completed',strategyId:'theme_lead',resultPersisted:true,publicationStatus:'superseded',scanRunId:'unpublished',displayRunId:'new-all'}),
+    getDisplay:async()=>newer,getSnapshot:async()=>assert.fail('unpublished run must not become a recommendation'),
+    onResult:value=>results.push(value),
+  })
+  await controller.start(5,'theme_lead');await clock.advance(0)
+  assert.equal(results[0].displayRunId,'new-all')
+  assert.match(controller.getState().notice,/本次结果未发布/)
+  assert.equal(controller.getState().loading,false)
+})
+
+test('enabling another custom rule invalidates a cached all-strategies configuration even when its version is unchanged', async () => {
+  const storage=memoryStorage(),clock=fakeClock()
+  storage.setItem(REFRESH_TASK_KEY,JSON.stringify({task_id:'old-all',strategyId:'all',strategyVersion:'v1',strategyFingerprint:'before-import',startedAt:0}))
+  let starts=0
+  const controller=createPicksRefreshController({...clock,storage,
+    startTask:async()=>{starts++;return{task_id:'new-all',strategyId:'all',strategyVersion:'v1',strategyFingerprint:'after-import',status:'pending'}},
+    getTask:async id=>{assert.equal(id,'new-all');return{status:'completed',strategyId:'all',strategyVersion:'v1',strategyFingerprint:'after-import',result:snapshot()}},
+  })
+  await controller.start(5,'all','v1','after-import');await flush()
+  assert.equal(starts,1);assert.equal(controller.getState().loading,false);assert.equal(clock.pending,0)
+})

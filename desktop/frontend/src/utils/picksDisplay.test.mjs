@@ -27,6 +27,85 @@ const snapshot = (generatedAt, source = 'scheduled') => ({
 const oldSnapshot = () => snapshot('2026-07-13T10:30:00+08:00', 'manual')
 const latestSnapshot = () => snapshot('2026-10-13T10:30:00+08:00')
 
+test('a task already published before a newer global round remains its own visible snapshot with return to current', async () => {
+  const newer=snapshot('2026-11-19T11:00:00+08:00'), older=snapshot('2026-11-19T10:59:00+08:00')
+  publish(newer,'new-all',[publishedRow(1,'600002','较新全局结果',newer.generatedAt)])
+  publish(older,'selected-theme',[publishedRow(1,'600001','刚完成指定打法',older.generatedAt)])
+  Object.assign(newer,{displayRunId:'new-all'});Object.assign(newer.adaptive.publishedPicks,{strategyId:'all'})
+  Object.assign(older,{displayRunId:'selected-theme'});Object.assign(older.adaptive.publishedPicks,{strategyId:'theme_lead',strategyVersion:'1'})
+  const mounted=mountPicks({GetDisplayedKingPicks:async()=>newer,
+    StartKingPicksStrategyRefresh:async()=>({task_id:'theme',status:'pending',strategyId:'theme_lead',strategyVersion:'1'}),
+    GetKingPicksRefreshTask:async()=>({status:'completed',strategyId:'theme_lead',strategyVersion:'1',resultPersisted:true,publishedRunId:'selected-theme',displayRunId:'new-all'}),
+    GetKingPicksSnapshot:async id=>{assert.equal(id,'selected-theme');return{run_id:id,result:older.adaptive}},
+  })
+  try{
+    await flush();const state=mounted.state();state.selectedStrategy='theme_lead'
+    await state.refresh();await flush()
+    assert.equal(state.viewingHistory,true);assert.equal(state.publication.runId,'selected-theme')
+    assert.equal(state.displayedResult.displayRunId,'new-all')
+    assert.match(mounted.visibleText(),/正在浏览历史快照.*刚完成指定打法/s)
+    state.returnToDisplayed();await flush()
+    assert.equal(state.viewingHistory,false);assert.equal(state.publication.runId,'new-all')
+  }finally{mounted.dispose()}
+})
+
+test('strategy choice applies to the next scan while current published labels and empty channels stay truthful', async () => {
+  const saved=snapshot('2026-11-19T10:30:00+08:00')
+  const row=publishedRow(1,'600001','双打法样本',saved.generatedAt)
+  row.strategyMatches=[{id:'trend_space',name:'趋势空间',version:'1',rank:1,reasons:['趋势理由'],evidence:[{label:'均线',value:20,unit:'元',source:'fixture',sourceTime:saved.generatedAt}]},
+    {id:'theme_lead',name:'题材领涨',version:'1',rank:2,reasons:['题材理由'],evidence:[]}]
+  publish(saved,'strategy-old',[row]); Object.assign(saved.adaptive.publishedPicks,{strategyId:'all',strategyName:'全部打法',strategyVersion:'1',channels:[
+    {id:'trend_space',name:'趋势空间',version:'1',count:1},{id:'countertrend_leader',name:'逆势领涨',version:'1',count:0,reason:'市场环境未满足'}]})
+  const fresh=structuredClone(saved);fresh.generatedAt='2026-11-19T11:00:00+08:00';fresh.adaptive.generatedAt=fresh.generatedAt;fresh.adaptive.run_id='strategy-new';fresh.displayRunId='strategy-new'
+  Object.assign(fresh.adaptive.publishedPicks,{runId:'strategy-new',strategyId:'theme_lead',strategyName:'题材领涨'})
+  const starts=[]
+  const mounted=mountPicks({GetDisplayedKingPicks:async()=>saved,GetKingPicksStrategies:async()=>({items:[{id:'theme_lead',name:'题材领涨',version:'1',enabled:true,builtin:true}]}),
+    StartKingPicksStrategyRefresh:async(max,id)=>{starts.push([max,id]);return {task_id:'strategy-job',status:'pending',strategyId:id,strategyVersion:'1'}},
+    GetKingPicksRefreshTask:async()=>({status:'completed',strategyId:'theme_lead',strategyVersion:'1',result:fresh}),
+  })
+  try {
+    await flush(); const state=mounted.state()
+    assert.equal(state.selectedStrategy,'all')
+    assert.match(mounted.visibleText(),/趋势空间.*题材理由|趋势理由/s)
+    assert.match(mounted.visibleText(),/逆势领涨.*0 只.*市场环境未满足/s)
+    assert.equal(state.rankedPicks.length,1)
+    state.selectedStrategy='theme_lead'; await flush()
+    assert.equal(state.publication.strategyId,'all')
+    assert.match(mounted.visibleText(),/本轮打法：全部打法/)
+    await state.refresh();await flush()
+    assert.deepEqual(starts,[[5,'theme_lead']])
+    assert.equal(state.publication.strategyId,'theme_lead')
+    assert.equal(state.loading,false)
+    assert.match(mounted.visibleText(),/本轮打法：题材领涨/)
+  }finally{mounted.dispose()}
+})
+
+test('imported algorithms require saved-data preview and explicit enabling without changing recommendations', async () => {
+  const saved=snapshot('2026-11-19T10:30:00+08:00');publish(saved,'unchanged',[publishedRow(1,'600002','已发布股票',saved.generatedAt)])
+  const rule={id:'custom.mine',name:'我的打法',version:'1',ruleFingerprint:'definition-1',enabled:false,builtin:false},calls=[]
+  const mounted=mountPicks({GetDisplayedKingPicks:async()=>saved,GetKingPicksStrategies:async()=>({items:[rule],availableFields:['rewardRisk']}),
+    ImportKingPicksStrategy:async definition=>{calls.push('import');assert.equal(definition.id,rule.id);return{strategy:rule}},
+    PreviewKingPicksStrategy:async(id,run)=>{calls.push('preview');assert.equal(id,rule.id);assert.equal(run,'unchanged');return{status:'previewed',strategyId:id,sourceRunId:run,previewReceipt:{ruleVersion:'1',fingerprint:'definition-1'},items:[{code:'600099',name:'试跑样本',reasons:['试跑理由']}]}},
+    SetKingPicksStrategyEnabled:async(id,enabled,version,fingerprint)=>{calls.push(enabled?'enable':'disable');assert.equal(id,rule.id);assert.equal(version,'1');assert.equal(fingerprint,'definition-1');rule.enabled=enabled;return{strategy:{...rule}}},
+  })
+  try{
+    await flush();const state=mounted.state();state.openCustomScreen()
+    state.ruleDraft='{bad';await flush();await state.importRule();assert.ok(state.ruleError);assert.deepEqual(calls,[])
+    state.ruleDraft=JSON.stringify({id:rule.id,name:rule.name,version:'1',baseStrategy:'trend_space',conditions:[]});await flush()
+    await state.importRule();await flush();assert.deepEqual(calls,['import']);assert.equal(state.importedRule.enabled,false)
+    await state.enableRule();assert.deepEqual(calls,['import'])
+    await state.previewRule();await flush();assert.deepEqual(calls,['import','preview'])
+    assert.match(mounted.visibleText(),/试跑结果.*试跑样本.*试跑理由.*确认启用此算法/s)
+    assert.equal(state.publication.runId,'unchanged');assert.deepEqual(state.rankedPicks.map(r=>r.code),['600002'])
+    await state.enableRule();await flush();assert.deepEqual(calls,['import','preview','enable'])
+    assert.equal(state.importedRule.enabled,true);assert.equal(state.selectedStrategy,'all')
+    assert.equal(state.publication.runId,'unchanged')
+    state.selectedStrategy=rule.id;await state.disableRule(rule);await flush()
+    assert.equal(state.importedRule.enabled,false);assert.equal(state.selectedStrategy,'all')
+    assert.deepEqual(calls,['import','preview','enable','disable']);assert.equal(state.publication.runId,'unchanged')
+  }finally{mounted.dispose()}
+})
+
 const publishedRow = (rank, code, name, sourceTime, price = 10.3) => ({
   rank, code, name, price, sourceTime, source: 'sina', basisLabel: '盘中量价',
   reasons: [`${name}的价格在成交均价之上，短期均线向上`], risk: `${name}跌破本轮支撑则重新评估`,

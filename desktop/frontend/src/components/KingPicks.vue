@@ -11,11 +11,12 @@ import { entryExecutionSummary, primaryReadinessSummary } from '../utils/recomme
 import { explainPick, PICK_BRANCHES, isEvidenceRuleVersion } from '../utils/pickExplain.mjs'
 import { createPicksRefreshController, readDisplayedPicks, saveDisplayedPicks, selectDisplayedPicks } from '../utils/picksRefresh.mjs'
 import { withRecordReadTimeout } from '../utils/recordRead.mjs'
-import { nextDayQueueLabel, nextDayTouchLabel, savedRecommendationSummary, primaryRecommendationPicks, primaryRecommendationState, primaryAdmissionReasons, marketBreadthSummary, firstRecommendationEvidence, isDailyPrimaryRun, dailyObservationPicks } from '../utils/pickLedger.mjs'
+import { nextDayQueueLabel, nextDayTouchLabel, savedRecommendationSummary, primaryRecommendationPicks, primaryRecommendationState, primaryAdmissionReasons, marketBreadthSummary, firstRecommendationEvidence, isDailyPrimaryRun, dailyObservationPicks, formatStrategyEvidence } from '../utils/pickLedger.mjs'
 import { premarketDisplayState, premarketText, premarketQuoteState, premarketPlanLabel } from '../utils/premarket.mjs'
 import { opportunityDisplay, opportunityRecommendations } from '../utils/opportunityDisplay.mjs'
 import { themeBoardDisplay, themeFeedbackDisplay, marketBriefDisplay, themePercent } from '../utils/themeDisplay.mjs'
 import { runCustomStockScreen } from '../utils/customStockScreen.mjs'
+import { StartKingPicksStrategyRefresh, GetKingPicksStrategies, ImportKingPicksStrategy, PreviewKingPicksStrategy, SetKingPicksStrategyEnabled } from '../../wailsjs/go/main/App'
 
 const router = useRouter()
 const message = useMessage()
@@ -24,12 +25,96 @@ const loading = ref(false), refreshError = ref(''), viewingHistory = ref(false),
 const restoring = ref(true), restoreError = ref('')
 const displayRecovery = ref(null)
 const refreshProgress = ref(0), refreshStage = ref(''), refreshElapsed = ref(0)
+const refreshNotice = ref('')
+const runningStrategy = ref('')
 const isV11 = computed(() => isEvidenceRuleVersion(adaptive.value.scoreVersion || adaptive.value.modelVersion) || adaptivePicks.value.some(pick => isV11Pick(pick)))
 const explanation = computed(() => explainPick(selectedPick.value || {}))
 const selectedEvidenceSummary = computed(() => selectedPick.value?.displayEvidenceMode === 'summary')
 function showWhy(pick, insufficient = false) { selectedPick.value = pick; selectedIsInsufficient.value = insufficient; explanationVisible.value = true }
 const engine = ref({ state: 'starting', ready: false })
 const maxPerBoard = ref(5)
+const selectedStrategy = ref('all'), strategies = ref([]), strategyCatalogError = ref(''), availableRuleFields = ref([])
+const strategyFingerprints = ref({})
+const ruleDraft = ref(''), ruleBusy = ref(''), ruleError = ref(''), importedRule = ref(null), rulePreview = ref(null)
+const enabledStrategies = computed(() => strategies.value.filter(item => item.enabled && item.id !== 'all'))
+const customStrategies = computed(() => strategies.value.filter(item => !item.builtin && item.id !== 'all'))
+const selectedStrategyVersion = computed(() => strategies.value.find(item => item.id === selectedStrategy.value)?.version || '')
+const selectedStrategyFingerprint = computed(() => strategyFingerprints.value[selectedStrategy.value] || strategies.value.find(item => item.id === selectedStrategy.value)?.strategyFingerprint || '')
+const ruleExample = JSON.stringify({id:'custom.trend_example',name:'我的趋势策略',version:'1',baseStrategy:'trend_space',conditions:[{field:'rewardRisk',op:'gte',value:1.5}],exclusions:[],rankBy:{field:'rewardRisk',direction:'desc'}}, null, 2)
+watch(ruleDraft, () => { importedRule.value = null; rulePreview.value = null; ruleError.value = '' })
+async function loadStrategies() {
+  if (typeof GetKingPicksStrategies !== 'function') return true
+  try {
+    const catalog = await withRecordReadTimeout(GetKingPicksStrategies(), 20000)
+    if (disposed) return false
+    strategies.value = Array.isArray(catalog.items) ? catalog.items : []
+    strategyFingerprints.value = {...(catalog.strategyFingerprints || {}), ...(catalog.defaultStrategyFingerprint ? {all:catalog.defaultStrategyFingerprint} : {})}
+    if (!loading.value && selectedStrategy.value !== 'all' && !strategies.value.some(item => item.id === selectedStrategy.value && item.enabled)) selectedStrategy.value = 'all'
+    availableRuleFields.value = Array.isArray(catalog.availableFields) ? catalog.availableFields : Object.entries(catalog.availableFields || {}).map(([field,name]) => ({field,name}))
+    strategyCatalogError.value = ''
+    return true
+  } catch (error) { if (!disposed) strategyCatalogError.value = error?.message || String(error); return false }
+}
+async function readRuleFile(event) {
+  const file = event.target?.files?.[0]
+  if (!file || ruleBusy.value) return
+  try {
+    if (file.size > 65536) throw new Error('算法 JSON 文件不能超过 64 KB。')
+    ruleDraft.value = await file.text()
+  } catch (error) { ruleError.value = error?.message || String(error) }
+  finally { if (event.target) event.target.value = '' }
+}
+async function importRule() {
+  if (ruleBusy.value) return
+  ruleBusy.value = 'import'; ruleError.value = ''; importedRule.value = null; rulePreview.value = null
+  try {
+    const definition = JSON.parse(ruleDraft.value)
+    if (!definition || typeof definition !== 'object' || Array.isArray(definition)) throw new Error('请输入一个算法 JSON 对象。')
+    const response = await ImportKingPicksStrategy(definition)
+    if (disposed) return
+    importedRule.value = response.strategy
+    await loadStrategies()
+  } catch (error) { if (!disposed) ruleError.value = error?.message || String(error) }
+  finally { ruleBusy.value = '' }
+}
+function chooseImportedRule(rule) { importedRule.value = rule; rulePreview.value = null; ruleError.value = '' }
+async function previewRule() {
+  if (!importedRule.value || ruleBusy.value) return
+  const runId = publication.value?.runId
+  if (!runId) { ruleError.value = '请先读取一轮已保存推荐，作为试跑的数据来源。'; return }
+  ruleBusy.value = 'preview'; ruleError.value = ''; rulePreview.value = null
+  try {
+    const preview = await withRecordReadTimeout(PreviewKingPicksStrategy(importedRule.value.id, runId), 50000)
+    if (!disposed) rulePreview.value = preview
+  } catch (error) { if (!disposed) ruleError.value = error?.message || String(error) }
+  finally { ruleBusy.value = '' }
+}
+async function enableRule() {
+  if (ruleBusy.value || rulePreview.value?.status !== 'previewed' || !importedRule.value) return
+  ruleBusy.value = 'enable'; ruleError.value = ''
+  try {
+    const receipt = rulePreview.value.previewReceipt || {}
+    const response = await SetKingPicksStrategyEnabled(importedRule.value.id, true, receipt.ruleVersion || importedRule.value.version, receipt.ruleFingerprint || receipt.fingerprint || '')
+    if (disposed) return
+    importedRule.value = response.strategy
+    rulePreview.value = null
+    await loadStrategies()
+    message.success('算法已启用，可在下次刷新时选择；定时扫描将纳入该算法。')
+  } catch (error) { if (!disposed) ruleError.value = error?.message || String(error) }
+  finally { ruleBusy.value = '' }
+}
+async function disableRule(rule) {
+  if (ruleBusy.value || loading.value || rule.builtin || !rule.enabled) return
+  ruleBusy.value = 'disable'; ruleError.value = ''
+  try {
+    const response = await SetKingPicksStrategyEnabled(rule.id, false, rule.version, rule.ruleFingerprint || '')
+    if (disposed) return
+    if (importedRule.value?.id === rule.id) { importedRule.value = response.strategy; rulePreview.value = null }
+    await loadStrategies()
+    message.success('算法已停用，后续扫描不再使用；历史推荐保持原样。')
+  } catch (error) { if (!disposed) ruleError.value = error?.message || String(error) }
+  finally { ruleBusy.value = '' }
+}
 const result = ref({ tiers: {}, kechuang: [], nonKeChuang: [], generatedAt: '', diagnostics: {} })
 const displayedResult = ref(null)
 const classicResult = ref({ tiers: {}, kechuang: [], nonKeChuang: [], generatedAt: '', diagnostics: {} })
@@ -62,9 +147,10 @@ const pageResult = computed(() => viewMode.value === 'classic' ? classicResult.v
 let snapshotStorage = null
 try { snapshotStorage = window.localStorage } catch (_) { /* Server persistence remains available. */ }
 const refreshController = createPicksRefreshController({
-  startTask: StartKingPicksRefresh,
+  startTask: (max, strategyId) => typeof StartKingPicksStrategyRefresh === 'function' ? StartKingPicksStrategyRefresh(max, strategyId) : StartKingPicksRefresh(max),
   getTask: GetKingPicksRefreshTask,
   getDisplay: GetDisplayedKingPicks,
+  getSnapshot: GetKingPicksSnapshot,
   storage: snapshotStorage,
   onState(state) {
     loading.value = state.loading
@@ -72,16 +158,21 @@ const refreshController = createPicksRefreshController({
     refreshStage.value = state.message
     refreshElapsed.value = state.elapsedSeconds
     refreshError.value = state.error
+    refreshNotice.value = state.notice || ''
+    runningStrategy.value = state.strategyName || strategies.value.find(item => item.id === state.strategyId)?.name || (state.strategyId === 'all' ? '全部打法' : state.strategyId || '')
   },
   onResult(fresh) {
     displayRecovery.value = fresh?.displayRecovery || null
     displayRevision++
     const saved = selectDisplayedPicks(displayedResult.value, fresh)
     displayedResult.value = saved
-    result.value = saved
+    const freshId = fresh.displayRunId || fresh.adaptive?.run_id || fresh.adaptive?.runId
+    const savedId = saved?.displayRunId || saved?.adaptive?.run_id || saved?.adaptive?.runId
+    const completedEarlierRun = Boolean(freshId && savedId && freshId !== savedId)
+    result.value = completedEarlierRun ? fresh : saved
     restoring.value = false
     restoreError.value = ''
-    viewingHistory.value = false
+    viewingHistory.value = completedEarlierRun
     saveDisplayedPicks(snapshotStorage, saved)
     if (fresh.recommendationSyncError) message.warning(`精选已生成，但推荐记录同步失败：${fresh.recommendationSyncError}`)
   },
@@ -120,8 +211,14 @@ const publication = computed(() => {
   return saved?.status === 'published' && saved.runId && saved.runId === recordsRunId.value && Array.isArray(saved.items) ? saved : null
 })
 const rankedPicks = computed(() => publication.value?.items || [])
+const displayedChannels = computed(() => (publication.value?.channels || []).map(channel => ({
+  ...channel,
+  publishedCount: rankedPicks.value.filter(stock => stock.strategyMatches?.some(match =>
+    match.id === channel.id && match.version === channel.version)).length,
+})))
 const screenVisible = ref(false), screenDraft = ref(''), screenQuery = ref(''), screenPage = ref(0)
 function openCustomScreen() {
+  void loadStrategies()
   try { screenQuery.value = snapshotStorage?.getItem('stock-king.custom-screen.v1') || '' } catch (_) { /* Storage is optional. */ }
   screenDraft.value = screenQuery.value
   screenPage.value = 0
@@ -402,7 +499,14 @@ async function refresh() {
   if (viewMode.value !== 'classic') {
     displayRevision++
     restoring.value = false
-    await refreshController.start(maxPerBoard.value)
+    if (typeof GetKingPicksStrategies === 'function') {
+      loading.value = true; refreshError.value = ''; refreshStage.value = '正在核对所选策略配置'; refreshProgress.value = 0
+      const ready = await loadStrategies()
+      if (disposed) return
+      loading.value = false
+      if (!ready) { refreshError.value = strategyCatalogError.value || '未能读取策略配置，请重试。'; return }
+    }
+    await refreshController.start(maxPerBoard.value, selectedStrategy.value, selectedStrategyVersion.value, selectedStrategyFingerprint.value)
     return
   }
   loading.value = true; refreshError.value = ''
@@ -642,6 +746,7 @@ async function toggleRecommendations(value) {
 
 onBeforeMount(async () => {
   readSnapshot()
+  void loadStrategies()
   const preferences = Promise.allSettled([
     GetStockKingBackgroundLearning().then(value => { if (!disposed) backgroundEnabled.value = value }),
     GetStockKingAutoRecommendations().then(value => { if (!disposed) recommendationsEnabled.value = value }),
@@ -692,11 +797,14 @@ onDeactivated(() => {
       <n-button v-if="viewMode === 'adaptive'" secondary @click="openRecommendationRecords">本轮记录</n-button>
       <n-button v-if="viewMode === 'adaptive' && !viewingHistory" secondary @click="reviewFilter=null; viewMode='reviews'">核验结果</n-button>
       <n-button v-if="viewMode !== 'adaptive'" secondary @click="showCurrentPicks">返回精选</n-button>
+      <label v-if="viewMode !== 'classic'" class="strategy-picker">下次刷新策略<select v-model="selectedStrategy" :disabled="loading || !!ruleBusy" aria-label="下次刷新策略"><option value="all">全部打法 · 合计最多五只</option><option v-for="strategy in enabledStrategies" :key="strategy.id" :value="strategy.id">{{ strategy.name }} · v{{ strategy.version }}</option></select></label>
       <n-button type="primary" :loading="loading" title="重新获取行情并在本地计算，成功保存后显示" @click="refresh">刷新扫描</n-button>
     </header>
+    <n-alert v-if="strategyCatalogError" type="warning" :show-icon="false">策略列表读取失败：{{ strategyCatalogError }}<n-button text size="small" @click="loadStrategies">重试</n-button></n-alert>
     <n-alert v-if="refreshError" type="warning" :show-icon="false" class="sync-alert">更新未完成：{{ refreshError }}</n-alert>
+    <n-alert v-if="refreshNotice" type="info" :show-icon="false" class="sync-alert">{{ refreshNotice }}</n-alert>
     <n-alert v-if="viewingHistory || (!engine.ready && !loading)" type="warning" :show-icon="false" class="sync-alert"><span>{{ viewingHistory ? '正在浏览历史快照' : (engine.message || '引擎正在启动，已保存推荐可以继续查看。') }}</span><n-button v-if="viewingHistory" size="tiny" text @click="returnToDisplayed">返回当前</n-button></n-alert>
-    <div v-if="loading" class="refresh-progress" role="status" aria-live="polite"><div><b>{{ refreshStage || '正在扫描' }}</b><span>已用 {{ refreshElapsed }} 秒 · {{ refreshProgress }}%</span></div><n-progress type="line" :percentage="refreshProgress" :show-indicator="false" /><small>完成并保存后更新列表；切换页面后可继续查看进度。</small></div>
+    <div v-if="loading" class="refresh-progress" role="status" aria-live="polite"><div><b><template v-if="runningStrategy">{{ runningStrategy }} · </template>{{ refreshStage || '正在扫描' }}</b><span>已用 {{ refreshElapsed }} 秒 · {{ refreshProgress }}%</span></div><n-progress type="line" :percentage="refreshProgress" :show-indicator="false" /><small>完成并保存后更新列表；切换页面后可继续查看进度。</small></div>
     <n-alert v-if="restoreError" type="warning" :show-icon="false" class="sync-alert">最新推荐读取失败：{{ restoreError }}<br/>{{ displayedResult ? '当前显示上次保存的推荐，尚未确认是否最新。' : '暂未取得推荐。' }}<n-button size="tiny" text @click="restoring=true; restoreDisplayed()">重试读取</n-button></n-alert>
     <n-alert v-if="displayRecovery?.status === 'recovering_history' && !viewingHistory" type="info" :show-icon="false" class="sync-alert">{{ displayRecovery.message }} 尚未确认是否为最新结果；还有 {{ displayRecovery.remainingHeaders }} 条历史记录待核对。</n-alert>
     <div v-if="!restoring || viewingHistory" class="picks-meta"><span>{{ pageResult.asOfDate || pageResult.as_of_date || pageResult.generatedAt?.slice(0, 10) || '待生成' }}</span><details class="sk-help-details"><summary>扫描信息</summary><p>生成 {{ pageResult.generatedAt || pageResult.generated_at || '—' }} · 版本 {{ viewMode === 'adaptive' && isDailyPrimary ? dailyAssessment.version || '日线条件规则' : pageResult.methodologyVersion || '兼容旧榜' }}</p><p>后台学习 {{ backgroundEnabled ? '开启' : '暂停' }} · {{ backgroundStatus.status || '未运行' }} {{ backgroundStatus.updatedAt }}</p><p>每轮扫描保留当时证据，可在历史中回看。</p></details></div>
@@ -717,10 +825,12 @@ onDeactivated(() => {
     <section v-if="['adaptive','archive'].includes(viewMode) && restoring && !viewingHistory" class="picks-loading" role="status" aria-live="polite"><n-spin size="small" /><span>正在读取最新已完成的推荐…</span></section>
     <section v-if="viewMode === 'adaptive' && (!restoring || viewingHistory)" class="focus-stocks shortlist" aria-label="上涨潜力精选">
       <div class="theme-section-heading"><div><h3>上涨潜力精选</h3>
-        <p v-if="publication">本轮 {{ rankedPicks.length }} 只 · 扫描于 {{ formatTime(publication.asOf) }}<template v-if="publication.publishedAt"> · 发布于 {{ formatTime(publication.publishedAt) }}</template><template v-else-if="publication.recordedAt"> · 补录于 {{ formatTime(publication.recordedAt) }}</template></p></div></div>
+        <p v-if="publication">本轮 {{ rankedPicks.length }} 只 · 扫描于 {{ formatTime(publication.asOf) }}<template v-if="publication.publishedAt"> · 发布于 {{ formatTime(publication.publishedAt) }}</template><template v-else-if="publication.recordedAt"> · 补录于 {{ formatTime(publication.recordedAt) }}</template></p><p v-if="publication?.strategyName">本轮打法：{{ publication.strategyName }} · v{{ publication.strategyVersion }}</p></div></div>
+      <div v-if="displayedChannels.length" class="strategy-channels" aria-label="本轮各打法结果"><article v-for="channel in displayedChannels" :key="channel.id"><b>{{ channel.name }} · v{{ channel.version }}</b><span>已推荐 {{ channel.publishedCount }} 只</span><small v-if="channel.count > channel.publishedCount">本轮规则共命中 {{ channel.count }} 只</small><p v-if="channel.reason">{{ channel.reason }}</p><p v-else-if="!channel.count">本轮没有符合该打法的股票。</p></article></div>
       <div v-if="rankedPicks.length" class="focus-list">
         <article v-for="stock in rankedPicks" :key="stock.code" class="focus-stock">
           <div class="focus-stock-heading"><div><span class="pick-rank">{{ stock.rank === 1 ? '首选' : '第 ' + stock.rank + ' 名' }}</span><strong>{{ stock.name }}</strong><code>{{ stock.code }}</code></div><n-button size="small" secondary @click="openKline(stock)">查看走势</n-button></div>
+          <div v-if="stock.strategyMatches?.length" class="stock-strategies"><section v-for="match in stock.strategyMatches" :key="match.id"><b>{{ match.name }} · v{{ match.version }}<template v-if="match.rank"> · 该打法第 {{ match.rank }} 名</template></b><p v-for="reason in match.reasons" :key="reason">{{ reason }}</p><p v-for="(evidence, index) in match.evidence" :key="index" class="theme-source">{{ evidence.label }}：{{ formatStrategyEvidence(evidence.value) }}{{ evidence.unit || '' }} · {{ evidence.source || '来源未记录' }}<template v-if="evidence.sourceTime"> · {{ formatTime(evidence.sourceTime) }}</template></p></section></div>
           <p v-for="reason in stock.reasons" :key="reason">{{ reason }}</p>
           <p v-if="stock.risk">风险：{{ stock.risk }}</p>
           <p class="theme-source">{{ stock.basisLabel || '扫描参考价' }} ¥{{ observationPrice(stock.price) }} · {{ quoteSourceLabel(stock.source) }} · {{ formatTime(stock.sourceTime) }}</p>
@@ -730,6 +840,18 @@ onDeactivated(() => {
     </section>
 
     <n-modal v-model:show="screenVisible" preset="card" title="自定义选股" style="width:min(580px, 94vw)" :mask-closable="true">
+      <section class="strategy-import" aria-label="导入自定义算法">
+        <h3>导入自定义算法</h3><p>导入 JSON 规则，先用已保存行情试跑，再确认启用。试跑结果不写入推荐记录。</p>
+        <input type="file" accept="application/json,.json" :disabled="!!ruleBusy" aria-label="选择算法 JSON 文件" @change="readRuleFile" />
+        <n-input v-model:value="ruleDraft" type="textarea" :disabled="!!ruleBusy" :autosize="{minRows: 5, maxRows: 14}" :placeholder="ruleExample" :input-props="{ 'aria-label': '算法 JSON' }" />
+        <div class="picks-control-actions"><n-button :disabled="!!ruleBusy" @click="ruleDraft=ruleExample">填入示例</n-button><n-button :loading="ruleBusy==='import'" :disabled="!!ruleBusy || !ruleDraft.trim()" @click="importRule">校验并导入</n-button></div>
+        <p class="theme-source">baseStrategy 可选已有打法或 eligible（共同准入），conditions 为必须满足的条件，exclusions 为排除项；op 支持 gt（大于）、gte（不小于）、lt（小于）、lte（不大于）、eq（等于）。rankBy.direction 为 asc 或 desc。</p>
+        <p v-if="availableRuleFields.length" class="theme-source">可用条件字段：{{ availableRuleFields.map(field => typeof field === 'string' ? field : `${field.field || field.id}（${field.name}）`).join('、') }}</p>
+        <div v-if="customStrategies.length" class="custom-rule-list"><p>已导入算法</p><span v-for="rule in customStrategies" :key="rule.id"><n-button size="small" :disabled="!!ruleBusy" @click="chooseImportedRule(rule)">{{ rule.name }} · v{{ rule.version }} · {{ rule.enabled ? '已启用' : '未启用' }}</n-button><n-button v-if="rule.enabled" size="small" :disabled="!!ruleBusy || loading" @click="disableRule(rule)">停用</n-button></span></div>
+        <div v-if="importedRule"><p>{{ importedRule.name }} · v{{ importedRule.version }} · {{ importedRule.enabled ? '已启用' : '未启用' }}</p><n-button :loading="ruleBusy==='preview'" :disabled="!!ruleBusy" @click="previewRule">用本轮已保存行情试跑</n-button></div>
+        <n-alert v-if="ruleError" type="warning" :show-icon="false">{{ ruleError }}</n-alert>
+        <section v-if="rulePreview" class="rule-preview"><b>试跑结果 · {{ rulePreview.items?.length || 0 }} 只</b><p class="theme-source">数据轮次 {{ rulePreview.sourceRunId || rulePreview.runId }} · {{ rulePreview.message || '使用该轮原始证据，不代表当时已经推荐。' }}</p><article v-for="stock in rulePreview.items || []" :key="stock.code"><strong>{{ stock.name }} {{ stock.code }}</strong><p v-for="reason in stock.reasons" :key="reason">{{ reason }}</p></article><p v-if="!rulePreview.items?.length">该轮没有满足规则的股票。</p><n-button type="primary" :disabled="!!ruleBusy || rulePreview.status!=='previewed' || importedRule?.enabled" :loading="ruleBusy==='enable'" @click="enableRule">确认启用此算法</n-button></section>
+      </section>
       <form class="custom-screen" @submit.prevent="applyCustomScreen">
         <label for="king-screen-conditions">选股条件</label>
         <n-input v-model:value="screenDraft" type="textarea" :input-props="{ id: 'king-screen-conditions' }" :autosize="{minRows: 2, maxRows: 5}" placeholder="例如：股价低于20元，涨幅大于2%，卖一量不少于1万股" />
@@ -1301,6 +1423,7 @@ onDeactivated(() => {
 .shortlist-empty { padding: 20px 0 8px; }
 .shortlist-empty p, .custom-screen p, .custom-results small { color: var(--sk-text-muted); }
 .custom-screen { display: grid; gap: 8px; }
+.strategy-picker{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--sk-text-muted)}.strategy-picker select{padding:7px;border:1px solid var(--sk-border);border-radius:6px;background:var(--sk-surface);color:var(--sk-text)}.strategy-channels{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:12px 0}.strategy-channels article,.stock-strategies section{padding:10px;border:1px solid var(--sk-border);border-radius:6px}.strategy-channels span{margin-left:10px}.strategy-channels p{margin:5px 0;color:var(--sk-text-muted)}.stock-strategies{display:flex;flex-direction:column;gap:8px;margin:10px 0}.strategy-import{display:grid;gap:10px;margin-bottom:22px;padding-bottom:20px;border-bottom:1px solid var(--sk-border)}.strategy-import h3,.strategy-import p{margin:2px 0}.custom-rule-list{display:flex;gap:8px;flex-wrap:wrap}.custom-rule-list>p{flex-basis:100%}.rule-preview article{padding:8px 0;border-bottom:1px solid var(--sk-border)}
 .custom-screen button { justify-self: start; }
 .custom-screen p, .custom-results p { margin: 4px 0 8px; }
 .custom-results { display: grid; gap: 8px; max-height: 46vh; overflow-y: auto; }
